@@ -23,6 +23,7 @@ from engine.oracle_sniper import (
     effective_exit_proceeds,
     entry_limit_price,
     estimate_fair_value,
+    estimate_twap_fair_value,
     evaluate_entry,
     evaluate_exit,
     pick_best_candidate,
@@ -187,6 +188,14 @@ class OracleSniperRunner:
             b.down_bid if dn_ok else None, b.down_ask if dn_ok else None,
         )
 
+    def _realized_twap_240(self, sym: str, window_ts: int, elapsed: float) -> tuple[Optional[float], float]:
+        if elapsed <= 240.0:
+            return None, 0.0
+        start_ms = (window_ts + 240) * 1000.0
+        end_ms = (window_ts + elapsed) * 1000.0
+        vals = [float(v) for ts_ms, v in (self.chainlink.ticks.get(sym) or ()) if start_ms <= ts_ms <= end_ms]
+        return ((sum(vals) / len(vals)) if vals else None), max(0.0, elapsed - 240.0)
+
     def _build_views(self, now: float, elapsed: float) -> dict[str, View]:
         views: dict[str, View] = {}
         for sym, st in self.hub.states.items():
@@ -203,7 +212,11 @@ class OracleSniperRunner:
             if strike is None:
                 self.diag[sym] = {"status": "NO_STRIKE"}
                 continue
-            fv = estimate_fair_value(strike, cl_px, 300.0 - elapsed, vol, flow, gap, self.cfg.student_t_df, cvd)
+            if self.cfg.use_twap_projection:
+                a_mean, a_sec = self._realized_twap_240(sym, st.window_ts, elapsed)
+                fv = estimate_twap_fair_value(strike, cl_px, 300.0 - elapsed, vol, (a_mean, a_sec), (flow, gap, cvd), self.cfg)
+            else:
+                fv = estimate_fair_value(strike, cl_px, 300.0 - elapsed, vol, flow, gap, self.cfg.student_t_df, cvd)
             if fv is None:
                 continue
             book = self._book_for(st, now, elapsed)

@@ -6,7 +6,8 @@
 
 ## Start Here (For Claude / Reviewers)
 
-- **Main Synthesis & R1–R8 / Section 4.1 / Section 4.2 Handoff**: [`CLAUDE_HANDOFF.md`](CLAUDE_HANDOFF.md) (`raw`: [CLAUDE_HANDOFF.md](https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/CLAUDE_HANDOFF.md))
+- **Main Synthesis & R1–R8 / Section 4.1 / Section 4.2 / TWAP Sniper V2 Handoff**: [`CLAUDE_HANDOFF.md`](CLAUDE_HANDOFF.md) (`raw`: [CLAUDE_HANDOFF.md](https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/CLAUDE_HANDOFF.md))
+- **TWAP Sniper V2 Implementation & Dual Backtest Report (`1s-CLOB` + `96d 3-Coin Single-Slot` + 5.4 Risk)**: [`edge_validation/strategy_v2_report.md`](edge_validation/strategy_v2_report.md) + [`edge_validation/v2_backtest_trades_clob1s.csv`](edge_validation/v2_backtest_trades_clob1s.csv) + [`edge_validation/backtest_twap_sniper_v2.py`](edge_validation/backtest_twap_sniper_v2.py)
 - **Section 4.1 96-Day Verification (`82,944` settled markets / `414,720` snapshots + zero-lag audit)**: [`edge_validation/summary_41.md`](edge_validation/summary_41.md) + [`edge_validation/deviations.md`](edge_validation/deviations.md) + [`edge_validation/r1_r2_parity_proof.json`](edge_validation/r1_r2_parity_proof.json)
   - Raw Section 4.1 dataset (`25 MB`): [`edge_validation/phase41_intrawindow.parquet`](edge_validation/phase41_intrawindow.parquet) + CSV summaries [`phase41_model_free_summary.csv`](edge_validation/phase41_model_free_summary.csv) & [`phase41_with_model_summary.csv`](edge_validation/phase41_with_model_summary.csv)
 - **Section 4.2 3-Coin Read-Only Recorder & Simulator**: [`edge_validation/live_recorder_42.py`](edge_validation/live_recorder_42.py) + [`edge_validation/frozen_config.json`](edge_validation/frozen_config.json) + [`strategy_reference/chainlink_oracle.py`](strategy_reference/chainlink_oracle.py) & [`oracle_sniper_runner.py`](strategy_reference/oracle_sniper_runner.py)

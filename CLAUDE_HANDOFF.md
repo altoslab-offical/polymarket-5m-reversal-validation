@@ -103,5 +103,23 @@
 ## 四、Section 4.2 三幣即時只讀錄製就緒狀態
 
 - **`edge_validation/live_recorder_42.py`** 已實作並通過 35 秒實機乾跑測試（零錯誤、三幣 `snapshots_1hz`、Top-5 CLOB depth JSON、`crypto_prices_twap_sixty`、`binance aggTrade`、`pm_trades_42` 均正常入庫；`--analyze` 離線 `+1s/+2s` 保守模擬與 6 項門檻判定邏輯已就緒）。
-- **`edge_validation/frozen_config.json`** 已將 `SniperConfig`、有效費率 `{BTC:0.05, ETH:0.01, SOL:0.01}`、執行保守檢查與 6 項預先登記門檻凍結寫入，Git SHA 已對應本次推送 commit。
-- **下一步建議（請使用者與 Claude 確認）**：於 `2026-11-21 00:00Z`（新費率生效時）前啟動背景只讀錄製 7–14 天，累積 `>= 300` 筆保守模擬成交單後交回完整 Section 4.2 逐單 CSV 與判定結果。
+- **`edge_validation/frozen_config.json`** 已將 `SniperConfig`（V1 基線 + `TWAP_V2_FILTERED_CONFIG` / `TWAP_V2_PURE_CONFIG`）、有效費率 `{BTC:0.05, ETH:0.01, SOL:0.01}`、執行保守檢查與 6 項預先登記門檻凍結寫入，Git SHA 已對應本次推送 commit。
+- **下一步**：已於本地背景啟動純只讀 3 幣監控錄製（zero real orders），累積 `>= 300` 筆保守模擬單（特別涵蓋 `11/21 00:00Z` 新費率後）即交回完整 4.2 CSV 與判定。
+
+---
+
+## 五、TWAP Sniper V2 策略實作與雙組回測結果（`edge_validation/strategy_v2_report.md`）
+
+依據 Section 4.1 驗證結果，已於 `engine/oracle_sniper.py` + `engine/oracle_sniper_runner.py` 實作 `TWAP_V2_FILTERED_CONFIG` 與 `TWAP_V2_PURE_CONFIG`（`estimate_twap_fair_value`，`V1 DEFAULT_SNIPER_CONFIG` 預設不變保留 75/75 重播相容性），完整雙組回測腳本 `edge_validation/backtest_twap_sniper_v2.py` 結果如下：
+
+1. **真實 1 秒 CLOB 盤口回測（`live_btc_5m.db` `1,013` BTC 窗，100% 官方 Gamma TWAP 回填，`+1s`/`+2s` 延遲懲罰）**：
+   - `V1_SPOT_DEFAULT`（修正官方 TWAP Strike 後）：過於保守（全 1,013 窗僅 `5–7` 筆）。
+   - `TWAP_V2_FILTERED_SETTLE`（`fee=0.05`）：
+     - `+1s` 延遲：IS `n=34`, WR `88.24%`, `+0.10471` ｜ OOS `n=13`, WR `84.62%`, `+0.10160` ｜ **FULL `n=47`, WR `87.23%`, `+0.10385/股` (`CI [+0.0186, +0.1706]`)**。
+     - `+2s` 延遲：IS `n=22`, WR `81.82%`, `+0.09319` ｜ OOS `n=12`, WR `91.67%`, `+0.15454` ｜ **FULL `n=34`, WR `85.29%`, `+0.11484/股` (`CI [+0.0186, +0.1943]`)**。
+   - `TWAP_V2_PURE_SETTLE`（高頻去流過濾，`fee=0.05`）：`+1s` Full `n=116`, WR `81.90%`, `+0.06126`；`+2s` Full `n=102`, WR `81.37%`, **`+0.09263/股` (`CI [+0.0324, +0.1468]`)**。
+2. **96 天三幣（BTC/ETH/SOL）單槽組合模擬（OOS `lag<=5s/2s` + 5.4 風控，`$43.10U` 起步）**：
+   - `OOS lag<=5s base (0.05/0.01)`：`n=175`, WR **`90.29%`**, **`+0.12239/股`** (`CI [+0.0792,+0.1626]`), 終值 **`$192.89U`**, Max DD **`9.60%`**, 週勝率 **`100.0%`**, **Daily Log-Growth 95% CI `[+0.03019, +0.06041]`（下界 > 0）**。
+   - `OOS lag<=5s +1¢ 滑價壓力`：`n=140`, WR **`90.00%`**, **`+0.12494/股`**, 終值 `$151.96U`, Max DD `8.63%`, 週勝率 `100.0%`, Daily Log-Growth CI `[+0.02410, +0.05485]`。
+   - `OOS lag<=2s base (0.05/0.01)`：`n=92`, WR **`93.48%`**, **`+0.15538/股`**, 終值 `$124.70U`, Max DD `10.50%`, 週勝率 `80.0%`, Daily Log-Growth CI `[+0.01977, +0.05819]`。
+- 詳細報表與逐單 CSV：`edge_validation/strategy_v2_report.md` 與 `edge_validation/v2_backtest_trades_clob1s.csv`。

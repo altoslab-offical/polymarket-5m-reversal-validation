@@ -34,6 +34,8 @@ sys.path.insert(0, str(REPO))
 from engine.chainlink_oracle import ChainlinkRTDSFeed
 from engine.oracle_sniper import (
     DEFAULT_SNIPER_CONFIG,
+    TWAP_V2_FILTERED_CONFIG,
+    TWAP_V2_PURE_CONFIG,
     FairValueEstimate,
     OpenPosition,
     OrderBookTop,
@@ -43,6 +45,7 @@ from engine.oracle_sniper import (
     effective_exit_proceeds,
     entry_limit_price,
     estimate_fair_value,
+    estimate_twap_fair_value,
     evaluate_entry,
     evaluate_exit,
     pick_best_candidate,
@@ -120,12 +123,14 @@ def write_frozen_config(
     if fee_rate_override is not None:
         cfg_dict["fee_rate"] = float(fee_rate_override)
     payload = {
-        "schema_version": "4.2-v1",
+        "schema_version": "4.2-v2",
         "frozen_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "git_sha": sha,
         "engine_dirty": dirty,
         "effective_fees_post_nov20": {"BTCUSDT": 0.05, "ETHUSDT": 0.01, "SOLUSDT": 0.01},
         "sniper_config": cfg_dict,
+        "sniper_config_v2_filtered": asdict(TWAP_V2_FILTERED_CONFIG),
+        "sniper_config_v2_pure": asdict(TWAP_V2_PURE_CONFIG),
         "execution_rules": {
             "fill_delay_sec_primary": 1, "fill_delay_sec_stress": 2,
             "require_top_ask_px_le_limit": True, "require_top_ask_sz_ge_shares": True,
@@ -473,9 +478,10 @@ class LiveRecorder42:
 
 
 def _build_tick_views(
-    T: int, t_sec: int, elapsed: int, sec_maps: Dict[str, Dict[int, Any]], w_meta: Dict[Tuple[int, str], Any],
-    trackers: Dict[str, RollingMicrostructureTracker], cfg: SniperConfig,
+    tick: Tuple[int, int, int], sec_maps: Dict[str, Dict[int, Any]], w_meta: Dict[Tuple[int, str], Any],
+    trackers: Dict[str, RollingMicrostructureTracker], cfg: SniperConfig, twap_acc: Optional[Dict[str, List[float]]] = None,
 ) -> Dict[str, Tuple[FairValueEstimate, OrderBookTop]]:
+    T, t_sec, elapsed = tick
     views: Dict[str, Tuple[FairValueEstimate, OrderBookTop]] = {}
     for s in SYMBOLS:
         row = sec_maps[s].get(t_sec)
@@ -483,6 +489,8 @@ def _build_tick_views(
         strike = (wm.gamma_price_to_beat if (wm and pd.notna(wm.gamma_price_to_beat)) else (wm.twap_strike if wm else None))
         if row is None or row.cl_spot is None or row.bn_close is None or not strike:
             continue
+        if twap_acc is not None and elapsed >= 240:
+            twap_acc[s].append(float(row.cl_spot))
         tr = trackers[s]
         tr.on_price(float(t_sec), float(row.bn_close))
         if float(row.bn_buy_vol or 0.0) > 0:
@@ -492,7 +500,13 @@ def _build_tick_views(
         vol = tr.get_realized_vol_1s(floor=cfg.min_1s_vol_floor)
         gap = tr.update_oracle_basis(float(row.cl_spot), float(row.bn_close))
         cvd, _, flow = tr.get_orderflow_metrics(float(t_sec))
-        fv = estimate_fair_value(float(strike), float(row.cl_spot), float(300 - elapsed), vol, flow, gap, cfg.student_t_df, cvd)
+        if cfg.use_twap_projection:
+            acc = twap_acc[s] if twap_acc is not None else []
+            a_mean = (sum(acc) / len(acc)) if acc else float(row.cl_spot)
+            a_sec = float(elapsed - 240) if elapsed >= 240 else 0.0
+            fv = estimate_twap_fair_value(float(strike), float(row.cl_spot), float(300 - elapsed), vol, (a_mean, a_sec), (flow, gap, cvd), cfg)
+        else:
+            fv = estimate_fair_value(float(strike), float(row.cl_spot), float(300 - elapsed), vol, flow, gap, cfg.student_t_df, cvd)
         if fv is not None:
             views[s] = (fv, OrderBookTop(row.up_bid1, row.up_ask1, row.down_bid1, row.down_ask1))
     return views
@@ -558,34 +572,24 @@ def _try_exit_pos(
     return open_pos
 
 
-def analyze_recording(db_path: pathlib.Path = DEFAULT_DB, frozen_path: pathlib.Path = FROZEN_CFG_PATH, out_dir: pathlib.Path = ROOT) -> dict[str, Any]:
-    """Conservative (+1s / +2s) fill & exit simulation against `frozen_config.json`."""
-    frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
-    cfg = SniperConfig(**{k: (tuple(v) if k == "slippage_ladder" else v) for k, v in frozen["sniper_config"].items()})
-    fee_map = frozen.get("effective_fees_post_nov20", {"BTCUSDT": 0.05, "ETHUSDT": 0.01, "SOLUSDT": 0.01})
+def _cfg_from_dict(raw: dict[str, Any]) -> SniperConfig:
+    return SniperConfig(**{k: (tuple(v) if k == "slippage_ladder" else v) for k, v in raw.items()})
 
-    con = sqlite3.connect(db_path)
-    df_w = pd.read_sql_query("SELECT * FROM windows_42 ORDER BY window_ts, symbol", con)
-    df_s = pd.read_sql_query("SELECT * FROM snapshots_1hz ORDER BY window_ts, symbol, elapsed_sec", con)
-    con.close()
 
-    settled = df_w[df_w["resolved_outcome"].isin(["UP", "DOWN"])]
-    has_tw = settled[settled["twap_strike"].notna() & settled["twap_close"].notna()]
-    tw_match = int(((has_tw["twap_close"] >= has_tw["twap_strike"]).map({True: "UP", False: "DOWN"}) == has_tw["resolved_outcome"]).sum())
-    r1_parity = (tw_match / len(has_tw)) if len(has_tw) else np.nan
-
-    snap_by_wt_sym = {k: g.sort_values("elapsed_sec") for k, g in df_s.groupby(["window_ts", "symbol"])}
-    w_meta = {(int(r.window_ts), str(r.symbol)): r for r in df_w.itertuples(index=False)}
+def _sim_one_cfg(
+    cfg: SniperConfig, fee_map: Dict[str, float], settled_ts: List[int],
+    snap_by_wt_sym: Dict[Any, pd.DataFrame], w_meta: Dict[Tuple[int, str], Any],
+) -> pd.DataFrame:
     trackers = {s: RollingMicrostructureTracker(cfg.vol_lookback_sec, cfg.cvd_window_sec) for s in SYMBOLS}
     trades_1s: List[dict[str, Any]] = []
     eq = 100.0
-
-    for T in sorted(settled["window_ts"].unique()):
+    for T in settled_ts:
         sec_maps = {s: ({int(r.ts_sec): r for r in g.itertuples(index=False)} if (g := snap_by_wt_sym.get((int(T), s))) is not None else {}) for s in SYMBOLS}
+        twap_acc: Dict[str, List[float]] = {s: [] for s in SYMBOLS}
         open_pos, entered = None, False
         for t_sec in range(int(T), int(T) + 300):
             elapsed = t_sec - int(T)
-            views = _build_tick_views(int(T), t_sec, elapsed, sec_maps, w_meta, trackers, cfg)
+            views = _build_tick_views((int(T), t_sec, elapsed), sec_maps, w_meta, trackers, cfg, twap_acc)
             if open_pos is None and not entered:
                 open_pos, unfilled = _try_enter_window(int(T), t_sec, elapsed, views, sec_maps, w_meta, cfg, fee_map, eq)
                 entered = open_pos is not None or unfilled is not None
@@ -602,17 +606,58 @@ def analyze_recording(db_path: pathlib.Path = DEFAULT_DB, frozen_path: pathlib.P
             open_pos["resolved_outcome"] = out
             open_pos["pnl_per_share"] = round((1.0 if out == open_pos["side"] else 0.0) - open_pos["cost_1s"], 5)
             trades_1s.append(open_pos)
+    return pd.DataFrame(trades_1s)
 
-    df_t = pd.DataFrame(trades_1s)
-    csv_out = out_dir / "phase42_trades_1s.csv"
-    df_t.to_csv(csv_out, index=False)
-    filled = df_t[df_t["filled_1s"] == True] if len(df_t) else pd.DataFrame()
+
+def _summarize_model_trades(df_t: pd.DataFrame) -> Dict[str, Any]:
+    if len(df_t) == 0:
+        return {"signals": 0, "filled_1s": 0, "mean_pnl_1s": None, "filled_2s": 0}
+    f1 = df_t[df_t["filled_1s"] == True]
+    f2 = df_t[df_t["filled_2s"] == True]
+    pos_coins = int(sum(float(g["pnl_per_share"].mean()) > 0 for _, g in f1.groupby("symbol"))) if len(f1) else 0
+    return {
+        "signals": int(len(df_t)), "filled_1s": int(len(f1)), "filled_2s": int(len(f2)),
+        "positive_coins_1s": pos_coins,
+        "mean_pnl_1s": round(float(f1["pnl_per_share"].mean()), 5) if len(f1) else None,
+        "wr_1s": round(float((f1["pnl_per_share"] > 0).mean()), 4) if len(f1) else None,
+    }
+
+
+def analyze_recording(db_path: pathlib.Path = DEFAULT_DB, frozen_path: pathlib.Path = FROZEN_CFG_PATH, out_dir: pathlib.Path = ROOT) -> dict[str, Any]:
+    """Conservative (+1s / +2s) dual V1 + V2 TWAP simulation against `frozen_config.json`."""
+    frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
+    fee_map = frozen.get("effective_fees_post_nov20", {"BTCUSDT": 0.05, "ETHUSDT": 0.01, "SOLUSDT": 0.01})
+    con = sqlite3.connect(db_path)
+    df_w = pd.read_sql_query("SELECT * FROM windows_42 ORDER BY window_ts, symbol", con)
+    df_s = pd.read_sql_query("SELECT * FROM snapshots_1hz ORDER BY window_ts, symbol, elapsed_sec", con)
+    con.close()
+
+    settled = df_w[df_w["resolved_outcome"].isin(["UP", "DOWN"])]
+    has_tw = settled[settled["twap_strike"].notna() & settled["twap_close"].notna()]
+    tw_match = int(((has_tw["twap_close"] >= has_tw["twap_strike"]).map({True: "UP", False: "DOWN"}) == has_tw["resolved_outcome"]).sum())
+    r1_parity = (tw_match / len(has_tw)) if len(has_tw) else np.nan
+
+    snap_by_wt_sym = {k: g.sort_values("elapsed_sec") for k, g in df_s.groupby(["window_ts", "symbol"])}
+    w_meta = {(int(r.window_ts), str(r.symbol)): r for r in df_w.itertuples(index=False)}
+    settled_ts = sorted(settled["window_ts"].unique())
+
+    models = {
+        "v1": _cfg_from_dict(frozen["sniper_config"]),
+        "v2_filtered": _cfg_from_dict(frozen["sniper_config_v2_filtered"]) if "sniper_config_v2_filtered" in frozen else TWAP_V2_FILTERED_CONFIG,
+        "v2_pure": _cfg_from_dict(frozen["sniper_config_v2_pure"]) if "sniper_config_v2_pure" in frozen else TWAP_V2_PURE_CONFIG,
+    }
+    summaries: Dict[str, Any] = {}
+    for lbl, cfg in models.items():
+        df_t = _sim_one_cfg(cfg, fee_map, settled_ts, snap_by_wt_sym, w_meta)
+        df_t.to_csv(out_dir / f"phase42_trades_1s_{lbl}.csv", index=False)
+        summaries[lbl] = _summarize_model_trades(df_t)
+    v2_s = summaries["v2_filtered"]
     return {
         "windows_recorded": int(len(df_w)), "windows_settled": int(len(settled)),
         "r1_twap_parity": None if np.isnan(r1_parity) else round(float(r1_parity), 4),
-        "signals_total": int(len(df_t)), "filled_1s": int(len(filled)),
-        "mean_pnl_per_share_1s": round(float(filled["pnl_per_share"].mean()), 5) if len(filled) else None,
-        "trades_csv": str(csv_out),
+        "signals_total": v2_s["signals"], "filled_1s": v2_s["filled_1s"],
+        "mean_pnl_per_share_1s": v2_s["mean_pnl_1s"],
+        "models": summaries,
     }
 
 

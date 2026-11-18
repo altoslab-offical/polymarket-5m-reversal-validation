@@ -46,9 +46,39 @@ class SniperConfig:
     # --- cost control (execution) ---
     slippage_ladder: tuple[float, ...] = (0.04, 0.03, 0.02)
     base_slippage: float = 0.01
+    # --- TWAP v2 model extensions (opt-in; defaults preserve V1 75/75 parity) ---
+    use_twap_projection: bool = False
+    twap_gaussian_weight: float = 0.70
+    twap_student_t_df: float = 6.0
+    use_flow_gates: bool = True
+    early_tp_enabled: bool = True
 
 
 DEFAULT_SNIPER_CONFIG = SniperConfig()
+
+TWAP_V2_FILTERED_CONFIG = SniperConfig(
+    student_t_df=6.0,
+    vol_lookback_sec=1800,
+    min_1s_vol_floor=0.000035,
+    max_model_market_divergence=0.25,
+    use_twap_projection=True,
+    twap_gaussian_weight=0.70,
+    twap_student_t_df=6.0,
+    use_flow_gates=True,
+    early_tp_enabled=False,
+)
+
+TWAP_V2_PURE_CONFIG = SniperConfig(
+    student_t_df=6.0,
+    vol_lookback_sec=1800,
+    min_1s_vol_floor=0.000035,
+    max_model_market_divergence=0.30,
+    use_twap_projection=True,
+    twap_gaussian_weight=1.0,
+    twap_student_t_df=6.0,
+    use_flow_gates=False,
+    early_tp_enabled=False,
+)
 
 # --------------------------------------------------------------------------------------
 # Fee / EV math
@@ -331,7 +361,59 @@ def _side_view(cfg: SniperConfig, fv: FairValueEstimate, book: OrderBookTop) -> 
     return None
 
 
+def estimate_twap_fair_value(
+    strike_price: float,
+    chainlink_price: float,
+    remaining_sec: float,
+    vol_1s: float,
+    realized_240: tuple[Optional[float], float] = (None, 0.0),
+    micro: tuple[float, Optional[float], float] = (0.0, None, 0.0),
+    cfg: Optional[SniperConfig] = None,
+) -> Optional[FairValueEstimate]:
+    """TWAP-projection probability that final 60s Chainlink TWAP [T+240..T+300] settles >= strike."""
+    if strike_price <= 0 or chainlink_price <= 0:
+        return None
+    use_cfg = cfg or TWAP_V2_FILTERED_CONFIG
+    realized_twap_mean, realized_twap_elapsed = realized_240
+    orderflow_score, dynamic_gap_bps, cvd_imbalance = micro
+    rem = max(0.5, remaining_sec)
+    vol = max(1e-7, vol_1s)
+    if rem > 60.0:
+        eff_tau = max(1.0, rem - 40.0)
+        horizon_vol = vol * math.sqrt(eff_tau)
+        raw_z = ((chainlink_price - strike_price) / strike_price) / horizon_vol
+    else:
+        a = max(0.0, min(59.5, realized_twap_elapsed))
+        mean_src = realized_twap_mean if (realized_twap_mean and realized_twap_mean > 0) else chainlink_price
+        mean_twap = (a * mean_src + rem * chainlink_price) / 60.0
+        horizon_vol = max(1e-7, (rem / 60.0) * vol * math.sqrt(rem / 3.0))
+        raw_z = ((mean_twap - strike_price) / strike_price) / horizon_vol
+    gap_bps = dynamic_gap_bps if dynamic_gap_bps is not None else 0.0
+    drift_z_adj = 0.05 * max(-1.0, min(1.0, orderflow_score))
+    adjusted_z = raw_z + drift_z_adj
+    gw = max(0.0, min(1.0, use_cfg.twap_gaussian_weight))
+    p_blend = gw * normal_cdf(adjusted_z) + (1.0 - gw) * fat_tail_prob_from_z(adjusted_z, df=use_cfg.twap_student_t_df)
+    p_up = max(0.005, min(0.995, p_blend))
+    return FairValueEstimate(
+        strike_price=strike_price,
+        chainlink_price=chainlink_price,
+        cex_lead_price=None,
+        oracle_gap_bps=gap_bps,
+        remaining_sec=remaining_sec,
+        vol_1s=vol_1s,
+        horizon_vol_pct=horizon_vol * 100.0,
+        raw_z_score=raw_z,
+        adjusted_z_score=adjusted_z,
+        orderflow_score=orderflow_score,
+        p_true_up=p_up,
+        p_true_down=1.0 - p_up,
+        cvd_imbalance=cvd_imbalance,
+    )
+
+
 def _flow_gates_pass(cfg: SniperConfig, view: SideView) -> bool:
+    if not cfg.use_flow_gates:
+        return True
     if view.gap_bps < -cfg.max_adverse_oracle_gap_bps:
         return False
     return not (view.flow < cfg.min_orderflow_score or view.cvd < cfg.min_directional_cvd)
@@ -417,7 +499,7 @@ def evaluate_exit(
         return None
     dir_z, dir_flow, p_now = _directional(fv, pos.side)
     net = effective_exit_proceeds(bid, cfg.fee_rate)
-    if net > pos.total_cost_per_share and (bid >= 0.99 or (bid >= cfg.take_profit_bid and net >= p_now - 0.002)):
+    if cfg.early_tp_enabled and net > pos.total_cost_per_share and (bid >= 0.99 or (bid >= cfg.take_profit_bid and net >= p_now - 0.002)):
         return ExitDecision("EARLY_TAKE_PROFIT", bid, net)
     if not cfg.enable_emergency_exit or elapsed_sec >= 292.0:
         return None

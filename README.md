@@ -1,53 +1,41 @@
-# Polymarket 5m Reversal Signal — Phase A Edge Validation
+# Polymarket 5m Strategy Research & Empirical Validation Repository
 
-> Full empirical verification of the Polymarket 5-minute crypto Up/Down mean-reversion signal over the pure **60-second Chainlink TWAP** resolution regime (`2026-08-14T00:00:00Z` to `2026-11-18T02:00:00Z`, `27,673` windows × 3 coins = `83,019` rows).
-
-## Verdict: **NO-GO** (`目前資料不支持訊號有優勢`)
-
-Using fixed 1-share taker sizing (`vwap_pre30` fallback `vwap_0_30` → `first_px`) with live-verified fee schedule (`fee = C × 0.07 × p × (1 - p)`):
-
-| Pre-Registered Rule | Threshold | Observed (`OOS`: `2026-10-17 01:20Z` – `2026-11-18 02:00Z`) | Result |
-|---|---|---|---|
-| Rule 1 | OOS T1 `n >= 300` | `n = 514` | **PASS** |
-| Rule 2 | OOS T1 mean PnL 95% Bootstrap CI lower > `0` | Mean `-0.0429` (`[-0.0847, -0.0011]`), WR `47.28%` | **FAIL** |
-| Rule 3 | `>= 2/3` coins with T2 mean PnL > `0` | OOS `0/3` (`BTC -0.0859`, `ETH -0.0574`, `SOL -0.0090`), Full `0/3` | **FAIL** |
-| Rule 4 | No OOS month mean PnL `< -0.03` | `2026-10` OOS = `-0.0700` (`2026-11` = `-0.0216`) | **FAIL** |
-
-Because Phase A failed (`NO-GO`), **Phase B (`live_windows.csv`) was not started**.
+> Complete open-source data, verification scripts, and empirical handoffs for both **Phase A (NO-GO)** and **Phase C / Platform Discovery (Intrawindow Chainlink TWAP Sniper + Nov 20 Fee Overhaul)**.
 
 ---
 
-## Repository Contents
+## Start Here (For Claude / Reviewers)
 
-### Reports & API Notes
-- [`summary.md`](summary.md): Full statistical report (**T1–T8**, Wilson 95% CI, 10,000-iter Bootstrap 95% CI, IS/OOS splits, ablation, calibration, loss-streak audit, data quality, pre-registered decision).
-- [`api_notes.md`](api_notes.md): Verified Polymarket Gamma / Data API v2 / CLOB / Binance Vision requests, truncated real responses, breaking schema differences (`Data API v1` retired 410 → `/v2/trades?condition=`; `Gamma` requires `closed=any`; `60s TWAP` effective strictly `2026-08-14T00:00:00Z` after 7 days of `30s TWAP`), and full Chainlink rules text.
+- **Main Synthesis & Strategy Debate Brief**: [`CLAUDE_HANDOFF.md`](CLAUDE_HANDOFF.md) (`raw`: [CLAUDE_HANDOFF.md](https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/CLAUDE_HANDOFF.md))
+- **Verified Platform Facts (102 markets, Nov 20 fee overhaul, RTT, SDK)**: [`platform_facts.md`](platform_facts.md) + [`settlement_latency.csv`](settlement_latency.csv)
+- **Maker vs Intrawindow Sniper 1s-CLOB Comparison + 96d 3-Coin Audit + Monte Carlo**: [`edge_validation/strategy_comparison_report.md`](edge_validation/strategy_comparison_report.md)
+  - Trade-level CSVs from `live_btc_5m.db` (`1,004` windows / `84.33h`): [`edge_validation/sniper_sim_btc.csv`](edge_validation/sniper_sim_btc.csv) & [`edge_validation/maker_sim_btc.csv`](edge_validation/maker_sim_btc.csv)
+  - Sniper pure strategy/pricing code: [`strategy_reference/oracle_sniper.py`](strategy_reference/oracle_sniper.py)
+  - Full `1,013`-window `1s` SQLite snapshot database (`121 MB`): hosted in [`altoslab-offical/polymarket-btc-5m` Release v1.0.0](https://github.com/altoslab-offical/polymarket-btc-5m/releases/tag/v1.0.0)
 
-### Raw Row-Level Dataset (`83,019` rows × `71` cols)
-Because raw `windows.csv` is `66 MB` (>50 MB GitHub blob limit), it is provided in all three clean formats:
-- **Per-coin CSVs** (exact split of `windows.csv`, ~22–23 MB each):
-  - [`windows_BTC.csv`](windows_BTC.csv) (`27,673` rows)
-  - [`windows_ETH.csv`](windows_ETH.csv) (`27,673` rows)
-  - [`windows_SOL.csv`](windows_SOL.csv) (`27,673` rows)
-- **Combined Parquet**: [`windows.parquet`](windows.parquet) (`34.5 MB`, 77-digit token IDs stored as exact UTF-8 strings)
-- **Combined Unsplit CSV (`66 MB`)**: Attached in **GitHub Release `v1.0.0`** (`windows.csv` and `windows.csv.zip`)
+---
 
-### Reproducible Scripts (`edge_validation/`)
-1. [`edge_validation/fetch_binance.py`](edge_validation/fetch_binance.py): Downloads & caches Binance Spot `1m` + `1s` klines and Futures UM 5m `metrics` OI (`2026-08-07` warmup → `2026-11-18T02:05Z`), normalizes us/ms timestamps & sorts unsorted OI CSVs, computes all Section 2.3/2.4 features with zero look-ahead.
-2. [`edge_validation/fetch_polymarket.py`](edge_validation/fetch_polymarket.py): Batch-fetches Gamma metadata, CLOB `batch-prices-history`, and Data API `/v2/trades` fills with SQLite checkpointing.
-3. [`edge_validation/build_windows_and_summary.py`](edge_validation/build_windows_and_summary.py): Runs the Section 2.5 shared 3-coin state machine, computes fixed-1-share PnL (`pnl_main`, `pnl_assumed054`, `pnl_vwap_0_60`), and generates `windows.csv` + `summary.md`.
-4. [`edge_validation/verify_outputs.py`](edge_validation/verify_outputs.py): Unit tests (Wilson CI, Bootstrap CI, state machine cooldown/bust, fee formula) + post-run output invariants.
+## Phase A Summary (`T=1786665600..1794967200`, `83,019` rows): **NO-GO**
 
-## Reproducing Locally
+Pre-window RSI(7) + microstructure reversal with fixed 1-share taker sizing (`vwap_pre30` fallback `vwap_0_30` → `first_px`) + `0.07` fee failed pre-registered OOS gates (`OOS n=514`, WR `47.28%`, PnL `-0.0429 [-0.0847, -0.0011]`, `0/3` coins positive).
 
-```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install httpx numpy pandas pyarrow
+- [`summary.md`](summary.md): Full T1–T8 tables & GO/NO-GO evaluation.
+- [`api_notes.md`](api_notes.md): Verified Polymarket Gamma / Data API v2 / CLOB / Binance Vision specs & exact `60s TWAP` boundary (`2026-08-14T00:00:00Z`).
+- Raw datasets (`83,019` rows × `71` cols): [`windows_BTC.csv`](windows_BTC.csv), [`windows_ETH.csv`](windows_ETH.csv), [`windows_SOL.csv`](windows_SOL.csv), [`windows.parquet`](windows.parquet), and unsplit [`windows.csv` in Release v1.0.0](https://github.com/altoslab-offical/polymarket-5m-reversal-validation/releases/tag/v1.0.0).
 
-python edge_validation/fetch_binance.py
-python edge_validation/fetch_polymarket.py --stage all
-python edge_validation/build_windows_and_summary.py
-python edge_validation/verify_outputs.py
-```
+---
 
-Or rebuild `summary.md` directly from the provided `windows_{BTC,ETH,SOL}.csv` / `windows.parquet` without re-downloading APIs.
+## Key Empirical Findings for Next Phase (Phase C Focus)
+
+1. **Nov 20, 2026T23:59Z Fee & Rebate Overhaul (`fee-and-rebate-changes-november-2026.md`)**:
+   - **BTC 5m/15m** taker `feeRate`: `0.07 → 0.05`.
+   - **ETH & SOL 5m** taker `feeRate`: `0.07 → 0.01` (**85.7% reduction**).
+   - **Maker Rebates** move to 30d weighted volume tiers; **accounts `< $200,000` receive `0%`**. Liquidity rewards (`rewardsMinSize=50`, `$1` min payout) yield `$0` for 5-share accounts.
+2. **Passive Maker Fails Empirically on 1,004 Real 1s-CLOB Windows (`live_btc_5m.db`)**:
+   - `T=0s` contrarian `48¢`/`45¢` Maker (`0%` fee): `-0.0566` (`42.34%` WR) / `-0.0564` (`39.36%` WR).
+   - Stepping back `1¢` on valid Sniper signals (`Maker-A3`): loses 40% of fills (`75 → 45`) and turns OOS negative (`-0.0131`, `78.57%` WR).
+3. **Intrawindow Chainlink TWAP Sniper + 44s Early Exit Works & Scales with Nov 20 Fees**:
+   - Taker Sniper (`n=75` BTC Full, `21.3/day`): **`90.67%` WR**, **`+0.0884`** (`0.07` fee) / **`+0.0920`** (`0.05`) / **`+0.0990`** (`0.01`). Pure OOS 40% (`n=23`): **`86.96%` WR**, **`+0.0528`** blended Nov 20 PnL.
+   - `68/75 (90.7%)` exit early at `bid >= 0.98` in **median `44s`** (and on-chain resolution takes median **`20s`** after `T+300` across `102` markets).
+   - 96-day (`82,944` settled markets) cross-coin check at `tau=180s`, `|Z|>=1.30`: BTC `96.46%`, ETH `96.37%`, SOL `96.60%` (`1.56×` non-overlapping 3-coin factor).
+   - Realistic OOS Monte Carlo from `$42.53U` (`26/day`, including `-1.5¢/sh` slippage stress): **`8–11 days` to `$100U`**, **`22–31 days` to `$200U`**. Next step: record 7–14 days of live BTC/ETH/SOL post-11/20 orderbooks (`dry_run` only) to confirm ETH/SOL OOS `n >= 300`.

@@ -6,7 +6,10 @@
 
 ## Start Here (For Claude / Reviewers)
 
-- **🔥 NEW (`2026-11-18` Strategic Pivot): Full-Candle V11 Battle Records & 91-Day Polymarket Audit (`FULL_CANDLE_V11_DIAGNOSIS_FOR_CLAUDE.md`)**: [`FULL_CANDLE_V11_DIAGNOSIS_FOR_CLAUDE.md`](FULL_CANDLE_V11_DIAGNOSIS_FOR_CLAUDE.md) (`raw`: [FULL_CANDLE_V11_DIAGNOSIS_FOR_CLAUDE.md](https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/FULL_CANDLE_V11_DIAGNOSIS_FOR_CLAUDE.md))
+- **🚀 LEAD ARCHITECT SPEC (`V12.0` Full-Candle Multi-Period RSI Strategy): [`V12_RSI_STRATEGY_SPEC.md`](V12_RSI_STRATEGY_SPEC.md)** (`raw`: [V12_RSI_STRATEGY_SPEC.md](https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/V12_RSI_STRATEGY_SPEC.md))
+  - Strategy implementation: [`strategy_reference/v12_rsi_strategy.py`](strategy_reference/v12_rsi_strategy.py)
+  - 96-Day Official Polymarket + 2-Year + Monte Carlo validation: [`edge_validation/validate_v12_rsi.py`](edge_validation/validate_v12_rsi.py) + [`edge_validation/v12_vs_v11_validation.csv`](edge_validation/v12_vs_v11_validation.csv)
+- **Full-Candle V11 Battle Records & 91-Day Polymarket Audit (`FULL_CANDLE_V11_DIAGNOSIS_FOR_CLAUDE.md`)**: [`FULL_CANDLE_V11_DIAGNOSIS_FOR_CLAUDE.md`](FULL_CANDLE_V11_DIAGNOSIS_FOR_CLAUDE.md) (`raw`: [FULL_CANDLE_V11_DIAGNOSIS_FOR_CLAUDE.md](https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/FULL_CANDLE_V11_DIAGNOSIS_FOR_CLAUDE.md))
   - Strategy source: [`strategy_reference/v8_strategy.py`](strategy_reference/v8_strategy.py) + [`strategy_reference/indicators.py`](strategy_reference/indicators.py)
   - 91-day official `pm_outcome` audit script & tables: [`edge_validation/audit_v11_full_candle_91d.py`](edge_validation/audit_v11_full_candle_91d.py) + [`edge_validation/v11_full_candle_91d_summary.csv`](edge_validation/v11_full_candle_91d_summary.csv) + [`edge_validation/v11_full_candle_91d_branches.csv`](edge_validation/v11_full_candle_91d_branches.csv)
 - **Round-3 Main Synthesis & Full Audit Responses (`CLAUDE_HANDOFF.md`)**: [`CLAUDE_HANDOFF.md`](CLAUDE_HANDOFF.md) (`raw`: [CLAUDE_HANDOFF.md](https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/CLAUDE_HANDOFF.md))

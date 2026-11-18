@@ -1,7 +1,7 @@
 {
   "schema_version": "4.2-v2-bonferroni",
-  "frozen_at_utc": "2026-11-18T16:55:14Z",
-  "git_sha": "a481bf666ee23d4676087c57f79008a6e9a42744",
+  "frozen_at_utc": "2026-11-18T18:21:30Z",
+  "git_sha": "6a53ae381f5b105fad2839325970cc3d8ceae281",
   "engine_dirty": false,
   "count_start_window_ts": 1795021200,
   "primary_eval_start_utc": "2026-11-21T00:00:00Z",

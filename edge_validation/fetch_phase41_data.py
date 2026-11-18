@@ -13,6 +13,7 @@ Download & cache Section 4.1 historical datasets (`2026-08-14 .. 2026-11-18`, BT
 from __future__ import annotations
 
 import asyncio
+import bisect
 import datetime
 import io
 import json
@@ -28,8 +29,8 @@ import pandas as pd
 ROOT = pathlib.Path(__file__).resolve().parent
 CACHE_DIR = ROOT / "cache"
 GAMMA_PARQUET = CACHE_DIR / "gamma_markets.parquet"
-CLOB_OUT = CACHE_DIR / "clob_hist_intrawindow.parquet"
-BN_OUT = CACHE_DIR / "bn_1s_tau_features.parquet"
+CLOB_OUT = CACHE_DIR / "clob_hist_l2.parquet"
+BN_OUT = CACHE_DIR / "bn_1s_tau_features_l1.parquet"
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 COIN_SHORT = {"BTCUSDT": "BTC", "ETHUSDT": "ETH", "SOLUSDT": "SOL"}
@@ -106,7 +107,39 @@ async def fetch_bytes_retry(
     raise RuntimeError(f"Failed {url}")
 
 
+def _sample_clob_token(pts: List[Tuple[int, float]], ts_arr: List[int], target: int) -> Tuple[float, float, float, float, float]:
+    px, lag = np.nan, np.nan
+    idx_pre = bisect.bisect_right(ts_arr, target) - 1
+    if idx_pre >= 0:
+        px, lag = pts[idx_pre][1], float(target - pts[idx_pre][0])
+    p5, dt5, p10 = np.nan, np.nan, np.nan
+    idx_post = bisect.bisect_left(ts_arr, target + 1)
+    if idx_post >= len(pts):
+        return px, lag, p5, dt5, p10
+    dt = pts[idx_post][0] - target
+    if dt <= 10:
+        p10 = pts[idx_post][1]
+    if dt <= 5:
+        p5, dt5 = pts[idx_post][1], float(dt)
+    return px, lag, p5, dt5, p10
+
+
+def _extract_window_taus(
+    coin: str, T: int, up_raw: list[dict[str, Any]], dn_raw: list[dict[str, Any]],
+) -> Dict[Tuple[str, int, int], Tuple[float, ...]]:
+    up_pts = sorted((int(x["t"]), float(x["p"])) for x in up_raw if "t" in x and "p" in x)
+    dn_pts = sorted((int(x["t"]), float(x["p"])) for x in dn_raw if "t" in x and "p" in x)
+    up_ts, dn_ts = [x[0] for x in up_pts], [x[0] for x in dn_pts]
+    out: Dict[Tuple[str, int, int], Tuple[float, ...]] = {}
+    for tau in TAUS:
+        up_px, up_lag, up_p5, up_dt5, up_p10 = _sample_clob_token(up_pts, up_ts, T + tau)
+        dn_px, dn_lag, dn_p5, dn_dt5, dn_p10 = _sample_clob_token(dn_pts, dn_ts, T + tau)
+        out[(coin, T, tau)] = (up_px, up_lag, dn_px, dn_lag, up_p5, up_dt5, dn_p5, dn_dt5, up_p10, dn_p10)
+    return out
+
+
 async def fetch_clob_intrawindow(client: httpx.AsyncClient, df_gamma: pd.DataFrame) -> pd.DataFrame:
+    """Fetch pre-tau and strict post-tau [tau+1, tau+5] CLOB snapshots across all gamma markets."""
     if CLOB_OUT.exists():
         df_old = pd.read_parquet(CLOB_OUT)
         if len(df_old) == len(df_gamma) * len(TAUS):
@@ -115,77 +148,42 @@ async def fetch_clob_intrawindow(client: httpx.AsyncClient, df_gamma: pd.DataFra
 
     pacer = RatePacer(max_per_10s=460.0, max_conc=36)
     valid = df_gamma[(df_gamma["found"] == 1) & df_gamma["up_token_id"].notna() & df_gamma["down_token_id"].notna()].copy()
-
-    batches: List[pd.DataFrame] = []
-    for coin in COINS:
-        sub = valid[valid["coin"] == coin].sort_values("T")
-        for i in range(0, len(sub), 10):
-            batches.append(sub.iloc[i : i + 10])
-
-    # Result dict keyed by (coin, T, tau) -> (up_px, up_lag, dn_px, dn_lag)
-    results: Dict[Tuple[str, int, int], Tuple[float, float, float, float]] = {}
+    batches: List[pd.DataFrame] = [sub.iloc[i : i + 10] for coin in COINS for sub in [valid[valid["coin"] == coin].sort_values("T")] for i in range(0, len(sub), 10)]
+    results: Dict[Tuple[str, int, int], Tuple[float, ...]] = {}
     lock = asyncio.Lock()
 
     async def process_batch(sub: pd.DataFrame) -> None:
-        toks: List[str] = []
-        meta: List[Tuple[str, int, str, str]] = []
-        for row in sub.itertuples(index=False):
-            toks.append(row.up_token_id)
-            toks.append(row.down_token_id)
-            meta.append((row.coin, int(row.T), row.up_token_id, row.down_token_id))
-        t_min = int(sub["T"].min())
-        t_max = int(sub["T"].max())
-        payload = {
-            "markets": toks,
-            "start_ts": t_min - 180,
-            "end_ts": t_max + 310,
-            "fidelity": 1,
-        }
+        meta = [(row.coin, int(row.T), row.up_token_id, row.down_token_id) for row in sub.itertuples(index=False)]
+        toks = [t for _, _, u, d in meta for t in (u, d)]
+        payload = {"markets": toks, "start_ts": int(sub["T"].min()) - 180, "end_ts": int(sub["T"].max()) + 310, "fidelity": 1}
         res = await post_json_retry(client, pacer, "https://clob.polymarket.com/batch-prices-history", payload)
         hist_map = res.get("history", {}) if isinstance(res, dict) else {}
-        local: Dict[Tuple[str, int, int], Tuple[float, float, float, float]] = {}
+        local: Dict[Tuple[str, int, int], Tuple[float, ...]] = {}
         for coin, T, up_tok, dn_tok in meta:
-            up_pts = sorted((int(x["t"]), float(x["p"])) for x in (hist_map.get(up_tok) or []) if "t" in x and "p" in x)
-            dn_pts = sorted((int(x["t"]), float(x["p"])) for x in (hist_map.get(dn_tok) or []) if "t" in x and "p" in x)
-            up_ts = [x[0] for x in up_pts]
-            dn_ts = [x[0] for x in dn_pts]
-            for tau in TAUS:
-                target = T + tau
-                up_px, up_lag = np.nan, np.nan
-                dn_px, dn_lag = np.nan, np.nan
-                # bisect right for last <= target
-                import bisect
-                ui = bisect.bisect_right(up_ts, target) - 1
-                if ui >= 0:
-                    up_px = up_pts[ui][1]
-                    up_lag = float(target - up_pts[ui][0])
-                di = bisect.bisect_right(dn_ts, target) - 1
-                if di >= 0:
-                    dn_px = dn_pts[di][1]
-                    dn_lag = float(target - dn_pts[di][0])
-                local[(coin, T, tau)] = (up_px, up_lag, dn_px, dn_lag)
+            local.update(_extract_window_taus(coin, T, hist_map.get(up_tok) or [], hist_map.get(dn_tok) or []))
         async with lock:
             results.update(local)
 
     t0 = time.time()
-    print(f"[4.1 CLOB] Fetching batch-prices-history [T, T+300] in {len(batches):,} calls...", flush=True)
+    print(f"[4.1 CLOB-L2] Fetching batch-prices-history [T, T+300] in {len(batches):,} calls...", flush=True)
     for start in range(0, len(batches), 400):
         await asyncio.gather(*(process_batch(b) for b in batches[start : start + 400]))
         done = min(start + 400, len(batches))
         if done % 1600 == 0 or done == len(batches):
-            print(f"  [4.1 CLOB] {done:,}/{len(batches):,} ({time.time() - t0:.1f}s)", flush=True)
+            print(f"  [4.1 CLOB-L2] {done:,}/{len(batches):,} ({time.time() - t0:.1f}s)", flush=True)
 
     rows = []
+    empty = (np.nan,) * 10
     for row in df_gamma[["coin", "T"]].itertuples(index=False):
         c, T = str(row.coin), int(row.T)
         for tau in TAUS:
-            up_px, up_lag, dn_px, dn_lag = results.get((c, T, tau), (np.nan, np.nan, np.nan, np.nan))
-            rows.append((c, T, tau, up_px, up_lag, dn_px, dn_lag))
-    df_out = pd.DataFrame(rows, columns=["coin", "T", "tau", "up_px", "up_lag_sec", "down_px", "down_lag_sec"])
-    for col in ("up_px", "up_lag_sec", "down_px", "down_lag_sec"):
+            rows.append((c, T, tau, *results.get((c, T, tau), empty)))
+    cols = ["coin", "T", "tau", "up_px", "up_lag_sec", "down_px", "down_lag_sec", "up_post5_px", "up_post5_dt", "down_post5_px", "down_post5_dt", "up_post10_px", "down_post10_px"]
+    df_out = pd.DataFrame(rows, columns=cols)
+    for col in cols[3:]:
         df_out[col] = df_out[col].astype("float32")
     df_out.to_parquet(CLOB_OUT, index=False)
-    print(f"[4.1 CLOB] Saved {CLOB_OUT}: rows={len(df_out):,}", flush=True)
+    print(f"[4.1 CLOB-L2] Saved {CLOB_OUT}: rows={len(df_out):,}, up_post5_notna={int(df_out['up_post5_px'].notna().sum()):,}", flush=True)
     return df_out
 
 
@@ -255,83 +253,79 @@ def _compute_sym_features(sym: str, closes_by_sec: np.ndarray, ts0: int, valid_t
     out: Dict[str, Any] = {
         "coin": np.full(len(Ts), coin, dtype=object),
         "T": Ts,
-        # S0 = mean over [T-60, T] (inclusive of T, i.e., 61s, plus store S0_excl [T-60, T-1] for parity check)
-        "S0": mean_range(idx_T - 60, idx_T),
+        # L1 fix: Binance kline at open_time=s closes at s+1, so bars closing in (T-60, T] are [T-60, T-1]
+        "S0": mean_range(idx_T - 60, idx_T - 1),
         "S0_excl": mean_range(idx_T - 60, idx_T - 1),
-        "twap60_close": mean_range(idx_T + 240, idx_T + 300),
-        "A_255": mean_range(idx_T + 240, idx_T + 255),
+        "twap60_close": mean_range(idx_T + 240, idx_T + 299),
+        "A_255": mean_range(idx_T + 240, idx_T + 254),
     }
     for tau in TAUS:
-        ti = np.clip(idx_T + tau, 0, n_tot - 1)
+        # L1 fix: spot at T+tau is bar with open_time = T+tau-1 (which closes at T+tau)
+        ti = np.clip(idx_T + tau - 1, 0, n_tot - 1)
         out[f"spot_{tau}"] = series[ti]
-        out[f"sigma_{tau}"] = sigma_trailing(idx_T + tau, 1800)
+        out[f"sigma_{tau}"] = sigma_trailing(idx_T + tau - 1, 1800)
     return pd.DataFrame(out)
 
 
+def _load_zip_into_array(content: bytes, arr_px: np.ndarray, ts0: int, ts1: int) -> None:
+    with zipfile.ZipFile(io.BytesIO(content)) as zf, zf.open(zf.namelist()[0]) as fh:
+        for chunk in pd.read_csv(fh, header=None, usecols=[0, 4], names=["ts", "c"], chunksize=600_000):
+            ts_s = _norm_ts_sec(chunk["ts"].to_numpy())
+            c = chunk["c"].to_numpy(dtype=np.float64)
+            m = (ts_s >= ts0) & (ts_s <= ts1)
+            if np.any(m):
+                arr_px[ts_s[m] - ts0] = c[m]
+
+
+async def _fetch_sym_bn_features(
+    client: httpx.AsyncClient, sym: str, urls_template: List[str],
+    sems: Tuple[asyncio.Semaphore, asyncio.Semaphore], ts0: int, ts1: int,
+) -> pd.DataFrame:
+    sem_zip, sem_rest = sems
+    t0 = time.time()
+    print(f"[4.1 BN-1s] Processing {sym} ({len(urls_template)} zips + REST Nov17-18)...", flush=True)
+    arr_px = np.full(ts1 - ts0 + 1, np.nan, dtype=np.float64)
+    urls = [u.format(SYM=sym) for u in urls_template]
+    for i in range(0, len(urls), 4):
+        contents = await asyncio.gather(*(fetch_bytes_retry(client, sem_zip, u) for u in urls[i : i + 4]))
+        for content in contents:
+            _load_zip_into_array(content, arr_px, ts0, ts1)
+        print(f"  [{sym}] zips {min(i + 4, len(urls))}/{len(urls)} ({time.time() - t0:.1f}s)", flush=True)
+
+    async def fetch_rest(s_sec: int) -> List[Tuple[int, float]]:
+        e_sec = min(s_sec + 999, ts1)
+        u = f"https://api.binance.com/api/v3/klines?symbol={sym}&interval=1s&startTime={s_sec * 1000}&endTime={e_sec * 1000}&limit=1000"
+        b = await fetch_bytes_retry(client, sem_rest, u)
+        return [(int(r[0]) // 1000, float(r[4])) for r in json.loads(b.decode())]
+
+    for part in await asyncio.gather(*(fetch_rest(s) for s in range(1794873540, ts1 + 1, 1000))):
+        for t_s, c_v in part:
+            if ts0 <= t_s <= ts1:
+                arr_px[t_s - ts0] = c_v
+
+    df_sym = _compute_sym_features(sym, arr_px, ts0, ts1)
+    miss = int(np.isnan(arr_px[2400:]).sum())
+    print(f"[4.1 BN-1s] {sym} done in {time.time() - t0:.1f}s (raw missing 1s ticks={miss:,})", flush=True)
+    return df_sym
+
+
 async def fetch_bn_1s_features(client: httpx.AsyncClient) -> pd.DataFrame:
+    """Download Binance monthly/daily 1s zips + REST tail and extract zero-look-ahead L1 features."""
     if BN_OUT.exists():
         df_old = pd.read_parquet(BN_OUT)
         if len(df_old) == 3 * ((T_END - T_START) // 300 + 1):
             print(f"[4.1 BN-1s] Cache hit: {len(df_old):,} rows", flush=True)
             return df_old
 
-    sem_zip = asyncio.Semaphore(3)
-    sem_rest = asyncio.Semaphore(16)
-    ts0 = T_START - 2400  # extra 40m warmup before T_START
-    ts1 = T_END + 305
-    n_secs = ts1 - ts0 + 1
-
-    urls_template: List[str] = []
-    for m in MONTHS_1S:
-        urls_template.append("https://data.binance.vision/data/spot/monthly/klines/{SYM}/1s/{SYM}-1s-" + f"{m}.zip")
+    sems = (asyncio.Semaphore(3), asyncio.Semaphore(16))
+    ts0, ts1 = T_START - 2400, T_END + 305
+    urls_template = ["https://data.binance.vision/data/spot/monthly/klines/{SYM}/1s/{SYM}-1s-" + f"{m}.zip" for m in MONTHS_1S]
     d = VISION_DAILY_START
     while d <= VISION_DAILY_END:
         urls_template.append("https://data.binance.vision/data/spot/daily/klines/{SYM}/1s/{SYM}-1s-" + f"{d.isoformat()}.zip")
         d += datetime.timedelta(days=1)
 
-    frames: List[pd.DataFrame] = []
-    for sym in SYMBOLS:
-        t0 = time.time()
-        print(f"[4.1 BN-1s] Processing {sym} ({len(urls_template)} zips + REST Nov17-18)...", flush=True)
-        arr_px = np.full(n_secs, np.nan, dtype=np.float64)
-
-        # Process zips sequentially or bounded batches of 4 to keep peak RAM < 150MB
-        urls = [u.format(SYM=sym) for u in urls_template]
-        for i in range(0, len(urls), 4):
-            batch_u = urls[i : i + 4]
-            contents = await asyncio.gather(*(fetch_bytes_retry(client, sem_zip, u) for u in batch_u))
-            for content in contents:
-                with zipfile.ZipFile(io.BytesIO(content)) as zf:
-                    with zf.open(zf.namelist()[0]) as f:
-                        for chunk in pd.read_csv(f, header=None, usecols=[0, 4], names=["ts", "c"], chunksize=600_000):
-                            ts_s = _norm_ts_sec(chunk["ts"].to_numpy())
-                            c = chunk["c"].to_numpy(dtype=np.float64)
-                            m = (ts_s >= ts0) & (ts_s <= ts1)
-                            if np.any(m):
-                                arr_px[ts_s[m] - ts0] = c[m]
-            print(f"  [{sym}] zips {min(i+4, len(urls))}/{len(urls)} ({time.time()-t0:.1f}s)", flush=True)
-
-        # Fetch REST tail [2026-11-17T00:00:00Z .. T_END+305] in 1000-sec chunks
-        rest_start = 1794873540  # slight overlap
-        starts = list(range(rest_start, ts1 + 1, 1000))
-
-        async def fetch_rest(s_sec: int) -> List[Tuple[int, float]]:
-            e_sec = min(s_sec + 999, ts1)
-            u = f"https://api.binance.com/api/v3/klines?symbol={sym}&interval=1s&startTime={s_sec*1000}&endTime={e_sec*1000}&limit=1000"
-            b = await fetch_bytes_retry(client, sem_rest, u)
-            return [(int(r[0]) // 1000, float(r[4])) for r in json.loads(b.decode())]
-
-        rest_parts = await asyncio.gather(*(fetch_rest(s) for s in starts))
-        for part in rest_parts:
-            for t_s, c_v in part:
-                if ts0 <= t_s <= ts1:
-                    arr_px[t_s - ts0] = c_v
-
-        df_sym = _compute_sym_features(sym, arr_px, ts0, ts1)
-        miss = int(np.isnan(arr_px[2400:]).sum())
-        print(f"[4.1 BN-1s] {sym} done in {time.time()-t0:.1f}s (raw missing 1s ticks={miss:,})", flush=True)
-        frames.append(df_sym)
-
+    frames = [await _fetch_sym_bn_features(client, sym, urls_template, sems, ts0, ts1) for sym in SYMBOLS]
     df_all = pd.concat(frames, ignore_index=True).sort_values(["T", "coin"]).reset_index(drop=True)
     df_all.to_parquet(BN_OUT, index=False)
     print(f"[4.1 BN-1s] Saved {BN_OUT}: rows={len(df_all):,}", flush=True)

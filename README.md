@@ -6,16 +6,12 @@
 
 ## Start Here (For Claude / Reviewers)
 
-- **Main Synthesis & R1–R8 / Section 4.1 / Section 4.2 / TWAP Sniper V2 Handoff**: [`CLAUDE_HANDOFF.md`](CLAUDE_HANDOFF.md) (`raw`: [CLAUDE_HANDOFF.md](https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/CLAUDE_HANDOFF.md))
-- **TWAP Sniper V2 Implementation & Dual Backtest Report (`1s-CLOB` + `96d 3-Coin Single-Slot` + 5.4 Risk)**: [`edge_validation/strategy_v2_report.md`](edge_validation/strategy_v2_report.md) + [`edge_validation/v2_backtest_trades_clob1s.csv`](edge_validation/v2_backtest_trades_clob1s.csv) + [`edge_validation/backtest_twap_sniper_v2.py`](edge_validation/backtest_twap_sniper_v2.py)
-- **Section 4.1 96-Day Verification (`82,944` settled markets / `414,720` snapshots + zero-lag audit)**: [`edge_validation/summary_41.md`](edge_validation/summary_41.md) + [`edge_validation/deviations.md`](edge_validation/deviations.md) + [`edge_validation/r1_r2_parity_proof.json`](edge_validation/r1_r2_parity_proof.json)
-  - Raw Section 4.1 dataset (`25 MB`): [`edge_validation/phase41_intrawindow.parquet`](edge_validation/phase41_intrawindow.parquet) + CSV summaries [`phase41_model_free_summary.csv`](edge_validation/phase41_model_free_summary.csv) & [`phase41_with_model_summary.csv`](edge_validation/phase41_with_model_summary.csv)
-- **Section 4.2 3-Coin Read-Only Recorder & Simulator**: [`edge_validation/live_recorder_42.py`](edge_validation/live_recorder_42.py) + [`edge_validation/frozen_config.json`](edge_validation/frozen_config.json) + [`strategy_reference/chainlink_oracle.py`](strategy_reference/chainlink_oracle.py) & [`oracle_sniper_runner.py`](strategy_reference/oracle_sniper_runner.py)
-- **Verified Platform Facts (102 markets, Nov 20 fee overhaul, RTT, SDK)**: [`platform_facts.md`](platform_facts.md) + [`settlement_latency.csv`](settlement_latency.csv)
-- **Maker vs Intrawindow Sniper 1s-CLOB Comparison + 96d 3-Coin Audit + Monte Carlo**: [`edge_validation/strategy_comparison_report.md`](edge_validation/strategy_comparison_report.md)
-  - Trade-level CSVs from `live_btc_5m.db` (`1,004` windows / `84.33h`): [`edge_validation/sniper_sim_btc.csv`](edge_validation/sniper_sim_btc.csv) & [`edge_validation/maker_sim_btc.csv`](edge_validation/maker_sim_btc.csv)
-  - Sniper pure strategy/pricing code: [`strategy_reference/oracle_sniper.py`](strategy_reference/oracle_sniper.py)
-  - Full `1,013`-window `1s` SQLite snapshot database (`121 MB`): hosted in [`altoslab-offical/polymarket-btc-5m` Release v1.0.0](https://github.com/altoslab-offical/polymarket-btc-5m/releases/tag/v1.0.0)
+- **Round-3 Main Synthesis & Full Audit Responses (`CLAUDE_HANDOFF.md`)**: [`CLAUDE_HANDOFF.md`](CLAUDE_HANDOFF.md) (`raw`: [CLAUDE_HANDOFF.md](https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/CLAUDE_HANDOFF.md))
+- **Section 4.1 Corrected `L1 + L2 + L3` 96-Day Report**: [`edge_validation/summary_41.md`](edge_validation/summary_41.md) + [`edge_validation/deviations.md`](edge_validation/deviations.md) + [`edge_validation/phase41_l2_post5_summary.csv`](edge_validation/phase41_l2_post5_summary.csv) + [`edge_validation/r1_r2_parity_proof.json`](edge_validation/r1_r2_parity_proof.json)
+  - Datasets & CSVs: [`edge_validation/phase41_intrawindow.parquet`](edge_validation/phase41_intrawindow.parquet), [`phase41_model_free_summary.csv`](edge_validation/phase41_model_free_summary.csv), [`phase41_with_model_summary.csv`](edge_validation/phase41_with_model_summary.csv), [`phase41_l2_post5_summary.csv`](edge_validation/phase41_l2_post5_summary.csv)
+- **Section 4.2 3-Coin Read-Only Recorder (`100/100` audit) & Frozen Bonferroni Config**: [`edge_validation/live_recorder_42.py`](edge_validation/live_recorder_42.py) + [`edge_validation/frozen_config.json`](edge_validation/frozen_config.json) + [`edge_validation/phase42_daily_report.md`](edge_validation/phase42_daily_report.md)
+- **TWAP Sniper V2 Reference Note (`live_btc_5m.db` in-sample reference; old `L4` compounding retracted)**: [`edge_validation/strategy_v2_report.md`](edge_validation/strategy_v2_report.md) + [`edge_validation/v2_backtest_trades_clob1s.csv`](edge_validation/v2_backtest_trades_clob1s.csv) + [`edge_validation/backtest_twap_sniper_v2.py`](edge_validation/backtest_twap_sniper_v2.py)
+- **Verified Platform Facts & Chainlink Oracle**: [`platform_facts.md`](platform_facts.md) + [`settlement_latency.csv`](settlement_latency.csv) + [`strategy_reference/chainlink_oracle.py`](strategy_reference/chainlink_oracle.py) + [`oracle_sniper.py`](strategy_reference/oracle_sniper.py) + [`oracle_sniper_runner.py`](strategy_reference/oracle_sniper_runner.py)
 
 ---
 
@@ -38,8 +34,6 @@ Pre-window RSI(7) + microstructure reversal with fixed 1-share taker sizing (`vw
 2. **Passive Maker Fails Empirically on 1,004 Real 1s-CLOB Windows (`live_btc_5m.db`)**:
    - `T=0s` contrarian `48¢`/`45¢` Maker (`0%` fee): `-0.0566` (`42.34%` WR) / `-0.0564` (`39.36%` WR).
    - Stepping back `1¢` on valid Sniper signals (`Maker-A3`): loses 40% of fills (`75 → 45`) and turns OOS negative (`-0.0131`, `78.57%` WR).
-3. **Intrawindow Chainlink TWAP Sniper + 44s Early Exit Works & Scales with Nov 20 Fees**:
-   - Taker Sniper (`n=75` BTC Full, `21.3/day`): **`90.67%` WR**, **`+0.0884`** (`0.07` fee) / **`+0.0920`** (`0.05`) / **`+0.0990`** (`0.01`). Pure OOS 40% (`n=23`): **`86.96%` WR**, **`+0.0528`** blended Nov 20 PnL.
-   - `68/75 (90.7%)` exit early at `bid >= 0.98` in **median `44s`** (and on-chain resolution takes median **`20s`** after `T+300` across `102` markets).
-   - 96-day (`82,944` settled markets) cross-coin check at `tau=180s`, `|Z|>=1.30`: BTC `96.46%`, ETH `96.37%`, SOL `96.60%` (`1.56×` non-overlapping 3-coin factor).
-   - Realistic OOS Monte Carlo from `$42.53U` (`26/day`, including `-1.5¢/sh` slippage stress): **`8–11 days` to `$100U`**, **`22–31 days` to `$200U`**. Next step: record 7–14 days of live BTC/ETH/SOL post-11/20 orderbooks (`dry_run` only) to confirm ETH/SOL OOS `n >= 300`.
+3. **Intrawindow Chainlink TWAP Sniper — Unbiased `L1+L2+L3` & Live 4.2 Status**:
+   - After fixing `L1` (`idx_T + tau - 1`), `L2` (`[tau+1, tau+5]` post-trigger fill), and `L3` (`EV >= 3.5c` conditional half-spread), strictly causal 96-day 3-coin OOS (`n=1,897`) converges to **`+0.02988/sh` (`95% CI [+0.02199, +0.03857]`)**, matching independent `1s-CLOB` (`+0.037 ± 0.042` @ `+1s`, `+0.027` @ `+2s`), while Model-Free `[tau+1, tau+5]` remains negative (`-0.003` to `-0.039`).
+   - Old `L4` portfolio compounding simulation (`$43 -> $192`) has been retracted. Live trading stays halted (`dry_run`); **`>= 2026-11-21T00:00:00Z`** live 1Hz Top-5 recording (`live_recorder_42.py`, 3 frozen configs, **Bonferroni `98.3% CI > 0` at `n >= 300`**) is the sole adjudication gate.

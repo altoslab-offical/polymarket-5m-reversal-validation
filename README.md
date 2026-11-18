@@ -6,7 +6,10 @@
 
 ## Start Here (For Claude / Reviewers)
 
-- **Main Synthesis & Strategy Debate Brief**: [`CLAUDE_HANDOFF.md`](CLAUDE_HANDOFF.md) (`raw`: [CLAUDE_HANDOFF.md](https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/CLAUDE_HANDOFF.md))
+- **Main Synthesis & R1–R8 / Section 4.1 / Section 4.2 Handoff**: [`CLAUDE_HANDOFF.md`](CLAUDE_HANDOFF.md) (`raw`: [CLAUDE_HANDOFF.md](https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/CLAUDE_HANDOFF.md))
+- **Section 4.1 96-Day Verification (`82,944` settled markets / `414,720` snapshots + zero-lag audit)**: [`edge_validation/summary_41.md`](edge_validation/summary_41.md) + [`edge_validation/deviations.md`](edge_validation/deviations.md) + [`edge_validation/r1_r2_parity_proof.json`](edge_validation/r1_r2_parity_proof.json)
+  - Raw Section 4.1 dataset (`25 MB`): [`edge_validation/phase41_intrawindow.parquet`](edge_validation/phase41_intrawindow.parquet) + CSV summaries [`phase41_model_free_summary.csv`](edge_validation/phase41_model_free_summary.csv) & [`phase41_with_model_summary.csv`](edge_validation/phase41_with_model_summary.csv)
+- **Section 4.2 3-Coin Read-Only Recorder & Simulator**: [`edge_validation/live_recorder_42.py`](edge_validation/live_recorder_42.py) + [`edge_validation/frozen_config.json`](edge_validation/frozen_config.json) + [`strategy_reference/chainlink_oracle.py`](strategy_reference/chainlink_oracle.py) & [`oracle_sniper_runner.py`](strategy_reference/oracle_sniper_runner.py)
 - **Verified Platform Facts (102 markets, Nov 20 fee overhaul, RTT, SDK)**: [`platform_facts.md`](platform_facts.md) + [`settlement_latency.csv`](settlement_latency.csv)
 - **Maker vs Intrawindow Sniper 1s-CLOB Comparison + 96d 3-Coin Audit + Monte Carlo**: [`edge_validation/strategy_comparison_report.md`](edge_validation/strategy_comparison_report.md)
   - Trade-level CSVs from `live_btc_5m.db` (`1,004` windows / `84.33h`): [`edge_validation/sniper_sim_btc.csv`](edge_validation/sniper_sim_btc.csv) & [`edge_validation/maker_sim_btc.csv`](edge_validation/maker_sim_btc.csv)

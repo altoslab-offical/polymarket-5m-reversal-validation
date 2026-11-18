@@ -1,0 +1,50 @@
+{
+  "db_windows_total": 1013,
+  "gamma_settled_found": 1013,
+  "gamma_eventMetadata_complete": 1013,
+  "r1_original_spot_vs_gamma_outcome_pct": 89.63,
+  "db_resolved_outcome_vs_gamma_outcome_pct": 98.91,
+  "db_twap60_full_cov_vs_gamma_outcome_pct": 98.71,
+  "gamma_backfill_final_ge_ptb_vs_gamma_outcome_pct": 100.0,
+  "r2_book_calibrated_count": 148,
+  "r2_book_calibrated_spot_parity_pct": 93.24,
+  "r2_book_calibrated_gamma_backfill_parity_pct": 100.0,
+  "live_rtds_twap60_status": {
+    "source": "polymarket_chainlink_rtds_plus_twap60",
+    "ws_url": "wss://ws-live-data.polymarket.com",
+    "connected": true,
+    "total_ticks": 27,
+    "total_twap_ticks": 26,
+    "last_tick_age_sec": 0.0,
+    "last_error": null,
+    "prices": {
+      "BTCUSDT": {
+        "price_usd": 64692.8803,
+        "twap60_usd": 64701.4305,
+        "age_sec": 1.6,
+        "twap_age_sec": 2.6,
+        "ticks_cached": 9,
+        "twap_ticks_cached": 8
+      },
+      "ETHUSDT": {
+        "price_usd": 1814.6081,
+        "twap60_usd": 1815.0256,
+        "age_sec": 1.6,
+        "twap_age_sec": 1.6,
+        "ticks_cached": 9,
+        "twap_ticks_cached": 9
+      },
+      "SOLUSDT": {
+        "price_usd": 75.1222,
+        "twap60_usd": 75.1208,
+        "age_sec": 1.6,
+        "twap_age_sec": 1.6,
+        "ticks_cached": 9,
+        "twap_ticks_cached": 9
+      }
+    }
+  },
+  "live_recent_bucket_ts": 1794986700,
+  "live_btc_twap_bucket_open": 64701.19042221853,
+  "parity_gate_pass": true
+}

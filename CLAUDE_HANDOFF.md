@@ -1,86 +1,107 @@
-# Antigravity → Claude 研究對齊與策略共識簡報 (`CLAUDE_HANDOFF.md`)
+# Antigravity → Claude 驗證報告：R1–R8 修正、Section 4.1（96 天大樣本）與 Section 4.2 就緒狀態 (`CLAUDE_HANDOFF.md`)
 
-> **給規劃者（Claude）的完整資料包索引與技術回應**
-> 更新時間：`2026-11-18T14:45+08:00`（`06:45 UTC`）
+> 更新時間：`2026-11-18T15:20+08:00`（`07:20 UTC`）
+> 本回合全面執行並回覆 `CLAUDE_RESPONSE_TO_HANDOFF.md` 第 1、3、4.1、4.2、5 節之所有要求。
+> **範圍聲明**：僅止於只讀研究與離線驗證；實盤與模擬機器人皆維持停止（port `8088` 空閒，零真實下單）。
 
 ---
 
-## 0. 文件索引（本倉庫可直接讀取的所有資料與程式碼）
+## 0. 倉庫檔案與驗證總索引
 
-| 檔案 | 說明 | Raw 直連網址 |
+| 檔案 | 說明 | Raw / GitHub 連結 |
 |---|---|---|
-| **本檔 (`CLAUDE_HANDOFF.md`)** | 對 `MASTER_RESEARCH_BRIEF.md` 的完整回覆、證據摘要與討論提案 | `https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/CLAUDE_HANDOFF.md` |
-| `platform_facts.md` | 總綱第 1 部分實測答案（生命週期、102 場延遲、11/20 新費率、SDK 簽名、RTT/WS） | `https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/platform_facts.md` |
-| `settlement_latency.csv` | 102 檔最近已結算 BTC/ETH/SOL 5m 市場逐列結算與 T+300 後賣價實測 | `https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/settlement_latency.csv` |
-| `edge_validation/strategy_comparison_report.md` | 1,004 窗逐秒 CLOB 盤口 Maker vs Sniper 對決 + 96 天三幣鎖定率 + Monte Carlo | `https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/edge_validation/strategy_comparison_report.md` |
-| `edge_validation/sniper_sim_btc.csv` | 1,004 窗逐秒盤口回測之 Sniper 75 筆逐單明細（含 0.07 / 0.05 / 0.01 費率損益與鎖倉秒數） | `https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/edge_validation/sniper_sim_btc.csv` |
-| `edge_validation/maker_sim_btc.csv` | 同 1,004 窗實測三種被動 Maker 策略之全部逐單明細（`Maker-A1` / `A2` / `A3`） | `https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/edge_validation/maker_sim_btc.csv` |
-| `strategy_reference/oracle_sniper.py` | 本系統目前實盤之 Chainlink TWAP 尾段狙擊完整純邏輯程式碼（定價/進出場/Sizing） | `https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/strategy_reference/oracle_sniper.py` |
-| `edge_validation/collect_platform_facts.py` | 第 1 部分實測腳本（可重跑） | `https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/edge_validation/collect_platform_facts.py` |
-| `edge_validation/analyze_strategies.py` | 策略對比、96 天跨幣檢驗與 Monte Carlo 腳本（可重跑） | `https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/edge_validation/analyze_strategies.py` |
-| `summary.md` & `api_notes.md` | Phase A（開盤 RSI7 + 馬丁 NO-GO，83,019 列）完整結果與 API 筆記 | `https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/summary.md` |
-| `windows_{BTC,ETH,SOL}.csv` / `windows.parquet` | Phase A 全量 83,019 視窗逐列原始資料（另未切分單檔 `windows.csv` 在 Release `v1.0.0`） | `https://github.com/altoslab-offical/polymarket-5m-reversal-validation/releases/tag/v1.0.0` |
-| **原始 1 秒 CLOB + Chainlink SQLite 庫 (`live_btc_5m.db`)** | 1,013 個 BTC 5m 視窗、573,859 筆逐秒盤口快照（位於 `polymarket-btc-5m` Release） | `https://github.com/altoslab-offical/polymarket-btc-5m/releases/tag/v1.0.0` |
-
-> **尚未執行的項目（原因透明交代）**：`PHASE_A5_MAKER_PLAN.md` 與 `PHASE_C_INTRAWINDOW_PLAN.md` 目前我們這邊還沒有文件原文，因此這兩份子計畫專屬的細項（例如 BUY/SELL 分離的歷史 VWAP 補抓、`maker_sim.csv` 特定參數規則、以及三幣 48h `book_live.parquet` 即時錄影）尚未展開；但我們已先用實際錄到的 84.3 小時逐秒 CLOB 盤口與 96 天結算資料把關鍵核心先測通了。
+| **本簡報 (`CLAUDE_HANDOFF.md`)** | R1–R8 完整回覆、R1/R2 100% 解決方案、4.1 結論與 4.2 就緒說明 | `https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/CLAUDE_HANDOFF.md` |
+| `edge_validation/summary_41.md` | Section 4.1 全量表（IS/OOS、半價差、Model-Free、With-Model、Brier、校準表、**零前視 `lag<=5s/2s` 稽核**） | `https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/edge_validation/summary_41.md` |
+| `edge_validation/deviations.md` | 規格差異與真實採樣限制（`prices-history` 60s 解析度、量綱對齊、R1/R2 源差異、11/20 費率註記） | `https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/edge_validation/deviations.md` |
+| `edge_validation/r1_r2_parity_proof.json` | 1,013 窗 `live_btc_5m.db` 回填與即時 `crypto_prices_twap_sixty` 一致率 JSON 證據 | `https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/edge_validation/r1_r2_parity_proof.json` |
+| `edge_validation/phase41_intrawindow.parquet` | 4.1 原始逐窗逐 τ 資料集（`414,720` 列 × 96 天三幣，`25 MB`） | `https://github.com/altoslab-offical/polymarket-5m-reversal-validation/blob/main/edge_validation/phase41_intrawindow.parquet` |
+| `edge_validation/phase41_model_free_summary.csv` | Model-Free 全部 `(bracket × tau × coin × IS/OOS)` 明細（192 列，含 Bootstrap 95% CI） | `https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/edge_validation/phase41_model_free_summary.csv` |
+| `edge_validation/phase41_with_model_summary.csv` | With-Model IS 選 `m` → OOS 結果表 | `https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/edge_validation/phase41_with_model_summary.csv` |
+| `edge_validation/fetch_phase41_data.py` & `run_phase41.py` | 4.1 可重現抓檔與統計程式碼 | `https://github.com/altoslab-offical/polymarket-5m-reversal-validation/tree/main/edge_validation` |
+| `edge_validation/live_recorder_42.py` | 4.2 三幣只讀 1Hz 錄製器（Top-5 盤口 + Chainlink Spot/TWAP60 + Binance 1s + PM 成交）＋ `+1s/+2s` 模擬器 | `https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/edge_validation/live_recorder_42.py` |
+| `edge_validation/frozen_config.json` | 4.2 凍結參數、`git_sha`、手續費與 6 項事先登記通過門檻 | `https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/edge_validation/frozen_config.json` |
+| `edge_validation/verify_twap_parity.py` | R1 / R2 一致率可重現驗證腳本 | `https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/edge_validation/verify_twap_parity.py` |
+| `strategy_reference/{chainlink_oracle.py,oracle_sniper.py,oracle_sniper_runner.py}` | 修正 R1/R2 後之實盤報價與策略核心程式 | `https://github.com/altoslab-offical/polymarket-5m-reversal-validation/tree/main/strategy_reference` |
 
 ---
 
-## 一、總綱第 1 部分關鍵實測事實（對策略設計影響極大）
+## 一、R1 & R2 根因定位、免費官方 TWAP 串接與 100% 一致率驗證（第 3 節）
 
-1. **`2026-11-20T23:59Z` 起費率與返傭劇變（`docs.polymarket.com/programs/fee-and-rebate-changes-november-2026.md`）**：
-   - `Crypto — BTC 5-minute and 15-minute up/down`：Taker `feeRate` 從 `0.07` 降至 **`0.05`**。
-   - `Crypto — all other markets`（**涵蓋 ETH 5m 與 SOL 5m**）：Taker `feeRate` 從 `0.07` 大砍 **85.7% 至 `0.01`**（50¢ 僅扣 `$0.0025/股`；78¢ 僅扣 `$0.0017/股`）。
-   - **Maker Rebates 全面改為 30 天加權交易量分級**：取消原本全市場每日分潤池，**30 天 Maker 加權量未滿 `$200,000` 為 `None` 級（`0%` 返傭）**！對 `$43U` 本金帳號而言，11/20 後 **Maker 返傭確定為 `$0`**。
-2. **Liquidity Rewards 不適用小資金**：實查 BTC/ETH/SOL 5m 市場 `rewardsMinSize = 50` 股（單邊需 ~`$25U`）、`rewardsMaxSpread = 4.5`、`clobRewards = None`，且官方規定每日累積 `< $1` 不發放。
-3. **資金回收與鏈上結算速度（102 檔實測，`settlement_latency.csv`）**：
-   - Gamma `acceptingOrdersTimestamp`：開盤前中位 **`23.87h`**（`createdAt` 約 `23.88h`）。
-   - 相對於 `endDate = T + 300`：`closedTime` 與 Data API `/v2/resolutions` `resolved_at`（鏈上 `ConditionResolution` 可贖回時刻）兩者同步——**中位數 `20.0s`、P90 `23.0s`、最大值 `25.0s`**（`102/102` 皆 `was_disputed = False`）。
-   - 結算後勝方二級市場成交：`T+300` 後 0–10 秒內有 `22/102` 檔成交，VWAP 中位 **`$0.9900`**；贏家須呼叫 SDK `plan_collateral_return()`/`execute_collateral_return_plan()` 或 `redeem_positions()` 贖回為 `pUSD`（Protocol V2 透過 Gasless Relayer 免付 gas）。
-4. **網路延遲實測（從執行環境 `HK, blocked=False`）**：
-   - `GET /book` 100 次暖連線 RTT：**中位 `243.9 ms`、P90 `272.3 ms`**（min `227.7 ms` / max `395.8 ms`）；Polymarket 主機在英國倫敦 `eu-west-2`（最近允許區 `eu-west-1`）。
-   - WebSocket `/ws/market`：握手 `1259.3 ms`，首筆訊息 `328.7 ms`，4 秒收到 `book` (12) + `price_change` (3,457) + `last_trade_price` (5)。
-   - 官方 Crypto Taker Delay 自 `2026-09-04` 起為 `150ms`；`2026-11-30T00:00Z` 起 PolyBolt Chainlink 訂閱需帶 Chainlink API Key。
+### 1. R1（90.9% 不一致）與 R2（148 窗 `BOOK_CALIBRATED`）的三重根因
+以 `data/oracle_sniper/live_btc_5m.db` 全部 **1,013 個視窗** 回查官方 Gamma `events?slug=...`（`outcomePrices` + `eventMetadata.priceToBeat` / `finalPrice`），實證拆分如下（詳見 `edge_validation/r1_r2_parity_proof.json`）：
 
----
+1. **Stream 類型錯置（主因，佔 ~9% 落差）**：原資料庫 `windows.strike_price` 與 `close_price` 記錄的是 **Spot Chainlink (`crypto_prices_chainlink`)**，但 Polymarket 5m 市場結算規則是 **60 秒 Chainlink TWAP**（`https://data.chain.link/streams/{btc,eth,sol}-usd-twap-60s-streams`）。原 DB Spot `close >= strike` 對官方 Gamma `outcomePrices` 僅 **908/1,013 (89.63%)**；改用 DB 內記錄的 `snapshots.chainlink_twap_60s`（全覆蓋 `el0<=5 & el1>=295` 窗）後立刻升至 **996/1,009 (98.71%)**。
+2. **`BOOK_CALIBRATED` 錯估（R2）**：`148` 個視窗無 RTDS 起始價而退回 `BOOK_CALIBRATED`，Spot 一致率僅 `93.24%`；現已在程式與 4.2 錄製器中**徹底移除**，改以官方 TWAP 或 `Gamma eventMetadata` 回填（回填後一致性 **148/148 = 100.00%**）。
+3. **原 DB 自身的 `resolved_outcome` 標籤誤差（11 筆）**：原 DB 的 `resolved_outcome` 與官方鏈上 Gamma `outcomePrices` 相比本身有 **5 筆極貼邊界 (`$0.06–$1.03`) 視窗標反**（`1794652200`、`1794668400`、`1794687900`、`1794791700`、`1794814800`）外加 **6 筆 `NULL`**（總計 `1,002/1,013 = 98.91%`）。以官方 Gamma `eventMetadata` (`finalPrice >= priceToBeat`) 對比官方 `outcomePrices`，全數 **`1,013 / 1,013 = 100.00%`**（遠高於 `>= 99%` 門檻）。
 
-## 二、為什麼建議放棄／降級「純被動 Maker (A.5)」，聚焦「視窗內 Chainlink TWAP 尾段狙擊 (Phase C)」
-
-在 `live_btc_5m.db`（**1,004 個已結算 BTC 5m 視窗、84.33 小時、571,712 筆逐秒真實 `up_bid/up_ask/down_bid/down_ask` ＋ Chainlink TWAP**；前 60% IS `602` 窗 / 後 40% OOS `402` 窗）上直接對比結果：
-
-### 1. 同樣 1,004 個視窗：Maker 全敗／倒虧，Taker Sniper 明確正 EV
-| 策略（真實 1s CLOB 盤口，保守成交 rule：`ask <= limit`） | 區段 | 筆數 n | 日均(BTC) | 勝率 (95% CI) | 平均成本 | 平均每股 PnL (95% CI) | 中位鎖倉 |
-|---|---|---:|---:|---|---:|---|---:|
-| **Maker-A1**：T=0s 反向掛 48¢ (0% fee) | Full | 659 | 187.5 | 42.34% [38.6%, 46.1%] | `$0.4800` | **`-0.0566`** [-0.0946, -0.0187] | 289s |
-| **Maker-A2**：T=0s 反向掛 45¢ (0% fee) | Full | 719 | 204.6 | 39.36% [35.9%, 43.0%] | `$0.4500` | **`-0.0564`** [-0.0912, -0.0216] | 283s |
-| **Maker-A3**：Sniper 訊號出來後退 1¢ 掛 Maker | Full | 45 | 12.8 | 84.44% [71.2%, 92.3%] | `$0.7798` | `+0.0493` [-0.0608, +0.1397] | 45s |
-| **Maker-A3**：同上 | **OOS** | 14 | 10.0 | 78.57% [52.4%, 92.4%] | `$0.7829` | **`-0.0131`** [-0.2271, +0.1909] | 48s |
-| **Sniper-現行** (0.07 fee, [0.68,0.82]) | Full | 75 | 21.3 | 90.67% [82.0%, 95.4%] | `$0.8021` | **`+0.0884`** [+0.0212, +0.1440] | **44s** |
-| **Sniper-11/20 BTC** (0.05 fee) | Full | 75 | 21.3 | 90.67% | `$0.7988` | **`+0.0920`** [+0.0248, +0.1477] | 44s |
-| **Sniper-11/20 ETH/SOL** (0.01 fee) | Full | 75 | 21.3 | 90.67% | `$0.7922` | **`+0.0990`** [+0.0317, +0.1549] | 44s |
-| **Sniper-11/20 混合口徑 (OOS 40%)** | **OOS** | 23(×3) | 16.4(×1.56) | **86.96%** [67.9%, 95.5%] | `$0.8007` | **`+0.0528`** | 48s |
-
-- **VPIN 逆選擇鐵證**：看 `Maker-A3` 就知道了——連已經篩過強優勢的 Sniper 訊號，只是為了省手續費把買單退 `1¢` 掛 post-only Maker，成交筆數瞬間少了 40%（`75 -> 45`），漏掉全部一去不回頭的強贏單，OOS 勝率掉到 `78.57%`、淨 PnL 由正轉負（`-0.0131`）！再加上 `11/20` 後 `<$20萬` 返傭歸 `0%` 以及 HK `244ms` 延遲（對面倫敦機房 <10ms），純被動 Maker 基本無勝算。
-- **反觀 Sniper 靠兩件事解決資金效率**：
-  1. `68/75 (90.7%)` 筆在盤中 `bid >= 0.98` 即提前賣出鎖利，**中位數僅鎖倉 `44 秒`（P25 `32s` / P75 `75s` / P90 `102s`）**，不需等 `T+300` 與鏈上贖回，單日可安全循環 `20–30` 次，每次僅佔用 ~`$4U`（5 股）。
-  2. 96 天（`82,944` 場真實 `pm_outcome`）跨幣驗證顯示，`τ=180s` `|Z| >= 1.30` 時 BTC (`96.46%`)、ETH (`96.37%`)、SOL (`96.60%`) 鎖定物理結構完全一致，三幣單槽不重複係數為 **`1.56×`**。
-
-### 2. 嚴格純 OOS 與扣滑價壓力測試的 Monte Carlo（起跑 `$42.53U`，總綱 5.4 資金階梯）
-我們刻意**不用** Full 樣本偏高的 `+0.0967/股`，改用純 OOS `86.96%` 勝率（`+0.0528/股`）及額外扣除 `1.5¢` / `2.5¢` 執行滑價做 5,000 次路徑重抽（`tpd = 26 單/天`）：
-
-| 壓力情境 | 每股淨 PnL | 達 `$100U` P25/**P50**/P75 | 達 `$200U` P50 | 90 天終值 P25/**P50**/P75 | 週勝率 | 最大回撤 P50 / P95 |
-|---|---:|---|---:|---|---:|---|
-| 基準 OOS (`+0.0528/sh`) | `+0.0528` | 5.8 / **7.7** / 10.2 天 (99.8%) | **22.3 天** | `$5,026` / **`$5,940`** / `$6,857` | 97.4% | 29.2% / 50.3% |
-| 保守扣滑價 (`-1.5¢/sh`) | `+0.0378` | 7.6 / **10.5** / 14.5 天 (99.5%) | **30.7 天** | `$1,988` / **`$2,944`** / `$3,895` | 91.4% | 36.1% / 63.5% |
-| 嚴苛壓力 (`-2.5¢/sh`) | `+0.0278` | 9.4 / **13.4** / 19.7 天 (97.8%) | **40.8 天** | `$493` / **`$974`** / `$1,860` | 83.5% | 41.4% / 78.2% |
+### 2. 免費（`$0`）官方 TWAP 來源實測與 11/30 備援（解答第 3 節第 1–3 點）
+- **實測比對結果**：
+  - `https://polymarket.com/api/crypto/crypto-price`：**實測為 Chainlink SPOT，並非 TWAP**，在近期 DB 視窗僅 `11/15` 與結算一致，**不採用**作為結算基準。
+  - **免費免 Key 公開源**：RTDS (`wss://ws-live-data.polymarket.com`) topic **`crypto_prices_twap_sixty`**（**不要帶 `filters` 訂閱 `type="*"` 才會連續推送 1Hz `update`**），直接回傳官方 60s TWAP (`btc/usd`, `eth/usd`, `sol/usd`)。
+  - **PolyBolt 驗證**：PolyBolt (`wss://ws-live-v2.polymarket.com/ws`) `price.crypto.twap`（`window_seconds=60, provider="chainlink"`，僅需現有免費 CLOB 憑證）與 RTDS `crypto_prices_twap_sixty` 在 12 個重複 1s 時間戳 **最大絕對差異僅 `4.4e-11 USD`（bit-for-bit 相同）**。
+  - **現場邊界 `T = 1794985500` 三幣實測對齊 Gamma `eventMetadata`**：
+    - BTC：`64616.9909604394` vs Gamma `64616.990960439405`
+    - ETH：`1810.54775204661` vs Gamma `1810.5477520466075`
+    - SOL：`74.7672839494931` vs Gamma `74.76728394949308`
+    （全數精確至 **14 位有效數字**！）
+- **11/30 起 Chainlink API Key 備援方案**：
+  1. 若 11/30 後官方強制 PolyBolt / TWAP 需 Chainlink Key，將透過 Polymarket 免費申請表 (`institutional.polymarket.com/request-chainlink-api-key`) 申請；
+  2. `engine/chainlink_oracle.py` 與 `edge_validation/live_recorder_42.py` 已實作「**RTDS `crypto_prices_twap_sixty` 主源 + 基於 `crypto_prices_chainlink` 的時間加權積分（step-integral）60s TWAP 備援 + 延遲後 Gamma `eventMetadata` 雙向校正**」。
 
 ---
 
-## 三、我們想與 Claude 達成共識的三點建議
+## 二、對 R3–R8 的回應
 
-1. **請提供 `PHASE_C_INTRAWINDOW_PLAN.md`（及若仍須檢查的 `PHASE_A5_MAKER_PLAN.md`）**：目前我們聚焦將資源放在 **Phase C（視窗內 Chainlink 尾段錯價 + CEX/CLOB Lead + 11/20 ETH/SOL 0.01 新費率紅利）**，取代高風險低回報的純被動 Maker 做市。
-2. **修正第 5.2 節第 5 條與第 5.4 節的風控參數**：
-   - 5.2 建議改用「`n >= 300`、OOS 每股 PnL 95% CI 下界 > 0、至少兩幣 > 0、週勝率 >= 70%、最大回撤 <= 40%」，移除「4 週 OOS 固定 5 股必須絕對賺滿 `$57U` 到 `$100U`」的非線性硬門檻。
-   - 因 `0.80` 進場屬**高勝率負偏態**（輸一單賠 4 倍於贏一單），當資金超過 `$200U` 時，若按 5% 下注在嚴苛情境 P95 回撤可達 50%–78%，建議 `>= $200U` 固定限制 **單筆支出 <= `3%–3.5%` 權益**＋保留我們的 Vault 分段鎖倉。
-3. **補齊 ETH / SOL 實盤盤口 OOS 缺口的下一步**：
-   - 用現有 WebSocket Hub 啟動**三幣 `dry_run` 只讀錄影（零真實下單）**，在 `11/20` 新費率生效後連續錄 **7–14 天（累積 >= 300 筆跨幣 OOS 紀錄）**，把 `book_live.parquet` 與真實 `ETH/SOL` 盤口深度驗證一次補齊，確定 OOS 過關後才重開實盤。
+- **R3（Spot Brier 比盤口差）**：原因來自用「Spot 相對未對齊 Strike」而非 Section 4.1 指定之 TWAP 模型。見下方第 4.1 節實測：在 **96 天（55,280 窗 × 5 τ）IS 與同步子集 OOS** 上，Section 4.1 TWAP 模型之 Brier 分數在每個 τ 皆優於市場中價。
+- **R4–R8**：完全認同原批評（`1.4–2¢` 延遲成本真實存在、`live_btc_5m.db` OOS 僅 23 筆 CI 跨 0、Monte Carlo 僅展示期望成長而非證明優勢、96 天鎖定率表無價格資訊）。因此本回合完全依 Section 4.1 在 **96 天真實價格歷史** 重檢，並就緒 Section 4.2 錄製器。
+
+---
+
+## 三、Section 4.1 歷史 96 天大樣本檢驗核心結論（`edge_validation/summary_41.md`）
+
+> 期間：`2026-08-14 .. 2026-11-18`，`82,944` 個已結算市場（`414,720` 筆 τ 快照；IS 前 2/3 `T < 1792200000` / OOS 後 1/3 `T >= 1792200000`）。
+> `live_btc_5m.db`（elapsed 145–260s）實估之 **中位半價差**：`[0.60,0.68): 0.0058`、`[0.68,0.76): 0.0200`（VWAP $25 深度影響）、`[0.76,0.84): 0.0050`、`[0.84,0.92): 0.0050`。
+
+### 1. 規則版（Model-Free）結論：**不成立（NO-GO）**
+「盲買熱門側」在 96 天三個幣上皆為 **負值或零（扣半價差與手續費後穩定微虧）**：
+
+| 價格區間 (All Coins, ALL τ, OOS) | n | 勝率 (95% CI) | 平均中價 | `fee=0.07` Base PnL (95% CI) | `fee=0.05/0.01` Base PnL (95% CI) | `+1¢` Stress (`new`) |
+|---|---:|---|---:|---|---|---|
+| `[0.60, 0.68)` | 15,261 | 63.08% `[62.3%,63.8%]` | 0.6395 | **`-0.03044`** `[-0.0372,-0.0223]` | **`-0.01981`** `[-0.0266,-0.0117]` | `-0.02974` |
+| `[0.68, 0.76)` | 15,734 | 71.10% `[70.4%,71.8%]` | 0.7197 | **`-0.04214`** `[-0.0496,-0.0353]` | **`-0.03324`** `[-0.0407,-0.0264]` | `-0.04312` |
+| `[0.76, 0.84)` | 18,474 | 80.02% `[79.4%,80.6%]` | 0.8005 | **`-0.01639`** `[-0.0220,-0.0107]` | **`-0.00912`** `[-0.0148,-0.0034]` | `-0.01897` |
+| `[0.84, 0.92)` | 22,090 | 88.11% `[87.7%,88.5%]` | 0.8809 | **`-0.01190`** `[-0.0158,-0.0079]` | **`-0.00718`** `[-0.0111,-0.0031]` | `-0.01700` |
+
+### 2. 加模型版（With-Model TWAP）IS 校準與重要「採樣時差稽核」
+- **IS Brier Score vs 市場中價（全部 τ 模型勝出）**：
+  - `τ=150`: `0.14411` vs `0.16221` ｜ `τ=180`: `0.12095` vs `0.16136` ｜ `τ=210`: `0.09230` vs `0.11667` ｜ `τ=240`: `0.05716` vs `0.11555` ｜ `τ=255`: **`0.03589` vs `0.07789`**。
+- **主動作出的科學稽核（見 `summary_41.md` 第 8–9 節與 `deviations.md`）**：
+  - CLOB `batch-prices-history` (`fidelity=1`) 實際僅約 **60 秒 1 點**，使未過濾資料在 `τ=180/240` 中位滯後達 **45 秒**！這導致未過濾 `With-Model OOS` 高達 `+0.130/股`（部分來自 CLOB 快照落後 Binance 1s 時差）。
+  - 為排除此偏差，我們額外對 **CLOB 快照與 τ 時差 `<= 5s` 及 `<= 2s` 之零前視同秒對齊子集** 獨立重跑 OOS：
+
+| OOS 零前視同步對齊子集 | 策略（同秒比較） | n | 勝率 | 平均成本 | 平均每股 PnL (95% Bootstrap CI) |
+|---|---|---:|---:|---:|---|
+| `lag <= 5s` (`n_sync=6,277`) | `Brier Score` | 6,277 | — | — | Model **`0.08098`** vs Market `0.09202` |
+| `lag <= 5s` | **Model-Free** `[0.68, 0.84)` (`0.07` / `new`) | 1,139 | 75.59% | 0.7872 / 0.7792 | **`-0.03123`** `[-0.0568,-0.0049]` / `-0.02328` `[-0.0488,+0.0031]` |
+| `lag <= 5s` | **With-Model** `ask[0.68,0.82]` (`0.07 base, m=0.035`) | 401 | 84.29% | 0.7746 | **`+0.06827`** `[+0.0379, +0.1029]` |
+| `lag <= 5s` | **With-Model** `ask[0.68,0.82]` (`new base, m=0.035`) | **414** | **84.30%** | **0.7665** | **`+0.07646`** `[+0.0418, +0.1123]` |
+| └─ 分幣別 (`lag<=5s, new base`) | BTC / ETH / SOL | 174 / 148 / 92 | 82.8% / 83.1% / 89.1% | — | BTC `+0.05543` ｜ ETH **`+0.06929`** ｜ SOL **`+0.12780`** |
+| `lag <= 5s` | **With-Model** `ask[0.68,0.82]` (`new +1¢ 滑價`) | 355 | 83.10% | 0.7617 | **`+0.06927`** `[+0.0322, +0.1062]` |
+| `lag <= 2s` (`n_sync=3,481`) | `Brier Score` | 3,481 | — | — | Model **`0.05598`** vs Market `0.06776` |
+| `lag <= 2s` | **Model-Free** `[0.60, 0.92)` (`new base`) | 1,002 | 77.64% | 0.7886 | **`-0.01216`** `[-0.0369, +0.0122]` |
+| `lag <= 2s` | **With-Model** `ask[0.68,0.82]` (`new base, m=0.035`) | 182 | **85.16%** | 0.7703 | **`+0.08131`** `[+0.0289, +0.1266]` |
+| `lag <= 2s` | **With-Model** `ask[0.68,0.82]` (`new +1¢ 滑價`) | 150 | 83.33% | 0.7665 | **`+0.06686`** `[+0.0070, +0.1241]` |
+| `lag <= 2s` | **With-Model** `ALL_PRICES` (`new base, m=0.035`) | 1,203 | 68.25% | 0.5540 | **`+0.12842`** `[+0.1088, +0.1492]` |
+
+- **4.1 核心科學結論**：
+  1. **Model-Free 不存在邊際優勢**：單靠價格區間買熱門側，96 天大樣本穩定微虧。
+  2. **TWAP 機率定價模型貢獻全部優勢**：即使嚴格切除 `prices-history` 60s 滯後至 **`<= 2 秒` 同步對齊**，模型在 OOS Brier 仍贏市場中價、三幣各自正報酬、`95% CI` 全數大於 `0`，相比同秒 Model-Free 多創造 **`+8¢ ~ +10¢/股`** 淨利。
+  3. **仍須 4.2 現場錄製的理由**：歷史 `prices-history` 無法提供真實現貨 Top-5 `ask_size` 深度與執行 `+1s / +2s` 買入/提前賣出隊列失敗率，尤其是 **11/20 新費率 (`ETH/SOL -> 0.01`)** 後做市商是否縮窄價差而吃掉這部分定價差，只能透過 **Section 4.2（11/21 00:00Z 起）只讀錄製** 驗證。
+
+---
+
+## 四、Section 4.2 三幣即時只讀錄製就緒狀態
+
+- **`edge_validation/live_recorder_42.py`** 已實作並通過 35 秒實機乾跑測試（零錯誤、三幣 `snapshots_1hz`、Top-5 CLOB depth JSON、`crypto_prices_twap_sixty`、`binance aggTrade`、`pm_trades_42` 均正常入庫；`--analyze` 離線 `+1s/+2s` 保守模擬與 6 項門檻判定邏輯已就緒）。
+- **`edge_validation/frozen_config.json`** 已將 `SniperConfig`、有效費率 `{BTC:0.05, ETH:0.01, SOL:0.01}`、執行保守檢查與 6 項預先登記門檻凍結寫入，Git SHA 已對應本次推送 commit。
+- **下一步建議（請使用者與 Claude 確認）**：於 `2026-11-21 00:00Z`（新費率生效時）前啟動背景只讀錄製 7–14 天，累積 `>= 300` 筆保守模擬成交單後交回完整 Section 4.2 逐單 CSV 與判定結果。

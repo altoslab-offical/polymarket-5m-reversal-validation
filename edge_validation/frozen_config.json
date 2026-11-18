@@ -1,8 +1,17 @@
 {
-  "schema_version": "4.2-v2",
-  "frozen_at_utc": "2026-11-18T08:16:39Z",
-  "git_sha": "05b6bc728ea598334be0dce19f382c899a5e38b1",
+  "schema_version": "4.2-v2-bonferroni",
+  "frozen_at_utc": "2026-11-18T09:25:14Z",
+  "git_sha": "14f4ad293be707848925098769cf1773e3152857",
   "engine_dirty": false,
+  "primary_eval_start_utc": "2026-11-21T00:00:00Z",
+  "primary_eval_start_ts": 1795219200,
+  "pre_registered_models": [
+    "v2_pure",
+    "v2_filtered",
+    "v1"
+  ],
+  "bonferroni_alpha": 0.016667,
+  "bonferroni_ci_pct": 98.33,
   "effective_fees_post_nov20": {
     "BTCUSDT": 0.05,
     "ETHUSDT": 0.01,
@@ -121,6 +130,9 @@
     "early_exit_delay_sec": 1,
     "require_top_bid_sz_ge_shares": true,
     "bankroll_gates": {
+      "pilot_fixed_shares": 5,
+      "pilot_trades": 100,
+      "pilot_slippage_max_cents": 1.0,
       "max_risk_pct_ge_200u": 0.03,
       "low_bankroll_daily_loss_stop_usd": 10.0,
       "low_bankroll_consec_loss_stop": 3,
@@ -132,6 +144,8 @@
     "max_days": 14,
     "min_trades_total": 300,
     "pnl_per_share_ci95_lo_gt": 0.0,
+    "bonferroni_ci98_3_lo_gt": 0.0,
+    "multi_config_count": 3,
     "min_positive_coins": 2,
     "min_median_trades_per_day": 10,
     "min_positive_weeks_pct": 0.7,

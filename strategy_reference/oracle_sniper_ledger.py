@@ -12,6 +12,7 @@ from typing import Any, Optional
 ROOT_DIR = Path(__file__).resolve().parent.parent
 STATE_PATH = ROOT_DIR / "data" / "oracle_sniper_state.json"
 PAPER_STATE_PATH = ROOT_DIR / "data" / "oracle_sniper_paper_43u.json"
+PAPER_40U_STATE_PATH = ROOT_DIR / "data" / "oracle_sniper_paper_40u.json"
 MAX_TRADES_KEPT = 500
 SYMBOL_ORDER = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 
@@ -58,6 +59,16 @@ PAPER_43U_RISK_POLICY = SniperRiskPolicy(
     rolling_halt_permanent=True,
     use_utc_day=True,
     paper_initial_equity_u=43.0,
+)
+
+PAPER_40U_RISK_POLICY = SniperRiskPolicy(
+    fixed_daily_loss_cap_u=10.0,
+    consec_loss_day_halt=3,
+    rolling_window=50,
+    rolling_be_buffer=0.02,
+    rolling_halt_permanent=True,
+    use_utc_day=True,
+    paper_initial_equity_u=40.0,
 )
 
 

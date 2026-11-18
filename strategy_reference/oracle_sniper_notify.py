@@ -13,7 +13,10 @@ def _coin(symbol: str) -> str:
 
 
 def _tag_for(obj: dict[str, Any]) -> str:
-    return PAPER_TAG if obj.get("paper_mode") else TAG
+    if not obj.get("paper_mode"):
+        return TAG
+    init_u = int(round(float(obj.get("paper_initial_u") or 43)))
+    return f"TWAP V2·🧪 模擬盤 ${init_u}U"
 
 
 def entry_message(trade: dict[str, Any], perf_lines: str) -> str:

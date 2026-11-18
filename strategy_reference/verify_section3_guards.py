@@ -17,8 +17,8 @@ from engine.oracle_sniper import (
     SniperConfig,
     check_frozen_config_parity,
 )
-from engine.oracle_sniper_ledger import PAPER_43U_RISK_POLICY, PRODUCTION_RISK_POLICY, SniperLedger, local_date_str
-from engine.oracle_sniper_runner import PAPER_43U_EXEC_POLICY, PRODUCTION_EXEC_POLICY, OracleSniperRunner, SniperExecutionPolicy
+from engine.oracle_sniper_ledger import PAPER_40U_RISK_POLICY, PAPER_43U_RISK_POLICY, PRODUCTION_RISK_POLICY, SniperLedger, local_date_str
+from engine.oracle_sniper_runner import PAPER_40U_EXEC_POLICY, PAPER_43U_EXEC_POLICY, PRODUCTION_EXEC_POLICY, OracleSniperRunner, SniperExecutionPolicy
 
 
 class StrictFakeChainlink:
@@ -28,7 +28,7 @@ class StrictFakeChainlink:
         self.connected = True
         self.spot_age = 0.3
         self.twap_age = 0.5
-        self.prices = {"BTCUSDT": 100.048, "ETHUSDT": 100.050, "SOLUSDT": 100.049}
+        self.prices = {"BTCUSDT": 100.048, "ETHUSDT": 100.048, "SOLUSDT": 100.048}
         self.opens = {"BTCUSDT": 100.0, "ETHUSDT": 100.0, "SOLUSDT": 100.0}
         self.ticks = {s: [(0.0, 100.0)] for s in self.prices}
 
@@ -58,27 +58,31 @@ def _make_strict_runner(
     notifier = MagicMock()
     notifier.dispatch_signal = AsyncMock()
     cl = StrictFakeChainlink()
-    pol = replace(PRODUCTION_EXEC_POLICY, frozen_config_path=Path(__file__).resolve().parent / "edge_validation" / "frozen_config.json")
+    pol = replace(PRODUCTION_EXEC_POLICY, frozen_config_path=Path(__file__).resolve().parent / "edge_validation" / "frozen_config.json", vol_cache_path=None)
     led = SniperLedger(tmp / f"{tag}.json", policy=PRODUCTION_RISK_POLICY)
     runner = OracleSniperRunner(at, cl, notifier, cfg=cfg, ledger=led, policy=pol)
     w = (int(time.time()) // 300) * 300 + 300
     now = float(w + 200)
     at.live_wallet_state["updated_at_ms"] = int(now * 1000)
+    now_sec = int(now)
     for sym, st in runner.hub.states.items():
         st.reset_for_window(w)
         st.up_token, st.down_token, st.slug, st.price_to_beat = f"{sym}-up", f"{sym}-dn", f"{sym}-5m-{w}", 100.0
         st.meta_checked_ts = st.prefetch_ts = 1e12
-        for i in range(600):
-            st.tracker.on_price(now - 600 + i, 100.0 + 0.048 * (i + 1) / 600.0)
-        st.binance_price, st.binance_ts = cl.prices[sym], now
+        for i in range(1800):
+            ts_i = now_sec - 1800 + i
+            px_i = 100.0 + 0.048 * ((i + 1) / 1800.0)
+            st.micro.ingest_bn_1s(ts_i, px_i, 0.0, 0.0, real_trade=True)
+        st.ingest_binance_trade(now, cl.prices[sym], 0.0, False)
         st.coinbase_price, st.coinbase_ts = cl.prices[sym], now
+        st.apply_book(sym, "UP", {"asset_id": st.up_token, "timestamp": int(now * 1000), "bids": [{"price": "0.76", "size": "100"}], "asks": [{"price": "0.78", "size": "100"}]}, via_ws=True) if False else None
         st.book = OrderBookTop(0.76, 0.78, 0.20, 0.22)
         st.up_local_ts = st.down_local_ts = now
     return runner, at, cl, w
 
 
 def check_frozen_parity_and_concurrency(tmp: Path) -> int:
-    """Verify frozen_config parity gate and simultaneous 3-coin (1 per coin) entry support."""
+    """Verify frozen_config parity gate and aligned single_slot (1 position across 3 eligible coins)."""
     frozen_p = Path(__file__).resolve().parent / "edge_validation" / "frozen_config.json"
     ok, diffs = check_frozen_config_parity(TWAP_V2_FILTERED_CONFIG, frozen_p, "v2_filtered")
     assert ok and not diffs, diffs
@@ -89,24 +93,24 @@ def check_frozen_parity_and_concurrency(tmp: Path) -> int:
     asyncio.run(r_bad._tick(float(w_bad + 200)))
     assert at_bad.sniper_buy.await_count == 0 and r_bad.ledger.state["skips"].get("FROZEN_CONFIG_DRIFT", 0) >= 1
 
-    # Valid config with all 3 coins eligible enters up to 3 simultaneous positions (1 per coin)
-    r, at, _cl, w = _make_strict_runner(tmp, "conc3", cash=100.0)
+    # Valid config with all 3 coins eligible enters strictly 1 position (single_slot, BTCUSDT via +1c bonus)
+    r, at, _cl, w = _make_strict_runner(tmp, "slot1", cash=100.0)
     asyncio.run(r._tick(float(w + 200)))
     asyncio.run(asyncio.sleep(0))
-    assert at.sniper_buy.await_count == 3, f"expected 3 concurrent orders (1/coin), got {at.sniper_buy.await_count}"
-    assert set(r._positions.keys()) == {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
-    # Re-tick same window must NOT enter a 4th position
+    assert at.sniper_buy.await_count == 1, f"expected single_slot=1 order, got {at.sniper_buy.await_count}"
+    assert set(r._positions.keys()) == {"BTCUSDT"}, r._positions
+    # Re-tick same window must NOT enter a 2nd position
     asyncio.run(r._tick(float(w + 210)))
-    assert at.sniper_buy.await_count == 3
+    assert at.sniper_buy.await_count == 1
     return 1
 
 
 def check_freshness_hard_blocks(tmp: Path) -> int:
     """Verify RTDS disconnected, Chainlink TWAP > 3s, and Binance > 2s hard-block entries (while fresh allows)."""
-    # Control baseline: fresh feeds MUST actually enter (anti-vacuous-pass check)
+    # Control baseline: fresh feeds MUST enter 1 coin (single_slot)
     r0, at0, _cl0, w0 = _make_strict_runner(tmp, "fresh_ok")
     asyncio.run(r0._tick(float(w0 + 200)))
-    assert at0.sniper_buy.await_count == 3, f"fresh baseline must enter 3 coins, got {at0.sniper_buy.await_count}"
+    assert at0.sniper_buy.await_count == 1, f"fresh baseline must enter 1 coin, got {at0.sniper_buy.await_count}"
     for idx, mode in enumerate(("rtds_down", "twap_stale", "binance_stale")):
         r, at, cl, w = _make_strict_runner(tmp, f"fresh_{idx}")
         now = float(w + 200)
@@ -154,32 +158,30 @@ def check_section3_circuit_breakers(tmp: Path) -> int:
     return 1
 
 
-def check_paper_43u_simulation(tmp: Path) -> int:
-    """Verify $43U paper simulation never hits real CLOB, simulates +1s miss/fill, updates $43 cash, and emits TG alerts."""
-    r, at, cl, w = _make_strict_runner(tmp, "paper43")
-    r.ledger = SniperLedger(tmp / "paper43_state.json", policy=PAPER_43U_RISK_POLICY)
-    r.policy = replace(PAPER_43U_EXEC_POLICY, frozen_config_path=Path(__file__).resolve().parent / "edge_validation" / "frozen_config.json", paper_fill_delay_sec=0.0)
-    r.ledger.ensure_baseline(43.0)
+def check_paper_40u_simulation(tmp: Path) -> int:
+    """Verify $40U single-slot paper simulation never hits real CLOB, simulates +1s depth/price FAK miss, and updates cash."""
+    r, at, cl, w = _make_strict_runner(tmp, "paper40")
+    r.ledger = SniperLedger(tmp / "paper40_state.json", policy=PAPER_40U_RISK_POLICY)
+    r.policy = replace(PAPER_40U_EXEC_POLICY, frozen_config_path=Path(__file__).resolve().parent / "edge_validation" / "frozen_config.json", paper_fill_delay_sec=0.0, vol_cache_path=None)
+    r.ledger.ensure_baseline(40.0)
     now = float(w + 200)
     asyncio.run(r._tick(now))
     asyncio.run(asyncio.sleep(0))
     assert at.sniper_buy.await_count == 0, "paper_simulation must NEVER call real sniper_buy"
-    assert len(r._positions) == 3, f"expected 3 paper positions on $43U? wait check pending cap"
-    # Verify paper debit decreased cash cleanly from 43.0
-    assert 30.0 <= float(r.ledger.state["paper_cash_u"]) < 34.0, r.ledger.state["paper_cash_u"]
+    assert len(r._positions) == 1, f"expected single_slot=1 paper position on $40U, got {len(r._positions)}"
+    assert 35.0 <= float(r.ledger.state["paper_cash_u"]) < 37.0, r.ledger.state["paper_cash_u"]
     msg_types = [c.args[0]["event_type"] for c in r.notifier.dispatch_signal.await_args_list]
-    assert "SNIPER_ENTRY" in msg_types and "🧪 模擬盤 $43U" in r.notifier.dispatch_signal.await_args_list[0].args[0]["message"]
-    # Verify +1s price spike causes realistic PAPER_MISSED_1S instead of free fill
-    r2, at2, _cl2, w2 = _make_strict_runner(tmp, "paper_miss")
-    r2.ledger = SniperLedger(tmp / "paper_miss_state.json", policy=PAPER_43U_RISK_POLICY)
-    r2.policy = replace(PAPER_43U_EXEC_POLICY, frozen_config_path=Path(__file__).resolve().parent / "edge_validation" / "frozen_config.json", paper_fill_delay_sec=0.0)
-    for st in r2.hub.states.values():
-        st.book = OrderBookTop(0.76, 0.78, 0.20, 0.22)
-    # Wait: fill only works if ask <= limit_px; test _paper_buy directly when ask moves to 0.96!
-    cand_mv = r2._positions
+    assert "SNIPER_ENTRY" in msg_types and "🧪 模擬盤 $40U" in r.notifier.dispatch_signal.await_args_list[0].args[0]["message"]
+    # Verify +1s price spike causes PAPER_MISSED_PRICE and shallow ask causes PAPER_MISSED_DEPTH
+    r2, _at2, _cl2, _w2 = _make_strict_runner(tmp, "paper_miss")
+    r2.ledger = SniperLedger(tmp / "paper_miss_state.json", policy=PAPER_40U_RISK_POLICY)
+    r2.policy = replace(PAPER_40U_EXEC_POLICY, frozen_config_path=Path(__file__).resolve().parent / "edge_validation" / "frozen_config.json", paper_fill_delay_sec=0.0, vol_cache_path=None)
     r2.hub.states["BTCUSDT"].book = OrderBookTop(0.94, 0.96, 0.02, 0.04)
     res_miss = asyncio.run(r2._paper_buy(MagicMock(symbol="BTCUSDT", side="UP"), 5.0, 0.82))
-    assert not res_miss["filled"] and res_miss["status"] == "PAPER_MISSED_1S", res_miss
+    assert not res_miss["filled"] and res_miss["status"] == "PAPER_MISSED_PRICE", res_miss
+    r2.hub.states["BTCUSDT"].up_asks_raw = {0.81: 4.0}
+    res_depth = asyncio.run(r2._paper_buy(MagicMock(symbol="BTCUSDT", side="UP"), 5.0, 0.82))
+    assert not res_depth["filled"] and res_depth["status"] == "PAPER_MISSED_DEPTH" and res_depth["filled_partial"] == 4.0, res_depth
     return 1
 
 
@@ -273,6 +275,7 @@ def check_forensics_regression_fixes(tmp: Path) -> int:
     r.policy = replace(r.policy, paper_simulation=True, paper_fill_delay_sec=0.5)
     st.up_local_ts = time.time() - 10.0
     st.book = OrderBookTop(0.79, 0.80, 0.19, 0.20)
+    st.up_asks_raw.clear()
     res_stale = asyncio.run(r._paper_buy(MagicMock(symbol="ETHUSDT", side="UP"), 5.0, 0.82))
     assert not res_stale["filled"] and res_stale["status"] == "PAPER_STALE_BOOK", res_stale
 
@@ -280,7 +283,7 @@ def check_forensics_regression_fixes(tmp: Path) -> int:
     r_spot, _at2, cl2, w2 = _make_strict_runner(tmp, "spot_age")
     cl2.spot_age = 3.5
     views = r_spot._build_views(w2 + 200.0, 200.0)
-    assert len(views) == 0 and r_spot.diag["BTCUSDT"]["entry_blocked"] == "CHAINLINK_STALE", r_spot.diag
+    assert len(views) == 0 and r_spot.diag["BTCUSDT"]["reason"] == "STALE_CL_SPOT", r_spot.diag
     return 1
 
 
@@ -292,7 +295,7 @@ def main() -> None:
             check_frozen_parity_and_concurrency(tmp)
             + check_freshness_hard_blocks(tmp)
             + check_section3_circuit_breakers(tmp)
-            + check_paper_43u_simulation(tmp)
+            + check_paper_40u_simulation(tmp)
             + check_telegram_channel_broadcast(tmp)
             + check_forensics_regression_fixes(tmp)
         )

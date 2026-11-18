@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, dataclass
+import json
+import os
 import pathlib
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from engine.master_strategy import compute_vault_locked_u
 from engine.oracle_sniper import (
@@ -24,9 +26,6 @@ from engine.oracle_sniper import (
     compute_shares,
     effective_exit_proceeds,
     entry_limit_price,
-    estimate_fair_value,
-    estimate_twap_fair_value,
-    evaluate_entry,
     evaluate_exit,
     pick_best_candidate,
     taker_fee_per_share,
@@ -34,6 +33,18 @@ from engine.oracle_sniper import (
 from engine.oracle_sniper_feeds import SYMBOLS, SniperMarketHub, SymbolState
 from engine.oracle_sniper_ledger import SniperLedger
 from engine.oracle_sniper_notify import alert_message, entry_message, exit_message
+from engine.signal_core import (
+    DEFAULT_MAX_AGES,
+    MarketInputs,
+    SignalDecision,
+    choose_best_candidate,
+    compute_fv,
+    compute_z_twap_proj_diagnostic,
+    directional_book_age,
+    evaluate as evaluate_signal,
+    simulate_fak_buy,
+    simulate_fak_sell,
+)
 
 MAX_ENTRY_ATTEMPTS_PER_WINDOW = 3
 ATTEMPT_SPACING_SEC = 5.0
@@ -60,44 +71,74 @@ class SniperExecutionPolicy:
     require_twap_fresh: bool = False
     max_chainlink_age_sec: float = CHAINLINK_MAX_AGE_SEC
     max_binance_age_sec: Optional[float] = None
+    max_book_age_sec: float = BOOK_MAX_AGE_SEC
     frozen_config_path: Optional[pathlib.Path] = None
     frozen_model_name: Optional[str] = None
     pilot_fixed_shares: Optional[float] = None
     paper_simulation: bool = False
     paper_fill_delay_sec: float = 1.0
-    paper_initial_equity_u: float = 43.0
+    paper_initial_equity_u: float = 40.0
+    enforce_vol_warmup: bool = False
+    vol_cache_path: Optional[pathlib.Path] = None
+    clock: Optional[Callable[[], float]] = None
 
+
+_DEFAULT_FROZEN_PATH = pathlib.Path(__file__).resolve().parent.parent / "edge_validation" / "frozen_config.json"
+_DEFAULT_VOL_CACHE_PATH = pathlib.Path(__file__).resolve().parent.parent / "data" / "sniper_vol_hist.json"
 
 PRODUCTION_EXEC_POLICY = SniperExecutionPolicy(
-    max_concurrent_positions=3,
+    max_concurrent_positions=1,
     per_symbol_fees=PRODUCTION_FEE_RATES,
     require_rtds_connected=True,
     require_twap_fresh=True,
     max_chainlink_age_sec=3.0,
     max_binance_age_sec=2.0,
-    frozen_config_path=pathlib.Path(__file__).resolve().parent.parent / "edge_validation" / "frozen_config.json",
+    max_book_age_sec=BOOK_MAX_AGE_SEC,
+    frozen_config_path=_DEFAULT_FROZEN_PATH,
     frozen_model_name="v2_filtered",
     pilot_fixed_shares=5.0,
+    enforce_vol_warmup=True,
+    vol_cache_path=_DEFAULT_VOL_CACHE_PATH,
+)
+
+PAPER_40U_EXEC_POLICY = SniperExecutionPolicy(
+    max_concurrent_positions=1,
+    per_symbol_fees=PRODUCTION_FEE_RATES,
+    require_rtds_connected=True,
+    require_twap_fresh=True,
+    max_chainlink_age_sec=3.0,
+    max_binance_age_sec=2.0,
+    max_book_age_sec=BOOK_MAX_AGE_SEC,
+    frozen_config_path=_DEFAULT_FROZEN_PATH,
+    frozen_model_name="v2_filtered",
+    pilot_fixed_shares=5.0,
+    paper_simulation=True,
+    paper_fill_delay_sec=1.0,
+    paper_initial_equity_u=40.0,
+    enforce_vol_warmup=True,
+    vol_cache_path=_DEFAULT_VOL_CACHE_PATH,
 )
 
 PAPER_43U_EXEC_POLICY = SniperExecutionPolicy(
-    max_concurrent_positions=3,
+    max_concurrent_positions=1,
     per_symbol_fees=PRODUCTION_FEE_RATES,
     require_rtds_connected=True,
     require_twap_fresh=True,
     max_chainlink_age_sec=3.0,
     max_binance_age_sec=2.0,
-    frozen_config_path=pathlib.Path(__file__).resolve().parent.parent / "edge_validation" / "frozen_config.json",
+    max_book_age_sec=BOOK_MAX_AGE_SEC,
+    frozen_config_path=_DEFAULT_FROZEN_PATH,
     frozen_model_name="v2_filtered",
     pilot_fixed_shares=None,
     paper_simulation=True,
     paper_fill_delay_sec=1.0,
     paper_initial_equity_u=43.0,
+    enforce_vol_warmup=True,
 )
 
 
 class OracleSniperRunner:
-    """Multi-coin Chainlink late-window execution engine (supports 1-slot legacy or 3-slot 1-per-coin Section 3)."""
+    """Single-slot Chainlink late-window execution engine driven by shared `signal_core`."""
 
     def __init__(
         self,
@@ -114,7 +155,8 @@ class OracleSniperRunner:
         self.notifier = notifier
         self.cfg = cfg
         self.ledger = ledger or SniperLedger()
-        self.hub = hub or SniperMarketHub(auto_trader, cfg)
+        self._custom_clock = policy.clock
+        self.hub = hub or SniperMarketHub(auto_trader, cfg, clock=self._now)
         self.policy = policy
         self.running = False
         self._task: Optional[asyncio.Task[None]] = None
@@ -130,9 +172,47 @@ class OracleSniperRunner:
         self._exit_attempts: dict[str, int] = {}
         self._next_exit_ts: dict[str, float] = {}
         self._last_wallet_ts = 0.0
+        self._last_vol_save_ts = 0.0
         self.heartbeat_ts = 0.0
         self.last_error: Optional[str] = None
         self.diag: dict[str, dict[str, Any]] = {}
+        self._decisions: dict[str, SignalDecision] = {}
+        self._last_ages: dict[str, dict[str, float]] = {}
+        self._load_vol_cache()
+
+    def _now(self) -> float:
+        return time.time() if self._custom_clock is None else float(self._custom_clock())
+
+    def _max_ages(self) -> dict[str, float]:
+        cl_lim = float(min(CHAINLINK_MAX_AGE_SEC, self.policy.max_chainlink_age_sec))
+        bn_lim = float(self.policy.max_binance_age_sec) if self.policy.max_binance_age_sec is not None else 9999.0
+        return {"cl_twap": cl_lim, "cl_spot": cl_lim, "bn": bn_lim, "book": float(self.policy.max_book_age_sec)}
+
+    def _load_vol_cache(self) -> None:
+        path = self.policy.vol_cache_path
+        if not path or not path.exists():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        now_sec = int(self._now())
+        for sym, st in self.hub.states.items():
+            entry = raw.get(sym) if isinstance(raw, dict) else None
+            if isinstance(entry, dict):
+                st.micro.load_persisted_dict(entry, now_sec)
+
+    def _maybe_save_vol_cache(self, now: float) -> None:
+        path = self.policy.vol_cache_path
+        if not path or (now - self._last_vol_save_ts) < 60.0:
+            return
+        self._last_vol_save_ts = now
+        payload = {sym: st.micro.to_persisted_dict() for sym, st in self.hub.states.items()}
+        payload["saved_at"] = now
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, path)
 
     @property
     def _pos(self) -> Optional[OpenPosition]:
@@ -183,7 +263,7 @@ class OracleSniperRunner:
 
     async def _run_loop(self) -> None:
         while self.running:
-            t0 = time.time()
+            t0 = self._now()
             try:
                 await self._tick(t0)
                 self.last_error = None
@@ -192,11 +272,12 @@ class OracleSniperRunner:
             except Exception as exc:  # noqa: BLE001 - the loop must survive any single-tick failure
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 print(f"[Sniper Tick Error] {self.last_error}")
-            await asyncio.sleep(max(0.05, 1.0 - (time.time() - t0)))
+            await asyncio.sleep(max(0.05, 1.0 - (self._now() - t0)))
 
     # ------------------------------------------------------------------ tick
     async def _tick(self, now: float) -> None:
         await self.hub.refresh_windows(now)
+        self._maybe_save_vol_cache(now)
         window_ts = self.hub.states[SYMBOLS[0]].window_ts
         elapsed = now - window_ts
         self.heartbeat_ts = now
@@ -206,7 +287,11 @@ class OracleSniperRunner:
             self.ledger.ensure_baseline(total)
             self.ledger.note_equity(total)
             self.ledger.roll_day_if_needed(total)
-        views = self._build_views(now, elapsed)
+        views, decisions = self.evaluate_second(now, window_ts)
+        for sym, dec in decisions.items():
+            c_sym = self._cfg_for(sym)
+            if dec.action == "SKIP" and c_sym.entry_start_elapsed_sec <= elapsed <= c_sym.entry_end_elapsed_sec:
+                self.ledger.bump_skip(dec.reason)
         for sym in list(self._positions):
             pos = self._positions.get(sym)
             if pos is None:
@@ -216,7 +301,7 @@ class OracleSniperRunner:
             else:
                 self._begin_settlement(sym)
         if self._entry_allowed(window_ts, now):
-            await self._seek_entry(views, window_ts, elapsed, now)
+            await self._seek_entry(decisions, window_ts, elapsed, now)
 
     # ------------------------------------------------------------------ market views
     def _rtds_open(self, sym: str, window_ts: int) -> Optional[float]:
@@ -224,6 +309,7 @@ class OracleSniperRunner:
         key = (sym, window_ts)
         if key in self._open_cache:
             return self._open_cache[key]
+        now_val = self._now()
         boundary_ms = window_ts * 1000.0
         twap_fn = getattr(self.chainlink, "get_settlement_twap_at", None)
         best = twap_fn(sym, window_ts) if callable(twap_fn) else None
@@ -234,20 +320,16 @@ class OracleSniperRunner:
             best_rank = (9, 4001.0)
             for ts_ms, val in src_ticks:
                 d = ts_ms - boundary_ms
-                if 0.0 <= d <= 4000.0:
-                    rank = (0, d)
-                    if rank < best_rank:
-                        best, best_rank, is_on_or_after = float(val), rank, True
-                elif -1000.0 <= d < 0.0 and (time.time() - window_ts) > 8.0:
-                    rank = (1, abs(d))
-                    if rank < best_rank:
-                        best, best_rank = float(val), rank
-        if best is None and (time.time() - window_ts) > 8.0 and callable(twap_fn):
+                if 0.0 <= d <= 4000.0 and (0, d) < best_rank:
+                    best, best_rank, is_on_or_after = float(val), (0, d), True
+                elif -1000.0 <= d < 0.0 and (now_val - window_ts) > 8.0 and (1, abs(d)) < best_rank:
+                    best, best_rank = float(val), (1, abs(d))
+        if best is None and (now_val - window_ts) > 8.0 and callable(twap_fn):
             try:
                 best = twap_fn(sym, window_ts, allow_pre_boundary=True)
             except TypeError:
                 best = None
-        if is_on_or_after or (time.time() - window_ts) > 8.0:
+        if is_on_or_after or (now_val - window_ts) > 8.0:
             self._open_cache[key] = best  # final only after >= boundary tick or window_ts + 8s
             if len(self._open_cache) > 60:
                 self._open_cache.pop(next(iter(self._open_cache)))
@@ -266,75 +348,101 @@ class OracleSniperRunner:
         if elapsed < 1.5:
             return OrderBookTop()
         b = st.book
-        up_ok = (now - st.up_local_ts) <= BOOK_MAX_AGE_SEC
-        dn_ok = (now - st.down_local_ts) <= BOOK_MAX_AGE_SEC
+        up_ok = (now - st.up_local_ts) <= self.policy.max_book_age_sec
+        dn_ok = (now - st.down_local_ts) <= self.policy.max_book_age_sec
         return OrderBookTop(
             b.up_bid if up_ok else None, b.up_ask if up_ok else None,
             b.down_bid if dn_ok else None, b.down_ask if dn_ok else None,
         )
 
-    def _realized_twap_240(self, sym: str, window_ts: int, elapsed: float) -> tuple[Optional[float], float]:
-        if elapsed <= 240.0:
-            return None, 0.0
-        start_ms = (window_ts + 240) * 1000.0
-        end_ms = (window_ts + elapsed) * 1000.0
-        vals = [float(v) for ts_ms, v in (self.chainlink.ticks.get(sym) or ()) if start_ms <= ts_ms <= end_ms]
-        return ((sum(vals) / len(vals)) if vals else None), max(0.0, elapsed - 240.0)
+    @staticmethod
+    def _levels_or_top(raw_sorted: list[tuple[float, float]], top_px: Optional[float]) -> list[tuple[float, float]]:
+        if raw_sorted:
+            return raw_sorted
+        return [(float(top_px), 100.0)] if top_px is not None else []
 
-    def _entry_feed_block_reason(self, sym: str, st: SymbolState, now: float) -> str:
+    def _assemble_inputs(self, sym: str, st: SymbolState, now: float, window_ts: int) -> tuple[MarketInputs, str]:
+        cl_spot, sp_age = self.chainlink.get_latest_price(sym, max_age_sec=9999.0)
+        tw_fn = getattr(self.chainlink, "get_latest_twap", None)
+        if callable(tw_fn):
+            cl_twap, tw_age = tw_fn(sym, max_age_sec=9999.0)
+        elif self.policy.require_twap_fresh:
+            cl_twap, tw_age = None, 9999.0
+        else:
+            cl_twap, tw_age = cl_spot, sp_age
         if self.policy.require_rtds_connected and not bool(getattr(self.chainlink, "connected", True)):
-            return "RTDS_DISCONNECTED"
-        if self.policy.require_twap_fresh:
-            tw_fn = getattr(self.chainlink, "get_latest_twap", None)
-            if not callable(tw_fn):
-                return "NO_TWAP_FEED"
-            tw_px, _tw_age = tw_fn(sym, max_age_sec=self.policy.max_chainlink_age_sec)
-            if tw_px is None:
-                return "CHAINLINK_TWAP_STALE"
-        if self.policy.max_binance_age_sec is not None:
-            if st.binance_price is None or (now - st.binance_ts) > self.policy.max_binance_age_sec:
-                return "BINANCE_STALE"
-        return ""
+            sp_age, tw_age = 9999.0, 9999.0
+        st.sync_micro_at(now, cl_spot, window_ts)
+        bn_px = st.micro.prices[-1] if st.micro.prices else st.binance_price
+        bn_age = (now - st.binance_ts) if (st.binance_price is not None and st.binance_ts > 0.0) else 9999.0
+        if self.policy.max_binance_age_sec is None and st.binance_price is None and cl_spot is not None:
+            bn_px, bn_age = cl_spot, 0.0
+        strike, src = self._strike(sym, st)
+        up_age = (now - st.up_local_ts) if st.up_local_ts > 0.0 else 9999.0
+        dn_age = (now - st.down_local_ts) if st.down_local_ts > 0.0 else 9999.0
+        bk_age = directional_book_age(cl_spot, strike, up_age, dn_age)
+        cvd, flow = st.micro.get_orderflow_metrics(int(now))
+        gap = st.micro._last_basis_gap_bps
+        r240 = st.micro.get_realized_twap_240(window_ts, int(now), fallback_spot=cl_spot)
+        up_asks = self._levels_or_top(st.sorted_asks("UP"), st.book.up_ask)
+        dn_asks = self._levels_or_top(st.sorted_asks("DOWN"), st.book.down_ask)
+        up_bids = self._levels_or_top(st.sorted_bids("UP"), st.book.up_bid)
+        dn_bids = self._levels_or_top(st.sorted_bids("DOWN"), st.book.down_bid)
+        ages = {"cl_twap": round(tw_age, 3), "cl_spot": round(sp_age, 3), "bn": round(bn_age, 3), "book": round(bk_age, 3)}
+        return MarketInputs(
+            sym, window_ts, now, strike, cl_twap, cl_spot, bn_px, tuple(st.micro.prices),
+            up_asks, dn_asks, up_bids, dn_bids, ages, flow, cvd, gap, r240,
+        ), src
+
+    def evaluate_second(
+        self, now: float, window_ts: Optional[int] = None
+    ) -> tuple[dict[str, View], dict[str, SignalDecision]]:
+        """Build unified MarketInputs and run pure `signal_core.evaluate()` for all symbols."""
+        win_ts = self.hub.roll_window(now) if window_ts is None else window_ts
+        elapsed = now - win_ts
+        views: dict[str, View] = {}
+        decisions: dict[str, SignalDecision] = {}
+        lims = self._max_ages()
+        for sym, st in self.hub.states.items():
+            cfg_sym = self._cfg_for(sym)
+            inp, src = self._assemble_inputs(sym, st, now, win_ts)
+            dec = evaluate_signal(inp, cfg_sym, max_ages=lims, enforce_warmup=self.policy.enforce_vol_warmup)
+            decisions[sym] = dec
+            self._last_ages[sym] = dict(inp.ages)
+            book = self._book_for(st, now, elapsed)
+            fv = dec.fv
+            if fv is None and sym in self._positions and float(inp.ages.get("cl_spot", 9999.0)) <= float(lims.get("cl_spot", 3.0)):
+                res = compute_fv(inp, cfg_sym)
+                fv = res[1] if res is not None else None
+            if fv is not None:
+                views[sym] = (fv, book)
+            self.diag[sym] = self._diag_row(dec, book, src, inp.ages, st, len(inp.vol_hist))
+        self._decisions = decisions
+        return views, decisions
 
     def _build_views(self, now: float, elapsed: float) -> dict[str, View]:
-        views: dict[str, View] = {}
-        cl_lim = min(CHAINLINK_MAX_AGE_SEC, self.policy.max_chainlink_age_sec)
-        for sym, st in self.hub.states.items():
-            cl_px, age = self.chainlink.get_latest_price(sym, max_age_sec=cl_lim)
-            if cl_px is None:
-                self.diag[sym] = {"status": "CHAINLINK_STALE", "cl_age_sec": age, "entry_blocked": "CHAINLINK_STALE"}
-                continue
-            lead = st.cex_lead_price(now)
-            st.tracker.on_price(now, lead or cl_px)
-            vol = st.tracker.get_realized_vol_1s(floor=self.cfg.min_1s_vol_floor)
-            gap = st.tracker.update_oracle_basis(cl_px, lead)
-            cvd, _obi, flow = st.tracker.get_orderflow_metrics(now)
-            strike, src = self._strike(sym, st)
-            if strike is None:
-                self.diag[sym] = {"status": "NO_STRIKE", "entry_blocked": "NO_STRIKE"}
-                continue
-            c_sym = self._cfg_for(sym)
-            if c_sym.use_twap_projection:
-                a_mean, a_sec = self._realized_twap_240(sym, st.window_ts, elapsed)
-                fv = estimate_twap_fair_value(strike, cl_px, 300.0 - elapsed, vol, (a_mean, a_sec), (flow, gap, cvd), c_sym)
-            else:
-                fv = estimate_fair_value(strike, cl_px, 300.0 - elapsed, vol, flow, gap, c_sym.student_t_df, cvd)
-            if fv is None:
-                continue
-            book = self._book_for(st, now, elapsed)
-            views[sym] = (fv, book)
-            row = self._diag_row(fv, book, src, age, st)
-            row["entry_blocked"] = self._entry_feed_block_reason(sym, st, now)
-            self.diag[sym] = row
+        views, _decisions = self.evaluate_second(now, self.hub.states[SYMBOLS[0]].window_ts or (int(now) // 300) * 300)
         return views
 
     @staticmethod
-    def _diag_row(fv: FairValueEstimate, book: OrderBookTop, src: str, age: float, st: SymbolState) -> dict[str, Any]:
-        return {
-            "status": "OK", "strike_src": src, "cl_age_sec": age, "z": round(fv.raw_z_score, 2),
-            "p_up": round(fv.p_true_up, 3), "gap_bps": round(fv.oracle_gap_bps, 2), "flow": round(fv.orderflow_score, 2),
+    def _diag_row(
+        dec: SignalDecision, book: OrderBookTop, src: str, ages: dict[str, float], st: SymbolState, vol_n: int
+    ) -> dict[str, Any]:
+        status = "OK" if dec.fv is not None else dec.reason
+        row: dict[str, Any] = {
+            "status": status, "decision": dec.action, "reason": dec.reason, "strike_src": src,
+            "cl_age_sec": ages.get("cl_spot"), "ages": ages, "vol_samples": vol_n,
             "up": [book.up_bid, book.up_ask], "down": [book.down_bid, book.down_ask], "has_tokens": bool(st.up_token),
         }
+        if dec.fv is not None:
+            row.update({
+                "z": round(dec.fv.raw_z_score, 2), "p_up": round(dec.fv.p_true_up, 3),
+                "gap_bps": round(dec.fv.oracle_gap_bps, 2), "flow": round(dec.fv.orderflow_score, 2),
+                "sigma": dec.sigma,
+            })
+        if dec.action == "SKIP":
+            row["entry_blocked"] = dec.reason
+        return row
 
     # ------------------------------------------------------------------ equity / wallet
     def _equity(self) -> tuple[float, float, float]:
@@ -404,31 +512,27 @@ class OracleSniperRunner:
             return False
         blk = (self.diag.get(sym) or {}).get("entry_blocked")
         if blk:
-            self.ledger.bump_skip(str(blk))
             return False
         return True
 
-    async def _seek_entry(self, views: dict[str, View], window_ts: int, elapsed: float, now: float) -> None:
-        cands: list[Candidate] = []
-        for sym, (fv, book) in views.items():
-            if not self._symbol_can_enter(sym, window_ts):
-                continue
-            cand = evaluate_entry(sym, self._cfg_for(sym), elapsed, fv, book)
-            if cand is not None:
-                cands.append(cand)
-        if not cands:
+    async def _seek_entry(
+        self, decisions: dict[str, SignalDecision], window_ts: int, elapsed: float, now: float
+    ) -> None:
+        eligible = [dec for sym, dec in decisions.items() if self._symbol_can_enter(sym, window_ts) and dec.action == "ENTER"]
+        if not eligible:
             return
         if self.policy.max_concurrent_positions == 1:
-            best = pick_best_candidate(cands)
+            best = choose_best_candidate(eligible)
             if best is not None:
-                await self._enter(best, window_ts, now, len(cands))
+                await self._enter(best, window_ts, now, len(eligible))
             return
         remaining = self.policy.max_concurrent_positions - len(self._positions)
+        cands = [d.candidate for d in eligible if d.candidate is not None]
         ranked = sorted(cands, key=lambda c: c.net_ev + (0.01 if c.symbol == "BTCUSDT" else 0.0), reverse=True)
         for cand in ranked[:remaining]:
             if self.ledger.guard_reason() is not None:
                 break
-            await self._enter(cand, window_ts, now, len(cands))
+            await self._enter(cand, window_ts, now, len(eligible))
 
     def _plan_size(self, cand: Candidate, limit_px: float) -> tuple[float, str]:
         total, cash, vault = self._equity()
@@ -449,20 +553,22 @@ class OracleSniperRunner:
         return shares, ""
 
     async def _paper_buy(self, cand: Candidate, shares: float, limit_px: float) -> dict[str, Any]:
-        """Simulate realistic delayed (+1s) top-of-book fill in paper mode (zero real orders)."""
+        """Simulate realistic delayed (+1s) depth-aware FAK fill in paper mode (zero real orders)."""
         if self.policy.paper_fill_delay_sec > 0.0:
             await asyncio.sleep(self.policy.paper_fill_delay_sec)
         st = self.hub.states[cand.symbol]
         live_ask = st.book.up_ask if cand.side == "UP" else st.book.down_ask
+        asks = self._levels_or_top(st.sorted_asks(cand.side), live_ask)
         side_ts = st.up_local_ts if cand.side == "UP" else st.down_local_ts
-        if live_ask is None:
-            return {"filled": False, "shares": 0.0, "usd": 0.0, "avg_price": 0.0, "order_id": "", "status": "PAPER_NO_BOOK", "error": "ask_missing"}
-        if side_ts > 0 and (time.time() - side_ts) > BOOK_MAX_AGE_SEC and self.policy.paper_fill_delay_sec >= 0.5:
-            age_s = time.time() - side_ts
-            return {"filled": False, "shares": 0.0, "usd": 0.0, "avg_price": 0.0, "order_id": "", "status": "PAPER_STALE_BOOK", "error": f"book_age={age_s:.1f}s>{BOOK_MAX_AGE_SEC}s"}
-        if live_ask > limit_px:
-            return {"filled": False, "shares": 0.0, "usd": 0.0, "avg_price": 0.0, "order_id": "", "status": "PAPER_MISSED_1S", "error": f"ask@+1s={live_ask:.3f}>{limit_px:.2f}"}
-        return {"filled": True, "shares": shares, "usd": round(shares * live_ask, 4), "avg_price": float(live_ask), "order_id": f"paper-{int(time.time() * 1000)}", "status": "PAPER_FILLED_1S", "error": None}
+        now_val = self._now()
+        if not asks:
+            return {"filled": False, "shares": 0.0, "filled_partial": 0.0, "usd": 0.0, "avg_price": 0.0, "order_id": "", "status": "PAPER_NO_BOOK", "error": "ask_missing"}
+        if side_ts > 0 and (now_val - side_ts) > self.policy.max_book_age_sec and self.policy.paper_fill_delay_sec >= 0.5:
+            return {"filled": False, "shares": 0.0, "filled_partial": 0.0, "usd": 0.0, "avg_price": 0.0, "order_id": "", "status": "PAPER_STALE_BOOK", "error": f"book_age={now_val - side_ts:.1f}s>{self.policy.max_book_age_sec}s"}
+        res = simulate_fak_buy(asks, shares, limit_px)
+        if not res.filled or res.avg_px is None:
+            return {"filled": False, "shares": 0.0, "filled_partial": res.filled_shares, "usd": 0.0, "avg_price": res.avg_px or 0.0, "order_id": "", "status": f"PAPER_{res.status}", "error": f"top={asks[0][0]:.3f} filled={res.filled_shares:.2f}/{shares:.2f} lim={limit_px:.2f}"}
+        return {"filled": True, "shares": shares, "filled_partial": shares, "usd": round(shares * res.avg_px, 4), "avg_price": float(res.avg_px), "order_id": f"paper-{int(now_val * 1000)}", "status": "PAPER_FILLED_1S", "error": None}
 
     async def _enter(self, cand: Candidate, window_ts: int, now: float, n_cands: int) -> None:
         self._attempts[(cand.symbol, window_ts)] = self._attempts.get((cand.symbol, window_ts), 0) + 1
@@ -475,11 +581,12 @@ class OracleSniperRunner:
         if shares <= 0.0 or not token:
             self.ledger.bump_skip(why or "NO_TOKEN")
             return
+        ages = dict(self._last_ages.get(cand.symbol) or {})
         intent = {
             "symbol": cand.symbol, "side": cand.side, "token_id": token, "window_ts": window_ts, "slug": st.slug,
             "condition_id": st.condition_id, "strike": st.price_to_beat, "ts": now, "target_shares": shares,
             "limit_px": limit_px, "est_cost_usd": round(shares * limit_px * 1.02, 4), "n_cands": n_cands,
-            "cand": asdict(cand),
+            "ages": ages, "cand": asdict(cand),
         }
         if not self.policy.paper_simulation:
             self.ledger.set_pending_entry(intent)
@@ -489,14 +596,15 @@ class OracleSniperRunner:
         self.ledger.record_attempt({
             "ts": now, "window_ts": window_ts, "symbol": cand.symbol, "side": cand.side, "sim_ask": cand.ask,
             "limit_px": limit_px, "filled": bool(fill.get("filled")), "actual_price": fill.get("avg_price"),
-            "status": fill.get("status"), "latency_ms": lat_ms,
+            "filled_partial": fill.get("filled_partial", 0.0), "ages": ages, "status": fill.get("status"), "latency_ms": lat_ms,
         })
         if fill.get("filled"):
-            self._register_entry(cand, window_ts, now, n_cands, fill, token, limit_px)
+            fill_with_ages = {**fill, "ages": ages}
+            self._register_entry(cand, window_ts, now, n_cands, fill_with_ages, token, limit_px)
             if not self.policy.paper_simulation:
                 self.ledger.set_pending_entry(None)
             return
-        self.ledger.bump_skip("NO_FILL")
+        self.ledger.bump_skip(str(fill.get("status") or "NO_FILL") if self.policy.paper_simulation else "NO_FILL")
         side_ts = st.up_local_ts if cand.side == "UP" else st.down_local_ts
         print(
             f"[Sniper] {cand.symbol} {cand.side} not filled: {fill.get('status')} {fill.get('error')} | "
@@ -547,6 +655,7 @@ class OracleSniperRunner:
         cost_ps = price + taker_fee_per_share(price, fee_r)
         cost_usd = round(float(fill.get("usd") or shares * price) + shares * taker_fee_per_share(price, fee_r), 4)
         self._positions[cand.symbol] = OpenPosition(cand.symbol, cand.side, window_ts, shares, price, cost_ps, cand.p_true, cand.z)
+        ages = fill.get("ages") if isinstance(fill.get("ages"), dict) else (self._last_ages.get(cand.symbol) or {})
         trade = {
             "id": f"{window_ts}-{cand.symbol}-{int(now * 1000)}", "symbol": cand.symbol, "side": cand.side, "window_ts": window_ts,
             "slug": st.slug, "token_id": token, "condition_id": st.condition_id, "shares": shares,
@@ -555,6 +664,8 @@ class OracleSniperRunner:
             "p_true": cand.p_true, "z": cand.z, "net_ev": cand.net_ev, "candidates": n_cands, "limit_px": limit_px,
             "order_id": fill.get("order_id", ""), "strike": st.price_to_beat or self._open_cache.get((cand.symbol, window_ts)), "partial_proceeds_usd": 0.0,
             "fill_status": fill.get("status"), "paper_mode": bool(self.policy.paper_simulation),
+            "paper_initial_u": round(float(self.policy.paper_initial_equity_u)),
+            "ages": dict(ages),
         }
         if self.policy.paper_simulation:
             self.ledger.paper_debit(cost_usd)
@@ -572,9 +683,11 @@ class OracleSniperRunner:
             await asyncio.sleep(self.policy.paper_fill_delay_sec)
         st = self.hub.states[sym]
         live_bid = st.book.up_bid if pos.side == "UP" else st.book.down_bid
-        if live_bid is None or live_bid < min_bid:
-            return {"filled": False, "shares": 0.0, "avg_price": 0.0, "status": "PAPER_EXIT_MISS", "error": f"bid={live_bid}<{min_bid}"}
-        return {"filled": True, "shares": pos.shares, "avg_price": float(live_bid), "status": "PAPER_SOLD_1S", "error": None}
+        bids = self._levels_or_top(st.sorted_bids(pos.side), live_bid)
+        res = simulate_fak_sell(bids, pos.shares, min_bid)
+        if not res.filled or res.avg_px is None:
+            return {"filled": False, "shares": 0.0, "avg_price": 0.0, "status": f"PAPER_EXIT_{res.status}", "error": f"bid={live_bid}<{min_bid} filled={res.filled_shares}"}
+        return {"filled": True, "shares": pos.shares, "avg_price": float(res.avg_px), "status": "PAPER_SOLD_1S", "error": None}
 
     # ------------------------------------------------------------------ exit
     async def _manage_position(self, sym: str, views: dict[str, View], elapsed: float, now: float) -> None:
@@ -587,6 +700,11 @@ class OracleSniperRunner:
         decision = evaluate_exit(self._cfg_for(sym), pos, elapsed, fv, book)
         if decision is None:
             return
+        st = self.hub.states[sym]
+        r240 = st.micro.get_realized_twap_240(pos.window_ts, int(now), fallback_spot=fv.chainlink_price)
+        z_tp = compute_z_twap_proj_diagnostic(fv.strike_price, fv.chainlink_price, 300.0 - elapsed, fv.vol_1s, r240, pos.side)
+        if z_tp is not None:
+            trade["z_twap_proj"] = round(z_tp, 4)
         self._exit_attempts[sym] = self._exit_attempts.get(sym, 0) + 1
         self._next_exit_ts[sym] = now + EXIT_RETRY_SPACING_SEC
         slip = 0.05 if decision.reason == "EMERGENCY_STOP_LOSS" else 0.03
@@ -628,10 +746,31 @@ class OracleSniperRunner:
         if float(trade["shares_open"]) >= 0.5:
             self.ledger.open_trade(trade)
             return
-        pnl = float(trade["partial_proceeds_usd"]) - float(trade["cost_usd"])
-        info = {"exit_reason": reason, "exit_price": float(sell["avg_price"]), "exit_shares": sold, "pnl_usd": round(pnl, 4),
-                "exit_ts": now, "payout_per_share": net_ps}
+        pnl = round(float(trade["partial_proceeds_usd"]) - float(trade["cost_usd"]), 4)
+        info: dict[str, Any] = {
+            "exit_reason": reason, "exit_price": float(sell["avg_price"]), "exit_shares": sold, "pnl_usd": pnl,
+            "exit_ts": now, "payout_per_share": net_ps, "sl_triggered": (reason == "EMERGENCY_STOP_LOSS"),
+            "pnl_with_sl_usd": pnl, "z_twap_proj": trade.get("z_twap_proj"),
+        }
         self._finish_trade(trade, info)
+        if reason == "EMERGENCY_STOP_LOSS" and self.running:
+            self._spawn(self._record_hold_shadow(dict(trade)))
+
+    async def _record_hold_shadow(self, trade: dict[str, Any]) -> None:
+        wait = max(0.0, float(trade["window_ts"]) + 303.0 - self._now())
+        if wait > 0.0:
+            await asyncio.sleep(wait)
+        res = await self._await_resolution(trade)
+        if not res.get("resolved"):
+            return
+        won = bool(res.get("polymarket_won"))
+        hold_pnl = round((float(trade["shares"]) if won else 0.0) - float(trade["cost_usd"]), 4)
+        for t in self.ledger.state.get("trades", []):
+            if t.get("id") == trade.get("id"):
+                t["pnl_hold_to_settle_usd"] = hold_pnl
+                t["sl_was_wrong"] = won
+                self.ledger.save()
+                break
 
     # ------------------------------------------------------------------ settlement
     def _begin_settlement(self, sym: Optional[str] = None) -> None:
@@ -678,12 +817,15 @@ class OracleSniperRunner:
         if self.policy.paper_simulation and rem_proceeds > 0.0:
             self.ledger.paper_credit(rem_proceeds)
         proceeds = float(trade.get("partial_proceeds_usd", 0.0)) + rem_proceeds
+        pnl_val = round(proceeds - float(trade["cost_usd"]), 4)
         info = {
             "exit_reason": f"SETTLED_{trade['side'] if won else ('DOWN' if trade['side'] == 'UP' else 'UP')}",
             "exit_price": payout, "exit_shares": float(trade["shares_open"]), "payout_per_share": payout,
-            "pnl_usd": round(proceeds - float(trade["cost_usd"]), 4), "exit_ts": time.time(),
+            "pnl_usd": pnl_val, "exit_ts": self._now(),
             "final_price": res.get("final_price"), "strike": res.get("price_to_beat") or trade.get("strike"),
             "provisional": bool(res.get("provisional", False)),
+            "sl_triggered": False, "sl_was_wrong": False,
+            "pnl_with_sl_usd": pnl_val, "pnl_hold_to_settle_usd": pnl_val,
         }
         self._finish_trade(trade, info)
         if won and not self.policy.paper_simulation:
@@ -766,7 +908,8 @@ class OracleSniperRunner:
             pos_txt = "｜".join(f"{p.symbol[:3]} {p.side} {p.shares:.2f}股 @ ${p.entry_price:.3f}" for p in self._positions.values())
         else:
             pos_txt = "空倉（等待 150–255s 狙擊窗口）"
-        mode_hdr = "🧪 模擬盤 $43U" if self.policy.paper_simulation else "實盤"
+        init_u = int(round(float(self.policy.paper_initial_equity_u)))
+        mode_hdr = f"🧪 模擬盤 ${init_u}U" if self.policy.paper_simulation else "實盤"
         lines = [f"🎯 新策略｜Chainlink TWAP V2・{mode_hdr}｜{state}", f"• 持倉（{len(self._positions)}/{self.policy.max_concurrent_positions}）：{pos_txt}"]
         for sym in SYMBOLS:
             d = self.diag.get(sym, {})
@@ -776,13 +919,13 @@ class OracleSniperRunner:
                     f"• {sym[:3]} Z={d['z']:+.2f} P(UP)={d['p_up'] * 100:.0f}% 買價 漲{up[1] or '--'}/跌{dn[1] or '--'}"
                 )
             else:
-                lines.append(f"• {sym[:3]} {d.get('status', '等待資料')}")
+                lines.append(f"• {sym[:3]} {d.get('status', '等待資料')} ({d.get('vol_samples', 0)}/1800s)")
         lines.append(self._perf_lines())
         return "\n".join(lines)
 
     def status(self) -> dict[str, Any]:
         """Snapshot for APIs, Telegram and patrol reports."""
-        now = time.time()
+        now = self._now()
         total, cash, vault = self._equity()
         pos = asdict(self._pos) if self._pos else None
         return {

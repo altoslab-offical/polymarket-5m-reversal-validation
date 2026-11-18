@@ -11,12 +11,13 @@ import asyncio
 from dataclasses import dataclass, field
 import json
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import aiohttp
 import websockets
 
 from engine.oracle_sniper import DEFAULT_SNIPER_CONFIG, OrderBookTop, RollingMicrostructureTracker, SniperConfig
+from engine.signal_core import Bn1sMicroTracker, MAX_GAP_FILL_SEC
 
 SYMBOLS: tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 COINBASE_PRODUCT = {"BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD", "SOLUSDT": "SOL-USD"}
@@ -115,8 +116,13 @@ class SymbolState:
 
     symbol: str
     tracker: RollingMicrostructureTracker
+    micro: Bn1sMicroTracker = field(default_factory=Bn1sMicroTracker)
     binance_price: Optional[float] = None
     binance_ts: float = 0.0
+    bn_last_close: Optional[float] = None
+    bn_cur_sec: int = 0
+    bn_cur_buy_usd: float = 0.0
+    bn_cur_sell_usd: float = 0.0
     coinbase_price: Optional[float] = None
     coinbase_ts: float = 0.0
     ratio_ewma: float = 1.0
@@ -141,6 +147,42 @@ class SymbolState:
     down_local_ts: float = 0.0
     meta_checked_ts: float = 0.0
     prefetch_ts: float = 0.0
+
+    def ingest_binance_trade(self, now: float, price: float, qty: float, is_buyer_maker: bool) -> None:
+        """Record Binance aggTrade exclusively (1s close + taker USD volume) for parity with Recorder."""
+        if price <= 0.0:
+            return
+        self.binance_price, self.binance_ts = price, now
+        self.bn_last_close = price
+        sec = int(now)
+        if sec != self.bn_cur_sec:
+            self.bn_cur_sec = sec
+            self.bn_cur_buy_usd = 0.0
+            self.bn_cur_sell_usd = 0.0
+        notional = price * max(0.0, qty)
+        if is_buyer_maker:
+            self.bn_cur_sell_usd += notional
+        else:
+            self.bn_cur_buy_usd += notional
+        self.micro.ingest_bn_1s(sec, price, self.bn_cur_buy_usd, self.bn_cur_sell_usd, real_trade=True)
+
+    def sync_micro_at(self, now: float, cl_spot: Optional[float], window_ts: int) -> None:
+        """Ensure 1Hz Binance history, EWMA basis, and T+240s TWAP are stepped at second `int(now)`."""
+        sec = int(now)
+        if self.bn_cur_sec < sec:
+            fresh = self.bn_last_close is not None and (now - self.binance_ts) <= float(MAX_GAP_FILL_SEC)
+            self.micro.ingest_bn_1s(sec, self.bn_last_close if fresh else None, 0.0, 0.0, real_trade=False)
+        bn_for_basis = self.micro.prices[-1] if self.micro.prices else self.binance_price
+        self.micro.update_basis_1s(sec, cl_spot, bn_for_basis)
+        self.micro.record_cl_240(window_ts, sec, cl_spot)
+
+    def sorted_asks(self, side: str) -> list[tuple[float, float]]:
+        raw = self.up_asks_raw if side == "UP" else self.down_asks_raw
+        return sorted(raw.items(), key=lambda t: t[0])
+
+    def sorted_bids(self, side: str) -> list[tuple[float, float]]:
+        raw = self.up_bids_raw if side == "UP" else self.down_bids_raw
+        return sorted(raw.items(), key=lambda t: t[0], reverse=True)
 
     def update_basis(self, now: float) -> None:
         """Track the Binance-USDT / Coinbase-USD ratio with a slow EWMA."""
@@ -207,11 +249,19 @@ class SymbolState:
 class SniperMarketHub:
     """Owns the WebSocket / REST feeds and per-symbol state for the sniper."""
 
-    def __init__(self, auto_trader: Any, cfg: SniperConfig = DEFAULT_SNIPER_CONFIG) -> None:
+    def __init__(
+        self, auto_trader: Any, cfg: SniperConfig = DEFAULT_SNIPER_CONFIG, clock: Callable[[], float] = time.time
+    ) -> None:
         self.auto_trader = auto_trader
         self.cfg = cfg
+        self._clock = clock
         self.states: dict[str, SymbolState] = {
-            s: SymbolState(s, RollingMicrostructureTracker(cfg.vol_lookback_sec, cfg.cvd_window_sec)) for s in SYMBOLS
+            s: SymbolState(
+                s,
+                RollingMicrostructureTracker(cfg.vol_lookback_sec, cfg.cvd_window_sec),
+                Bn1sMicroTracker(cfg.vol_lookback_sec, cfg.cvd_window_sec),
+            )
+            for s in SYMBOLS
         }
         self.prefetched: dict[tuple[str, int], dict[str, Any]] = {}
         self.stats: dict[str, Any] = {"binance_ws": False, "coinbase_ws": False, "clob_ws": False}
@@ -313,18 +363,13 @@ class SniperMarketHub:
         st = self.states.get(sym)
         if st is None:
             return
-        now = time.time()
+        now = self._clock()
         if "aggTrade" in stream:
-            price, qty = float(data["p"]), float(data["q"])
-            st.binance_price, st.binance_ts = price, now
-            st.update_basis(now)
-            st.tracker.on_trade(now, price, qty, bool(data["m"]))
-            st.tracker.on_price(now, st.cex_lead_price(now) or price)
+            st.ingest_binance_trade(now, float(data["p"]), float(data["q"]), bool(data["m"]))
         elif "bookTicker" in stream:
+            # Refresh freshness timestamp only; never mix bookTicker mid/OBI into Binance-1s model vol or flow.
             bid, ask = float(data["b"]), float(data["a"])
             st.binance_price, st.binance_ts = 0.5 * (bid + ask), now
-            st.update_basis(now)
-            st.tracker.on_book_ticker(float(data["B"]), float(data["A"]))
 
     async def _binance_ws_loop(self) -> None:
         while not self._stop.is_set():
@@ -347,8 +392,7 @@ class SniperMarketHub:
         for sym, prod in COINBASE_PRODUCT.items():
             if prod == product:
                 st = self.states[sym]
-                st.coinbase_price, st.coinbase_ts = float(data["price"]), time.time()
-                st.update_basis(st.coinbase_ts)
+                st.coinbase_price, st.coinbase_ts = float(data["price"]), self._clock()
 
     async def _coinbase_ws_loop(self) -> None:
         sub = {"type": "subscribe", "product_ids": list(COINBASE_PRODUCT.values()), "channels": ["ticker"]}
@@ -376,7 +420,7 @@ class SniperMarketHub:
         return out
 
     def _set_side_book(self, st: SymbolState, side: str, bid: Optional[float], ask: Optional[float], ev_ts: float, via_ws: bool) -> None:
-        local = time.time()
+        local = self._clock()
         if side == "UP":
             st.book.up_bid, st.book.up_ask = bid, ask
             st.up_book_ts, st.up_local_ts = max(st.up_book_ts, ev_ts), local
@@ -387,7 +431,7 @@ class SniperMarketHub:
             st.last_ws_book_local_ts = local
 
     def apply_book(self, sym: str, side: str, payload: dict[str, Any], via_ws: bool) -> None:
-        """Store executable bid/ask for one token, ignoring older snapshots and other windows' tokens."""
+        """Store top-of-book & full depth for one token, ignoring older snapshots and other windows' tokens."""
         st = self.states[sym]
         asset = str(payload.get("asset_id") or "")
         expected = st.up_token if side == "UP" else st.down_token
@@ -405,13 +449,16 @@ class SniperMarketHub:
             st.down_bids_raw, st.down_asks_raw = bids_map, asks_map
         bids = sorted(bids_map.items(), key=lambda t: t[0], reverse=True)
         asks = sorted(asks_map.items(), key=lambda t: t[0])
-        bid, ask = _executable_from_sorted(bids, asks)
+        bid = bids[0][0] if bids else None
+        ask = asks[0][0] if asks else None
+        if bid is not None and ask is not None and bid >= ask:
+            bid, ask = None, None
         self._set_side_book(st, side, bid, ask, ev_ts, via_ws=via_ws)
 
     def apply_price_change(self, payload: dict[str, Any], tokens: dict[str, tuple[str, str]], via_ws: bool = True) -> None:
         """Apply Polymarket CLOB WS `price_change` deltas incrementally so top-of-book never freezes stale."""
         ev_ts = parse_book_ts_sec(payload)
-        if ev_ts > 0.0 and (time.time() - ev_ts) > 2.5:
+        if ev_ts > 0.0 and (self._clock() - ev_ts) > 2.5:
             return
         touched: set[tuple[str, str]] = set()
         for ch in payload.get("price_changes") or ():
@@ -451,7 +498,10 @@ class SniperMarketHub:
                 continue
             bids = sorted(bids_map.items(), key=lambda t: t[0], reverse=True)
             asks = sorted(asks_map.items(), key=lambda t: t[0])
-            bid, ask = _executable_from_sorted(bids, asks)
+            bid = bids[0][0] if bids else None
+            ask = asks[0][0] if asks else None
+            if bid is not None and ask is not None and bid >= ask:
+                bid, ask = None, None
             self._set_side_book(st, side, bid, ask, ev_ts, via_ws=via_ws)
 
     async def _clob_ws_loop(self) -> None:
@@ -460,7 +510,7 @@ class SniperMarketHub:
             if not tokens:
                 await asyncio.sleep(0.5)
                 continue
-            subscribed_window = (int(time.time()) // 300) * 300
+            subscribed_window = (int(self._clock()) // 300) * 300
             try:
                 async with websockets.connect(POLY_CLOB_WS_URL, ping_interval=15, ping_timeout=10, open_timeout=8) as ws:
                     await ws.send(json.dumps({"assets_ids": list(tokens), "type": "market"}))
@@ -475,15 +525,15 @@ class SniperMarketHub:
                 await asyncio.sleep(1.5)
 
     async def _clob_ws_pump(self, ws: Any, tokens: dict[str, tuple[str, str]], subscribed_window: int) -> None:
-        last_msg = time.time()
-        while not self._stop.is_set() and (int(time.time()) // 300) * 300 == subscribed_window:
-            if time.time() - last_msg >= 12.0 or len(self._token_map()) != len(tokens):
+        last_msg = self._clock()
+        while not self._stop.is_set() and (int(self._clock()) // 300) * 300 == subscribed_window:
+            if self._clock() - last_msg >= 12.0 or len(self._token_map()) != len(tokens):
                 return
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
-            last_msg = time.time()
+            last_msg = self._clock()
             if not raw or raw in ("PING", "PONG"):
                 continue
             try:
@@ -497,7 +547,7 @@ class SniperMarketHub:
                 if ev_type == "book":
                     ev_ts = parse_book_ts_sec(ev)
                     mapped = tokens.get(str(ev.get("asset_id")))
-                    if mapped and not (ev_ts > 0.0 and (time.time() - ev_ts) > 2.5):
+                    if mapped and not (ev_ts > 0.0 and (self._clock() - ev_ts) > 2.5):
                         self.apply_book(mapped[0], mapped[1], ev, via_ws=True)
                 elif ev_type == "price_change":
                     self.apply_price_change(ev, tokens, via_ws=True)
@@ -516,7 +566,7 @@ class SniperMarketHub:
         """Poll REST books for symbols whose WebSocket is silent (>=2.5s) or empty; refresh CEX if WS is down."""
         while not self._stop.is_set():
             try:
-                now = time.time()
+                now = self._clock()
                 jobs = []
                 for sym, st in self.states.items():
                     silent = (now - st.last_ws_book_local_ts) >= 2.5
@@ -544,14 +594,13 @@ class SniperMarketHub:
                 st = self.states.get(str(row.get("symbol")))
                 if st is not None:
                     st.binance_price = 0.5 * (float(row["bidPrice"]) + float(row["askPrice"]))
-                    st.binance_ts = time.time()
-                    st.update_basis(st.binance_ts)
+                    st.binance_ts = self._clock()
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError):
             return
 
     def health(self) -> dict[str, Any]:
         """Compact feed-health snapshot for status APIs."""
-        now = time.time()
+        now = self._clock()
         per_sym = {
             s: {
                 "cex_age_sec": round(now - max(st.binance_ts, st.coinbase_ts), 1) if (st.binance_ts or st.coinbase_ts) else None,

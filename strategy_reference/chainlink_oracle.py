@@ -5,7 +5,7 @@ import asyncio
 from collections import deque
 import json
 import time
-from typing import Any
+from typing import Any, Callable
 
 import websockets
 
@@ -33,9 +33,12 @@ class ChainlinkRTDSFeed:
     - Time-weighted step-integral 60s TWAP fallback from spot ticks if the TWAP topic lags
     """
 
-    def __init__(self, proxy_url: str | None = None, max_ticks_per_symbol: int = 25000) -> None:
+    def __init__(
+        self, proxy_url: str | None = None, max_ticks_per_symbol: int = 25000, clock: Callable[[], float] = time.time
+    ) -> None:
         self.proxy_url = (proxy_url or "").strip() or None
         self.max_ticks = max(1000, int(max_ticks_per_symbol))
+        self._clock = clock
         self.ticks: dict[str, deque[tuple[int, float]]] = {
             "BTCUSDT": deque(maxlen=self.max_ticks),
             "ETHUSDT": deque(maxlen=self.max_ticks),
@@ -98,7 +101,7 @@ class ChainlinkRTDSFeed:
             return
         buf.append((int(ts_ms), float(value)))
         self.total_ticks += 1
-        self.last_tick_recv_ms = int(time.time() * 1000)
+        self.last_tick_recv_ms = int(self._clock() * 1000)
         self._record_bucket_open(self.bucket_opens, sym, value, ts_ms)
 
     def ingest_twap_tick(self, raw_symbol: str, value: float, ts_ms: int) -> None:
@@ -122,7 +125,7 @@ class ChainlinkRTDSFeed:
                 return
         buf.append((int(ts_ms), float(value)))
         self.total_twap_ticks += 1
-        self.last_tick_recv_ms = int(time.time() * 1000)
+        self.last_tick_recv_ms = int(self._clock() * 1000)
         self._record_bucket_open(self.twap_bucket_opens, sym, value, ts_ms)
 
     def get_latest_price(self, symbol: str, max_age_sec: float = 20.0) -> tuple[float | None, float]:
@@ -130,7 +133,7 @@ class ChainlinkRTDSFeed:
         if not buf:
             return None, 9999.0
         ts_ms, val = buf[-1]
-        age_sec = max(0.0, (time.time() * 1000.0 - float(ts_ms)) / 1000.0)
+        age_sec = max(0.0, (self._clock() * 1000.0 - float(ts_ms)) / 1000.0)
         if age_sec > max_age_sec:
             return None, round(age_sec, 2)
         return float(val), round(age_sec, 2)
@@ -140,7 +143,7 @@ class ChainlinkRTDSFeed:
         if not buf:
             return None, 9999.0
         ts_ms, val = buf[-1]
-        age_sec = max(0.0, (time.time() * 1000.0 - float(ts_ms)) / 1000.0)
+        age_sec = max(0.0, (self._clock() * 1000.0 - float(ts_ms)) / 1000.0)
         if age_sec > max_age_sec:
             return None, round(age_sec, 2)
         return float(val), round(age_sec, 2)
@@ -202,7 +205,7 @@ class ChainlinkRTDSFeed:
     ) -> tuple[float | None, int]:
         """Official 60s Chainlink TWAP at `end_ts_ms`, or time-weighted step-integral fallback."""
         sym = symbol.upper()
-        end_ms = int(end_ts_ms if end_ts_ms is not None else time.time() * 1000)
+        end_ms = int(end_ts_ms if end_ts_ms is not None else self._clock() * 1000)
         twap_buf = self.twap_ticks.get(sym)
         if twap_buf:
             best_val = None
@@ -256,7 +259,7 @@ class ChainlinkRTDSFeed:
             "connected": bool(self.connected),
             "total_ticks": int(self.total_ticks),
             "total_twap_ticks": int(self.total_twap_ticks),
-            "last_tick_age_sec": round(max(0.0, (time.time() * 1000.0 - self.last_tick_recv_ms) / 1000.0), 1)
+            "last_tick_age_sec": round(max(0.0, (self._clock() * 1000.0 - self.last_tick_recv_ms) / 1000.0), 1)
             if self.last_tick_recv_ms > 0
             else None,
             "last_error": self.last_error,

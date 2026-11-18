@@ -220,23 +220,35 @@ class OracleSniperRunner:
 
     # ------------------------------------------------------------------ market views
     def _rtds_open(self, sym: str, window_ts: int) -> Optional[float]:
-        """Official 60s Chainlink TWAP at the 5m boundary (falls back to spot ticks only in unit-test dummies)."""
+        """Official 60s Chainlink TWAP at the 5m boundary (never locks T-1s before T+8s)."""
         key = (sym, window_ts)
         if key in self._open_cache:
             return self._open_cache[key]
         boundary_ms = window_ts * 1000.0
         twap_fn = getattr(self.chainlink, "get_settlement_twap_at", None)
         best = twap_fn(sym, window_ts) if callable(twap_fn) else None
+        is_on_or_after = best is not None
         if best is None:
             twap_buf = getattr(self.chainlink, "twap_ticks", {}).get(sym) or ()
             src_ticks = twap_buf if twap_buf else (self.chainlink.ticks.get(sym) or ())
-            dist = 4001.0
+            best_rank = (9, 4001.0)
             for ts_ms, val in src_ticks:
                 d = ts_ms - boundary_ms
-                if -1000.0 <= d <= 4000.0 and abs(d) < dist:
-                    best, dist = float(val), abs(d)
-        if best is not None or time.time() - window_ts > 8.0:
-            self._open_cache[key] = best  # final: later ticks can no longer qualify
+                if 0.0 <= d <= 4000.0:
+                    rank = (0, d)
+                    if rank < best_rank:
+                        best, best_rank, is_on_or_after = float(val), rank, True
+                elif -1000.0 <= d < 0.0 and (time.time() - window_ts) > 8.0:
+                    rank = (1, abs(d))
+                    if rank < best_rank:
+                        best, best_rank = float(val), rank
+        if best is None and (time.time() - window_ts) > 8.0 and callable(twap_fn):
+            try:
+                best = twap_fn(sym, window_ts, allow_pre_boundary=True)
+            except TypeError:
+                best = None
+        if is_on_or_after or (time.time() - window_ts) > 8.0:
+            self._open_cache[key] = best  # final only after >= boundary tick or window_ts + 8s
             if len(self._open_cache) > 60:
                 self._open_cache.pop(next(iter(self._open_cache)))
         return best
@@ -286,7 +298,7 @@ class OracleSniperRunner:
 
     def _build_views(self, now: float, elapsed: float) -> dict[str, View]:
         views: dict[str, View] = {}
-        cl_lim = max(CHAINLINK_MAX_AGE_SEC, self.policy.max_chainlink_age_sec)
+        cl_lim = min(CHAINLINK_MAX_AGE_SEC, self.policy.max_chainlink_age_sec)
         for sym, st in self.hub.states.items():
             cl_px, age = self.chainlink.get_latest_price(sym, max_age_sec=cl_lim)
             if cl_px is None:
@@ -443,10 +455,11 @@ class OracleSniperRunner:
         st = self.hub.states[cand.symbol]
         live_ask = st.book.up_ask if cand.side == "UP" else st.book.down_ask
         side_ts = st.up_local_ts if cand.side == "UP" else st.down_local_ts
-        if live_ask is None or (time.time() - side_ts) > BOOK_MAX_AGE_SEC and side_ts > 0 and self.policy.paper_fill_delay_sec >= 0.5:
-            # Allow unit tests with synthetic timestamps close to tick `now`, block genuine dead WS feeds
-            if live_ask is None:
-                return {"filled": False, "shares": 0.0, "usd": 0.0, "avg_price": 0.0, "order_id": "", "status": "PAPER_NO_BOOK", "error": "ask_missing"}
+        if live_ask is None:
+            return {"filled": False, "shares": 0.0, "usd": 0.0, "avg_price": 0.0, "order_id": "", "status": "PAPER_NO_BOOK", "error": "ask_missing"}
+        if side_ts > 0 and (time.time() - side_ts) > BOOK_MAX_AGE_SEC and self.policy.paper_fill_delay_sec >= 0.5:
+            age_s = time.time() - side_ts
+            return {"filled": False, "shares": 0.0, "usd": 0.0, "avg_price": 0.0, "order_id": "", "status": "PAPER_STALE_BOOK", "error": f"book_age={age_s:.1f}s>{BOOK_MAX_AGE_SEC}s"}
         if live_ask > limit_px:
             return {"filled": False, "shares": 0.0, "usd": 0.0, "avg_price": 0.0, "order_id": "", "status": "PAPER_MISSED_1S", "error": f"ask@+1s={live_ask:.3f}>{limit_px:.2f}"}
         return {"filled": True, "shares": shares, "usd": round(shares * live_ask, 4), "avg_price": float(live_ask), "order_id": f"paper-{int(time.time() * 1000)}", "status": "PAPER_FILLED_1S", "error": None}
@@ -540,7 +553,7 @@ class OracleSniperRunner:
             "shares_open": shares, "entry_price": price, "sim_ask": cand.ask, "cost_per_share": cost_ps,
             "cost_usd": cost_usd, "fee_rate": fee_r, "entry_ts": now, "entry_elapsed": cand.elapsed_sec,
             "p_true": cand.p_true, "z": cand.z, "net_ev": cand.net_ev, "candidates": n_cands, "limit_px": limit_px,
-            "order_id": fill.get("order_id", ""), "strike": st.price_to_beat, "partial_proceeds_usd": 0.0,
+            "order_id": fill.get("order_id", ""), "strike": st.price_to_beat or self._open_cache.get((cand.symbol, window_ts)), "partial_proceeds_usd": 0.0,
             "fill_status": fill.get("status"), "paper_mode": bool(self.policy.paper_simulation),
         }
         if self.policy.paper_simulation:

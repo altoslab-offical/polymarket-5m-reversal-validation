@@ -66,6 +66,11 @@ class ChainlinkRTDSFeed:
         self._task: asyncio.Task[None] | None = None
 
     @staticmethod
+    def _boundary_rank(dt_ms: float) -> tuple[int, float]:
+        # Prefer on/after-boundary ticks (dt_ms >= 0) over pre-boundary ticks so T-1s never beats T+1s.
+        return (0 if dt_ms >= 0.0 else 1, abs(dt_ms))
+
+    @staticmethod
     def _record_bucket_open(
         table: dict[str, dict[int, tuple[float, int]]], sym: str, value: float, ts_ms: int
     ) -> None:
@@ -77,7 +82,7 @@ class ChainlinkRTDSFeed:
             dt_ms = ts_ms - b_ms
             if -1500 <= dt_ms <= 15000:
                 existing = table[sym].get(cand_b)
-                if existing is None or abs(dt_ms) < abs(existing[1] - b_ms):
+                if existing is None or ChainlinkRTDSFeed._boundary_rank(dt_ms) < ChainlinkRTDSFeed._boundary_rank(existing[1] - b_ms):
                     table[sym][cand_b] = (float(value), int(ts_ms))
         if len(table[sym]) > 120:
             cutoff_b = b_floor - 8 * 3600
@@ -140,22 +145,27 @@ class ChainlinkRTDSFeed:
             return None, round(age_sec, 2)
         return float(val), round(age_sec, 2)
 
-    def get_settlement_twap_at(self, symbol: str, target_ts_sec: int, max_dist_ms: int = 4000) -> float | None:
+    def get_settlement_twap_at(
+        self, symbol: str, target_ts_sec: int, max_dist_ms: int = 4000, allow_pre_boundary: bool = False
+    ) -> float | None:
         """Exact official Chainlink 60s TWAP tick at a 5m bucket boundary (`target_ts_sec * 1000`)."""
         sym = symbol.upper()
         anchor = self.twap_bucket_opens.get(sym, {}).get(int(target_ts_sec))
         target_ms = int(target_ts_sec) * 1000
-        if anchor is not None and abs(anchor[1] - target_ms) <= max_dist_ms:
+        min_dt = -1000 if allow_pre_boundary else 0
+        if anchor is not None and min_dt <= (anchor[1] - target_ms) <= max_dist_ms:
             return float(anchor[0])
         buf = self.twap_ticks.get(sym)
         if buf:
             best_val = None
-            best_dist = max_dist_ms + 1
+            best_rank = (9, float(max_dist_ms + 1))
             for ts_ms, val in buf:
-                dist = abs(ts_ms - target_ms)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_val = float(val)
+                dt_ms = ts_ms - target_ms
+                if min_dt <= dt_ms <= max_dist_ms:
+                    rank = self._boundary_rank(dt_ms)
+                    if rank < best_rank:
+                        best_rank = rank
+                        best_val = float(val)
             if best_val is not None:
                 return best_val
         return None

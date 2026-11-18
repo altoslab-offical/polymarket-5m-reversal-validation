@@ -227,6 +227,63 @@ def check_telegram_channel_broadcast(tmp: Path) -> int:
     return 1
 
 
+def check_forensics_regression_fixes(tmp: Path) -> int:
+    """Verify live_4trades_forensics bug fixes: WS price_change, T-1s strike lock, stale book/spot rejection."""
+    from engine.chainlink_oracle import ChainlinkRTDSFeed
+
+    r, _at, _cl, w = _make_strict_runner(tmp, "forensic_fix")
+    st = r.hub.states["ETHUSDT"]
+    st.up_token, st.down_token = "tok-up-cur", "tok-dn-cur"
+    now_ms = int(time.time() * 1000)
+    r.hub.apply_book("ETHUSDT", "UP", {
+        "asset_id": "tok-up-cur",
+        "timestamp": now_ms - 500,
+        "bids": [{"price": "0.80", "size": "50"}],
+        "asks": [{"price": "0.81", "size": "50"}],
+    }, via_ws=True)
+    assert st.book.up_ask == 0.81 and st.book.up_bid == 0.80
+
+    # 1. price_change clears 0.81 ask -> best ask immediately jumps to 0.88 (must not freeze at 0.81)
+    tokens = {"tok-up-cur": ("ETHUSDT", "UP"), "tok-dn-cur": ("ETHUSDT", "DOWN")}
+    r.hub.apply_price_change({
+        "event_type": "price_change",
+        "timestamp": now_ms,
+        "price_changes": [
+            {"asset_id": "tok-up-cur", "price": "0.81", "size": "0", "side": "SELL"},
+            {"asset_id": "tok-up-cur", "price": "0.88", "size": "60", "side": "SELL"},
+            {"asset_id": "tok-up-old", "price": "0.50", "size": "99", "side": "SELL"},  # ignored wrong window
+        ],
+    }, tokens=tokens, via_ws=True)
+    assert st.book.up_ask == 0.88, f"expected price_change to move ask to 0.88, got {st.book.up_ask}"
+
+    # 2. T-1s TWAP tick must NEVER beat / lock over real T>=0 boundary tick (1795005900-ETHUSDT bug)
+    from unittest.mock import patch
+    cl_real = ChainlinkRTDSFeed()
+    cur_b = (int(time.time()) // 300) * 300
+    cl_real.ingest_twap_tick("eth/usd", 1789.96, (cur_b - 1) * 1000)
+    r_b = OracleSniperRunner(MagicMock(), cl_real, MagicMock(dispatch_signal=AsyncMock()), cfg=TWAP_V2_FILTERED_CONFIG)
+    with patch("engine.oracle_sniper_runner.time.time", return_value=float(cur_b) + 0.2):
+        assert r_b._rtds_open("ETHUSDT", cur_b) is None
+    cl_real.ingest_twap_tick("eth/usd", 1790.0685, cur_b * 1000)
+    with patch("engine.oracle_sniper_runner.time.time", return_value=float(cur_b) + 1.0):
+        assert cl_real.get_settlement_twap_at("ETHUSDT", cur_b) == 1790.0685
+        assert r_b._rtds_open("ETHUSDT", cur_b) == 1790.0685
+
+    # 3. _paper_buy must reject genuinely stale books when paper_fill_delay_sec >= 0.5
+    r.policy = replace(r.policy, paper_simulation=True, paper_fill_delay_sec=0.5)
+    st.up_local_ts = time.time() - 10.0
+    st.book = OrderBookTop(0.79, 0.80, 0.19, 0.20)
+    res_stale = asyncio.run(r._paper_buy(MagicMock(symbol="ETHUSDT", side="UP"), 5.0, 0.82))
+    assert not res_stale["filled"] and res_stale["status"] == "PAPER_STALE_BOOK", res_stale
+
+    # 4. _build_views enforces min(CHAINLINK_MAX_AGE_SEC, policy.max_chainlink_age_sec) = 3.0s on cl_spot
+    r_spot, _at2, cl2, w2 = _make_strict_runner(tmp, "spot_age")
+    cl2.spot_age = 3.5
+    views = r_spot._build_views(w2 + 200.0, 200.0)
+    assert len(views) == 0 and r_spot.diag["BTCUSDT"]["entry_blocked"] == "CHAINLINK_STALE", r_spot.diag
+    return 1
+
+
 def main() -> None:
     """Run all Section 3 production safety checks."""
     with tempfile.TemporaryDirectory() as td:
@@ -237,6 +294,7 @@ def main() -> None:
             + check_section3_circuit_breakers(tmp)
             + check_paper_43u_simulation(tmp)
             + check_telegram_channel_broadcast(tmp)
+            + check_forensics_regression_fixes(tmp)
         )
     print(json.dumps({"status": "SECTION3_PRODUCTION_GUARDS_PASSED", "groups_passed": groups}))
 

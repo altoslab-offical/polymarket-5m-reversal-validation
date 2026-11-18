@@ -437,7 +437,7 @@ class LiveRecorder42:
                 INSERT INTO windows_42 (window_ts, symbol, slug, condition_id, up_token_id, down_token_id, twap_strike, spot_strike)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(window_ts, symbol) DO UPDATE SET
-                    slug = COALESCE(NULLIF(windows_42.slug, ''), excluded.slug),
+                    slug = COALESCE(NULLIF(excluded.slug, ''), windows_42.slug),
                     condition_id = COALESCE(NULLIF(excluded.condition_id, ''), windows_42.condition_id),
                     up_token_id = COALESCE(NULLIF(excluded.up_token_id, ''), windows_42.up_token_id),
                     down_token_id = COALESCE(NULLIF(excluded.down_token_id, ''), windows_42.down_token_id),

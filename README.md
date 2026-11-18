@@ -6,6 +6,9 @@
 
 ## Start Here (For Claude / Reviewers)
 
+- **🔥 NEW (`2026-11-18` Strategic Pivot): Full-Candle V11 Battle Records & 91-Day Polymarket Audit (`FULL_CANDLE_V11_DIAGNOSIS_FOR_CLAUDE.md`)**: [`FULL_CANDLE_V11_DIAGNOSIS_FOR_CLAUDE.md`](FULL_CANDLE_V11_DIAGNOSIS_FOR_CLAUDE.md) (`raw`: [FULL_CANDLE_V11_DIAGNOSIS_FOR_CLAUDE.md](https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/FULL_CANDLE_V11_DIAGNOSIS_FOR_CLAUDE.md))
+  - Strategy source: [`strategy_reference/v8_strategy.py`](strategy_reference/v8_strategy.py) + [`strategy_reference/indicators.py`](strategy_reference/indicators.py)
+  - 91-day official `pm_outcome` audit script & tables: [`edge_validation/audit_v11_full_candle_91d.py`](edge_validation/audit_v11_full_candle_91d.py) + [`edge_validation/v11_full_candle_91d_summary.csv`](edge_validation/v11_full_candle_91d_summary.csv) + [`edge_validation/v11_full_candle_91d_branches.csv`](edge_validation/v11_full_candle_91d_branches.csv)
 - **Round-3 Main Synthesis & Full Audit Responses (`CLAUDE_HANDOFF.md`)**: [`CLAUDE_HANDOFF.md`](CLAUDE_HANDOFF.md) (`raw`: [CLAUDE_HANDOFF.md](https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/CLAUDE_HANDOFF.md))
 - **Section 4.1 Corrected `L1 + L2 + L3` 96-Day Report**: [`edge_validation/summary_41.md`](edge_validation/summary_41.md) + [`edge_validation/deviations.md`](edge_validation/deviations.md) + [`edge_validation/phase41_l2_post5_summary.csv`](edge_validation/phase41_l2_post5_summary.csv) + [`edge_validation/r1_r2_parity_proof.json`](edge_validation/r1_r2_parity_proof.json)
   - Datasets & CSVs: [`edge_validation/phase41_intrawindow.parquet`](edge_validation/phase41_intrawindow.parquet), [`phase41_model_free_summary.csv`](edge_validation/phase41_model_free_summary.csv), [`phase41_with_model_summary.csv`](edge_validation/phase41_with_model_summary.csv), [`phase41_l2_post5_summary.csv`](edge_validation/phase41_l2_post5_summary.csv)

@@ -7,9 +7,11 @@ pure (no I/O) so the exact same code path is used by the live runner and by the 
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import json
 import math
-from typing import Deque, Optional
+import pathlib
+from typing import Any, Deque, Optional
 
 # --------------------------------------------------------------------------------------
 # Configuration
@@ -69,6 +71,21 @@ TWAP_V2_FILTERED_CONFIG = SniperConfig(
 )
 
 TWAP_V2_PURE_CONFIG = SniperConfig(
+    student_t_df=6.0,
+    vol_lookback_sec=1800,
+    min_1s_vol_floor=0.000035,
+    max_model_market_divergence=0.30,
+    use_twap_projection=True,
+    twap_gaussian_weight=1.0,
+    twap_student_t_df=6.0,
+    use_flow_gates=False,
+    early_tp_enabled=False,
+)
+
+# Shadow model for Section 4.2 high-band exploration ([0.84, 0.95]); NEVER included in the Bonferroni gate.
+TWAP_V2_HIGHBAND_SHADOW_CONFIG = SniperConfig(
+    min_entry_price=0.84,
+    max_entry_price=0.95,
     student_t_df=6.0,
     vol_lookback_sec=1800,
     min_1s_vol_floor=0.000035,
@@ -536,3 +553,36 @@ def entry_limit_price(cfg: SniperConfig, ask: float, p_true: float) -> float:
         if (p_true - cand - taker_fee_per_share(cand, cfg.fee_rate)) >= cfg.min_net_edge:
             return cand
     return limit_px
+
+
+_FROZEN_MODEL_KEYS: dict[str, str] = {
+    "v1": "sniper_config",
+    "v2_filtered": "sniper_config_v2_filtered",
+    "v2_pure": "sniper_config_v2_pure",
+    "v2_highband_shadow": "shadow_config_v2_highband",
+}
+
+
+def cfg_from_dict(raw: dict[str, Any]) -> SniperConfig:
+    """Reconstruct a SniperConfig from JSON dict, normalizing tuple fields."""
+    return SniperConfig(**{k: (tuple(v) if k == "slippage_ladder" else v) for k, v in raw.items()})
+
+
+def load_frozen_sniper_config(frozen_path: pathlib.Path, model_name: str = "v2_filtered") -> tuple[SniperConfig, dict[str, float]]:
+    """Load an exact pre-registered SniperConfig and per-symbol fee schedule from `frozen_config.json`."""
+    raw = json.loads(frozen_path.read_text(encoding="utf-8"))
+    key = _FROZEN_MODEL_KEYS.get(model_name)
+    if key is None or key not in raw:
+        raise KeyError(f"Unknown or missing frozen model {model_name!r} in {frozen_path}")
+    fees = {str(k): float(v) for k, v in raw.get("effective_fees_post_nov20", {}).items()}
+    return cfg_from_dict(raw[key]), fees
+
+
+def check_frozen_config_parity(cfg: SniperConfig, frozen_path: pathlib.Path, model_name: str = "v2_filtered") -> tuple[bool, list[str]]:
+    """Verify live `cfg` matches `frozen_config.json` bit-for-bit across all strategy parameters."""
+    if not frozen_path.exists():
+        return False, ["frozen_config_missing"]
+    frozen_cfg, _fees = load_frozen_sniper_config(frozen_path, model_name)
+    cur_d, exp_d = asdict(cfg), asdict(frozen_cfg)
+    diffs = [f"{k}: live={cur_d.get(k)!r} != frozen={exp_d.get(k)!r}" for k in exp_d if cur_d.get(k) != exp_d.get(k)]
+    return (len(diffs) == 0), diffs

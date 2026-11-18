@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Complete Backtest Suite for TWAP Sniper V2 (`TWAP_V2_FILTERED_CONFIG` & `TWAP_V2_PURE_CONFIG`):
-  1. Real 1s-CLOB Replay on `live_btc_5m.db` (1,013 BTC windows, 100% Gamma TWAP backfill,
-     conservative +1s & +2s execution delay, IS 2/3 vs OOS 1/3).
-  2. 96-Day 3-Coin (`BTC/ETH/SOL`) Non-Overlapping Single-Slot Portfolio Backtest on
-     zero-lag synced `phase41_intrawindow.parquet` (`lag <= 5s` & `lag <= 2s`), post-11/20 fees.
-  3. Section 5.4 Risk-Gated Bankroll Simulation from $43.10U + Daily Log-Growth Bootstrap CI.
+Complete Unbiased Backtest Suite for TWAP Sniper V2:
+  1. Real 1s-CLOB Replay on `live_btc_5m.db` (1,013 BTC windows = 3.517 days, 100% Gamma TWAP
+     backfill, conservative +1s & +2s execution delay) for V1, V2_FILTERED, V2_PURE, and
+     V2_HIGHBAND_SHADOW ([0.84, 0.95] data reference).
+  2. Honest Frequency, Win-Rate, and Monthly Projection Matrix anchored to `4.1` / `1s-CLOB`
+     (explicitly marking `L4` $43->$192 compounding retracted & CI pre-4.2).
 """
 from __future__ import annotations
 
@@ -23,10 +23,10 @@ ROOT = pathlib.Path(__file__).resolve().parent
 REPO = ROOT.parent
 sys.path.insert(0, str(REPO))
 
-from engine.master_strategy import compute_vault_locked_u
 from engine.oracle_sniper import (
     DEFAULT_SNIPER_CONFIG,
     TWAP_V2_FILTERED_CONFIG,
+    TWAP_V2_HIGHBAND_SHADOW_CONFIG,
     TWAP_V2_PURE_CONFIG,
     FairValueEstimate,
     OpenPosition,
@@ -223,6 +223,7 @@ def replay_1s_clob(
 
 def _split_summary_rows(tdf: pd.DataFrame, name: str, delay: int, fee: float) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
+    span_days = {"IS": 1013 * 2 / 3 / 288.0, "OOS": 1013 / 3 / 288.0, "FULL": 1013 / 288.0}
     for sp in ("IS", "OOS", "FULL"):
         s = tdf if sp == "FULL" else tdf[tdf["split"] == sp]
         n = len(s)
@@ -233,6 +234,7 @@ def _split_summary_rows(tdf: pd.DataFrame, name: str, delay: int, fee: float) ->
         plo, phi = bootstrap_ci(s["pnl"].to_numpy(dtype=np.float64))
         rows.append({
             "model": name, "delay_s": delay, "fee": fee, "split": sp, "n": n,
+            "per_day_btc": round(n / span_days[sp], 1),
             "wr": round(wins / n, 4), "wr_ci95": f"[{wlo:.3f},{whi:.3f}]",
             "mean_cost": round(float(s["cost"].mean()), 4),
             "pnl_per_sh": round(float(s["pnl"].mean()), 5),
@@ -242,12 +244,12 @@ def _split_summary_rows(tdf: pd.DataFrame, name: str, delay: int, fee: float) ->
 
 
 def summarize_clob_1s(windows: List[Any]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Run all V1/V2 comparisons across +1s and +2s delay and fees {0.07, 0.05}."""
+    """Run V1, V2_FILTERED, V2_PURE, and V2_HIGHBAND_SHADOW across +1s/+2s delay & {0.07, 0.05} fees."""
     configs: List[Tuple[str, SniperConfig]] = [
         ("V1_SPOT_DEFAULT", DEFAULT_SNIPER_CONFIG),
         ("TWAP_V2_FILTERED_SETTLE", TWAP_V2_FILTERED_CONFIG),
-        ("TWAP_V2_FILTERED_TP98", SniperConfig(**{**asdict(TWAP_V2_FILTERED_CONFIG), "early_tp_enabled": True})),
         ("TWAP_V2_PURE_SETTLE", TWAP_V2_PURE_CONFIG),
+        ("V2_HIGHBAND_SHADOW", TWAP_V2_HIGHBAND_SHADOW_CONFIG),
     ]
     all_trades: List[pd.DataFrame] = []
     summary_rows: List[Dict[str, Any]] = []
@@ -262,157 +264,63 @@ def summarize_clob_1s(windows: List[Any]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     return pd.DataFrame(summary_rows), out_csv
 
 
-def _simulate_bankroll_54(trades: pd.DataFrame, start_u: float = 43.10) -> Dict[str, Any]:
-    """Chronological $43.10U equity trajectory enforcing Section 5.4 + Proposal-2 risk gates."""
-    if len(trades) == 0:
-        return {"n": 0}
-    eq = start_u
-    peak_eq = start_u
-    vault = 0.0
-    max_dd = 0.0
-    cur_day = -1
-    day_start_eq = start_u
-    consec_losses = 0
-    day_stopped = False
-    daily_eq: Dict[int, Tuple[float, float]] = {}
-    weekly_pnl: Dict[int, float] = {}
-    recent_50: List[Tuple[int, float]] = []
-    executed = 0
-
-    for row in trades.sort_values("T").itertuples(index=False):
-        day = int(row.T // 86400)
-        wk = int(row.T // (7 * 86400))
-        if day != cur_day:
-            if cur_day != -1:
-                daily_eq[cur_day] = (day_start_eq, eq)
-            cur_day = day
-            day_start_eq = eq
-            consec_losses = 0
-            day_stopped = False
-
-        if day_stopped:
-            continue
-        if len(recent_50) >= 50:
-            wr50 = sum(x[0] for x in recent_50[-50:]) / 50.0
-            be50 = sum(x[1] for x in recent_50[-50:]) / 50.0
-            if wr50 < be50 + 0.02:
-                continue
-
-        tradable = max(0.0, eq - vault)
-        risk_pct = 0.03 if eq >= 200.0 else 0.05
-        cfg_step = SniperConfig(risk_fraction=risk_pct, min_shares=5.0)
-        sh = compute_shares(cfg_step, tradable, float(row.cost))
-        if sh <= 0:
-            break
-        pnl_usd = sh * float(row.pnl)
-        eq += pnl_usd
-        executed += 1
-        peak_eq = max(peak_eq, eq)
-        vault, _, _ = compute_vault_locked_u(peak_eq, vault)
-        dd = (peak_eq - eq) / peak_eq if peak_eq > 0 else 0.0
-        max_dd = max(max_dd, dd)
-        weekly_pnl[wk] = weekly_pnl.get(wk, 0.0) + pnl_usd
-        recent_50.append((int(row.win), float(row.cost)))
-
-        if pnl_usd < 0:
-            consec_losses += 1
-        else:
-            consec_losses = 0
-        if eq < 100.0 and (consec_losses >= 3 or (day_start_eq - eq) >= 10.0):
-            day_stopped = True
-
-    if cur_day != -1:
-        daily_eq[cur_day] = (day_start_eq, eq)
-    log_rets = np.array([math.log(max(1e-6, e1 / max(1e-6, e0))) for e0, e1 in daily_eq.values()], dtype=np.float64)
-    lg_lo, lg_hi = bootstrap_ci(log_rets) if len(log_rets) >= 2 else (0.0, 0.0)
-    pos_weeks = sum(1 for v in weekly_pnl.values() if v > 0) / max(1, len(weekly_pnl))
-    return {
-        "executed_trades": executed, "days": len(daily_eq),
-        "final_equity_u": round(eq, 2), "vault_locked_u": round(vault, 2),
-        "max_dd_pct": round(max_dd * 100.0, 2),
-        "pos_weeks_pct": round(pos_weeks * 100.0, 1),
-        "daily_log_growth_mean": round(float(log_rets.mean()), 5) if len(log_rets) else 0.0,
-        "daily_log_growth_ci95_lo": round(lg_lo, 5),
-        "daily_log_growth_ci95_hi": round(lg_hi, 5),
-    }
-
-
-def backtest_96d_single_slot(max_lag: int = 5, slip_stress: float = 0.0) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Single-slot 3-coin non-overlapping backtest on zero-lag synced Section 4.1 data (post-11/20 fees)."""
-    df = pd.read_parquet(P41_PQ)
-    sync = df[(df["split"] == "OOS") & df["up_valid"] & df["dn_valid"] & (df["up_lag_sec"] <= max_lag) & (df["down_lag_sec"] <= max_lag)].copy()
-    hs_map = [(0.0, 0.50, 0.005), (0.50, 0.60, 0.00725), (0.60, 0.68, 0.0058), (0.68, 0.76, 0.02), (0.76, 0.84, 0.005), (0.84, 0.92, 0.005), (0.92, 1.0, 0.005)]
-
-    def get_hs(arr: np.ndarray) -> np.ndarray:
-        out = np.full(len(arr), 0.005)
-        for lo, hi, v in hs_map:
-            out[(arr >= lo) & (arr < hi)] = v
-        return out
-
-    up_p, dn_p = sync["up_px"].to_numpy(dtype=np.float64), sync["down_px"].to_numpy(dtype=np.float64)
-    rate = sync["coin"].map({"BTC": 0.05, "ETH": 0.01, "SOL": 0.01}).to_numpy(dtype=np.float64)
-    au = np.minimum(0.99, up_p + get_hs(up_p) + slip_stress)
-    ad = np.minimum(0.99, dn_p + get_hs(dn_p) + slip_stress)
-    cu = au + np.round(rate * au * (1.0 - au), 5)
-    cd = ad + np.round(rate * ad * (1.0 - ad), 5)
-    eu = sync["fair_up"].to_numpy(dtype=np.float64) - cu
-    ed = sync["fair_down"].to_numpy(dtype=np.float64) - cd
-    tup = eu >= ed
-    sync["cand_side"] = np.where(tup, "UP", "DOWN")
-    sync["cand_ev"] = np.where(tup, eu, ed)
-    sync["cand_ask"] = np.where(tup, au, ad)
-    sync["cand_cost"] = np.where(tup, cu, cd)
-    sync["cand_fair"] = np.where(tup, sync["fair_up"], sync["fair_down"])
-    sync["cand_win"] = np.where(tup, sync["pm_outcome"] == 1.0, sync["pm_outcome"] == 0.0).astype(np.float64)
-    sync["cand_pnl"] = sync["cand_win"] - sync["cand_cost"]
-
-    gate = (sync["cand_ask"] >= 0.68) & (sync["cand_ask"] <= 0.82) & (sync["cand_ev"] >= 0.035) & (sync["cand_fair"] >= 0.80) & (np.abs(sync["z_twap"]) >= 1.30)
-    passed = sync[gate].copy()
-    passed["rank_score"] = passed["cand_ev"] + np.where(passed["coin"] == "BTC", 0.01, 0.0)
-    # Single-slot: keep top-ranked `(coin, tau)` per unique 5m window `T`
-    slot_trades = passed.sort_values("rank_score", ascending=False).groupby("T", as_index=False).first()
-    slot_trades = slot_trades.rename(columns={"cand_cost": "cost", "cand_pnl": "pnl", "cand_win": "win"})
-    bank = _simulate_bankroll_54(slot_trades, start_u=43.10)
-    return slot_trades, pd.DataFrame([bank])
+def build_monthly_expectation_table() -> pd.DataFrame:
+    """Transparent monthly expectancy bounds at 5 shares vs 5% sizing (Section 4.2 gate pending)."""
+    rows: List[Dict[str, Any]] = []
+    scenarios = [
+        ("v2_filtered (+1s ref: ~13.4/d BTC, ~30-40/d 3-coin)", 30.0, 0.000, "保守無優勢 (CI跨0下緣)"),
+        ("v2_filtered (+1s ref)", 30.0, 0.020, "保守正優勢 (+2¢/股)"),
+        ("v2_filtered (+1s ref)", 30.0, 0.030, "96d因果均值 (+3¢/股)"),
+        ("v2_filtered (+1s ref)", 30.0, 0.037, "Claude 1s盤口均值 (+3.7¢/股)"),
+        ("v2_pure (+1s ref: ~33/d BTC, ~75/d 3-coin)", 75.0, 0.020, "高頻保守 (+2¢/股)"),
+        ("v2_pure (+1s ref)", 75.0, 0.030, "高頻均值 (+3¢/股)"),
+    ]
+    for label, trades_day_3c, edge_sh, note in scenarios:
+        sh_5 = 5.0
+        sh_100u = round(100.0 * 0.05 / 0.79, 2)
+        rows.append({
+            "scenario": label,
+            "edge_per_sh": f"{edge_sh:+.3f}",
+            "est_trades_3coin_day": int(trades_day_3c),
+            "est_trades_30d": int(trades_day_3c * 30),
+            "monthly_usd_5sh": round(trades_day_3c * 30 * sh_5 * edge_sh, 2),
+            "monthly_usd_at_100u_5pct": round(trades_day_3c * 30 * sh_100u * edge_sh, 2),
+            "note": note,
+        })
+    return pd.DataFrame(rows)
 
 
 def main() -> None:
-    """Execute 1s-CLOB & 96-day single-slot backtests and write report."""
+    """Execute unbiased 1s-CLOB backtest (In-Sample Ref) + expectation sensitivity report."""
     windows, t_split = load_1s_clob_windows()
     clob_summary, clob_trades = summarize_clob_1s(windows)
     clob_trades.to_csv(OUT_TRADES_CSV, index=False)
-
-    slot_5s, bank_5s = backtest_96d_single_slot(max_lag=5, slip_stress=0.0)
-    slot_5s_1c, bank_5s_1c = backtest_96d_single_slot(max_lag=5, slip_stress=0.01)
-    slot_2s, bank_2s = backtest_96d_single_slot(max_lag=2, slip_stress=0.0)
-
-    def fmt_slot(label: str, st: pd.DataFrame, bk: pd.DataFrame) -> Dict[str, Any]:
-        n = len(st)
-        plo, phi = bootstrap_ci(st["pnl"].to_numpy(dtype=np.float64)) if n else (0.0, 0.0)
-        b = bk.iloc[0].to_dict() if len(bk) else {}
-        return {
-            "scenario": label, "n_windows": n, "wr": round(float(st["win"].mean()), 4) if n else 0.0,
-            "pnl_per_sh": round(float(st["pnl"].mean()), 5) if n else 0.0, "pnl_ci95": f"[{plo:+.4f},{phi:+.4f}]",
-            "final_u": b.get("final_equity_u"), "max_dd_pct": b.get("max_dd_pct"),
-            "pos_weeks_pct": b.get("pos_weeks_pct"),
-            "daily_lg_ci95": f"[{b.get('daily_log_growth_ci95_lo')},{b.get('daily_log_growth_ci95_hi')}]",
-        }
-
-    port_df = pd.DataFrame([
-        fmt_slot("OOS lag<=5s base (0.05/0.01)", slot_5s, bank_5s),
-        fmt_slot("OOS lag<=5s +1c slip", slot_5s_1c, bank_5s_1c),
-        fmt_slot("OOS lag<=2s base (0.05/0.01)", slot_2s, bank_2s),
-    ])
+    exp_df = build_monthly_expectation_table()
     lines = [
-        "# TWAP Sniper V2 策略實作與完整回測報告 (`strategy_v2_report.md`)", "",
-        f"- 核心策略模組：`engine/oracle_sniper.py` (`TWAP_V2_FILTERED_CONFIG`, `TWAP_V2_PURE_CONFIG`, `estimate_twap_fair_value`)",
-        f"- 第一組真實 1s-CLOB 回測：`1,013` BTC 窗（100% 官方 Gamma TWAP 回填；IS `T < {t_split}` `675` 窗 / OOS `338` 窗）",
-        "- 第二組 96 天三幣單槽模擬：`phase41_intrawindow.parquet` OOS 零前視同步對齊子集（每 5m 窗最多 1 單）＋ Section 5.4 風控規則（`$43.10U` 起步、`>= $200U` 單筆 `<= 3%`、`<$100U` 連輸 3 單/日虧 `$10U` 停機）", "",
-        "## 1. 真實 1 秒 CLOB 盤口回測（含 `+1s` / `+2s` 保守延遲懲罰）", "", df_to_md(clob_summary), "",
-        "## 2. 96 天三幣（BTC/ETH/SOL）單槽組合模擬（OOS `lag<=5s/2s` + 5.4 風控）", "", df_to_md(port_df), "",
-        "## 3. 關鍵結論與實盤停機狀態",
-        "- **為什麼從 `V1_SPOT` 升級為 `TWAP_V2`**：修正為 100% 官方 TWAP Strike 後，舊 `V1_SPOT` 因剩餘方差未縮減而極端保守（全 1,013 窗僅觸發 5–7 筆）；`TWAP_V2_FILTERED_SETTLE` 在嚴苛 `+1s` 與 `+2s` 延遲下皆呈現實質且雙向正樣本報酬（表 1：`+1s` Full `n=47`, WR `87.23%`, `+0.10385/股`, CI `[+0.0186, +0.1706]`；`+2s` Full `n=34`, WR `85.29%`, `+0.11484/股`, CI `[+0.0186, +0.1943]`），`TWAP_V2_PURE_SETTLE` 則提供高頻版本（`n=102–116`, WR `81.4–81.9%`, `+0.06126 ~ +0.09263/股`）。",
-        "- **交易頻率與監控計畫**：`TWAP_V2_FILTERED` 單幣 BTC 實測約 `13.4 單/天`（三幣 `1.56×` 約 `21 單/天`），`TWAP_V2_PURE` 單幣 BTC 約 `33 單/天`（三幣約 `50 單/天`）；目前實盤仍嚴格保持停機，僅透過 `live_recorder_42.py` 在背景以純只讀監控紀錄三幣實際 `Top-5` 盤口深度與 V1/V2 雙軌模擬成效。", "",
+        "# TWAP Sniper V2 策略實作與回測說明 (`strategy_v2_report.md`)",
+        "",
+        "> ⚠️ **Round-3 稽核規範聲明**：",
+        "> 1. `live_btc_5m.db`（`1,013` BTC 窗 = `3.52` 天）為 **V2 設計樣本內參考（Reference / In-Sample Only）**。",
+        "> 2. **原第 2 節 96 天組合複利模擬（`$43.10 -> $192.89U`）正式作廢（`L4 Retracted`）**。",
+        "> 3. 實盤與期望值裁決以 Section 4.2（`>= 2026-11-21T00:00:00Z`，`n >= 300`，**Bonferroni 98.3% CI 下界 > 0**）為唯一依據。",
+        "",
+        f"- 核心策略模組：`engine/oracle_sniper.py` (`TWAP_V2_FILTERED_CONFIG`, `TWAP_V2_PURE_CONFIG`, `TWAP_V2_HIGHBAND_SHADOW_CONFIG`)",
+        f"- 真實 1s-CLOB 回測基準：`1,013` BTC 窗（100% Gamma TWAP 回填；IS `T < {t_split}` `675` 窗 / OOS `338` 窗）",
+        "",
+        "## 1. 真實 1 秒 CLOB 盤口回測（含 `+1s` / `+2s` 延遲懲罰；V2 僅作設計參考）",
+        "",
+        df_to_md(clob_summary),
+        "",
+        "## 2. [RETRACTED / 已作廢] 原 96 天三幣複利模擬 (`L4` 暫不採用)",
+        "",
+        "> 因基於 L1–L3 修正前資料且未計入 1Hz 錯過率與問價深度，`$43.10 -> $192.89U` 曲線已全面作廢；上線判定改以 4.2 實盤盤口為準。",
+        "",
+        "## 3. 誠實敏感度推估（僅在 4.2 通過 `98.3% CI > 0` 後生效）",
+        "",
+        df_to_md(exp_df),
+        "",
+        "- **重要誠實提示**：在真實 1Hz 盤口 (`live_btc_5m.db`, `n=339`) 上，95% CI 為 `+0.037 ± 0.042`（下界仍跨過 `0`）。因此若 `4.2`（11/21 新費率後）實測淨優勢落在 `<= 0¢/股`（做市商把 ETH/SOL 降費優勢吃光），則策略**不會上線**；只有通過 `4.2` 且確認淨正優勢（例如 `+2¢ ~ +3.7¢/股`）後，上表月期望值才會成立。",
+        "",
     ]
     OUT_MD.write_text("\n".join(lines), encoding="utf-8")
     print(f"[V2 Backtest] Saved {OUT_MD} & {OUT_TRADES_CSV} ({len(clob_trades)} rows)")

@@ -7,7 +7,8 @@ Settlement is resolved from Polymarket's official Gamma outcome and winnings are
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
+import pathlib
 import time
 from typing import Any, Optional
 
@@ -19,6 +20,7 @@ from engine.oracle_sniper import (
     OpenPosition,
     OrderBookTop,
     SniperConfig,
+    check_frozen_config_parity,
     compute_shares,
     effective_exit_proceeds,
     entry_limit_price,
@@ -40,6 +42,7 @@ MAX_EXIT_ATTEMPTS = 5
 CHAINLINK_MAX_AGE_SEC = 4.5
 BOOK_MAX_AGE_SEC = 3.5
 WALLET_REFRESH_SEC = 30.0
+PRODUCTION_FEE_RATES: dict[str, float] = {"BTCUSDT": 0.05, "ETHUSDT": 0.01, "SOLUSDT": 0.01}
 
 UNCERTAIN_FILL_STATUSES = ("ERROR", "UNKNOWN", "DUST_FILL")
 RECONCILE_DELAYS_SEC = (6.0, 12.0, 20.0, 30.0)
@@ -47,8 +50,36 @@ RECONCILE_DELAYS_SEC = (6.0, 12.0, 20.0, 30.0)
 View = tuple[FairValueEstimate, OrderBookTop]
 
 
+@dataclass(frozen=True)
+class SniperExecutionPolicy:
+    """Concurrency, pre-order data-freshness, frozen-config parity, and pilot constraints."""
+
+    max_concurrent_positions: int = 1
+    per_symbol_fees: Optional[dict[str, float]] = None
+    require_rtds_connected: bool = False
+    require_twap_fresh: bool = False
+    max_chainlink_age_sec: float = CHAINLINK_MAX_AGE_SEC
+    max_binance_age_sec: Optional[float] = None
+    frozen_config_path: Optional[pathlib.Path] = None
+    frozen_model_name: Optional[str] = None
+    pilot_fixed_shares: Optional[float] = None
+
+
+PRODUCTION_EXEC_POLICY = SniperExecutionPolicy(
+    max_concurrent_positions=3,
+    per_symbol_fees=PRODUCTION_FEE_RATES,
+    require_rtds_connected=True,
+    require_twap_fresh=True,
+    max_chainlink_age_sec=3.0,
+    max_binance_age_sec=2.0,
+    frozen_config_path=pathlib.Path(__file__).resolve().parent.parent / "edge_validation" / "frozen_config.json",
+    frozen_model_name="v2_filtered",
+    pilot_fixed_shares=5.0,
+)
+
+
 class OracleSniperRunner:
-    """Single-slot multi-coin execution engine."""
+    """Multi-coin Chainlink late-window execution engine (supports 1-slot legacy or 3-slot 1-per-coin Section 3)."""
 
     def __init__(
         self,
@@ -58,6 +89,7 @@ class OracleSniperRunner:
         cfg: SniperConfig = DEFAULT_SNIPER_CONFIG,
         ledger: Optional[SniperLedger] = None,
         hub: Optional[SniperMarketHub] = None,
+        policy: SniperExecutionPolicy = SniperExecutionPolicy(),
     ) -> None:
         self.auto_trader = auto_trader
         self.chainlink = chainlink_feed
@@ -65,21 +97,40 @@ class OracleSniperRunner:
         self.cfg = cfg
         self.ledger = ledger or SniperLedger()
         self.hub = hub or SniperMarketHub(auto_trader, cfg)
+        self.policy = policy
         self.running = False
         self._task: Optional[asyncio.Task[None]] = None
         self._bg: set[asyncio.Task[Any]] = set()
-        self._pos: Optional[OpenPosition] = None
-        self._trade: Optional[dict[str, Any]] = None
+        self._positions: dict[str, OpenPosition] = {}
+        self._trades: dict[str, dict[str, Any]] = {}
         self._traded_windows: set[int] = set()
-        self._attempts: dict[int, int] = {}
+        self._traded_coin_windows: set[tuple[str, int]] = set()
+        self._attempts: dict[tuple[str, int], int] = {}
+        self._win_attempts: dict[int, int] = {}
         self._open_cache: dict[tuple[str, int], Optional[float]] = {}
         self._last_attempt_ts = 0.0
-        self._exit_attempts = 0
-        self._next_exit_ts = 0.0
+        self._exit_attempts: dict[str, int] = {}
+        self._next_exit_ts: dict[str, float] = {}
         self._last_wallet_ts = 0.0
         self.heartbeat_ts = 0.0
         self.last_error: Optional[str] = None
         self.diag: dict[str, dict[str, Any]] = {}
+
+    @property
+    def _pos(self) -> Optional[OpenPosition]:
+        return next(iter(self._positions.values()), None)
+
+    @property
+    def _trade(self) -> Optional[dict[str, Any]]:
+        return next(iter(self._trades.values()), None)
+
+    def _fee_for(self, sym: str) -> float:
+        fees = self.policy.per_symbol_fees or {}
+        return float(fees.get(sym, self.cfg.fee_rate))
+
+    def _cfg_for(self, sym: str) -> SniperConfig:
+        fee = self._fee_for(sym)
+        return self.cfg if abs(fee - self.cfg.fee_rate) < 1e-12 else SniperConfig(**{**asdict(self.cfg), "fee_rate": fee})
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -138,11 +189,15 @@ class OracleSniperRunner:
             self.ledger.note_equity(total)
             self.ledger.roll_day_if_needed(total)
         views = self._build_views(now, elapsed)
-        if self._pos is not None and self._pos.window_ts == window_ts:
-            await self._manage_position(views, elapsed, now)
-        elif self._pos is not None:
-            self._begin_settlement()
-        elif self._entry_allowed(window_ts, now):
+        for sym in list(self._positions):
+            pos = self._positions.get(sym)
+            if pos is None:
+                continue
+            if pos.window_ts == window_ts:
+                await self._manage_position(sym, views, elapsed, now)
+            else:
+                self._begin_settlement(sym)
+        if self._entry_allowed(window_ts, now):
             await self._seek_entry(views, window_ts, elapsed, now)
 
     # ------------------------------------------------------------------ market views
@@ -196,12 +251,28 @@ class OracleSniperRunner:
         vals = [float(v) for ts_ms, v in (self.chainlink.ticks.get(sym) or ()) if start_ms <= ts_ms <= end_ms]
         return ((sum(vals) / len(vals)) if vals else None), max(0.0, elapsed - 240.0)
 
+    def _entry_feed_block_reason(self, sym: str, st: SymbolState, now: float) -> str:
+        if self.policy.require_rtds_connected and not bool(getattr(self.chainlink, "connected", True)):
+            return "RTDS_DISCONNECTED"
+        if self.policy.require_twap_fresh:
+            tw_fn = getattr(self.chainlink, "get_latest_twap", None)
+            if not callable(tw_fn):
+                return "NO_TWAP_FEED"
+            tw_px, _tw_age = tw_fn(sym, max_age_sec=self.policy.max_chainlink_age_sec)
+            if tw_px is None:
+                return "CHAINLINK_TWAP_STALE"
+        if self.policy.max_binance_age_sec is not None:
+            if st.binance_price is None or (now - st.binance_ts) > self.policy.max_binance_age_sec:
+                return "BINANCE_STALE"
+        return ""
+
     def _build_views(self, now: float, elapsed: float) -> dict[str, View]:
         views: dict[str, View] = {}
+        cl_lim = max(CHAINLINK_MAX_AGE_SEC, self.policy.max_chainlink_age_sec)
         for sym, st in self.hub.states.items():
-            cl_px, age = self.chainlink.get_latest_price(sym, max_age_sec=CHAINLINK_MAX_AGE_SEC)
+            cl_px, age = self.chainlink.get_latest_price(sym, max_age_sec=cl_lim)
             if cl_px is None:
-                self.diag[sym] = {"status": "CHAINLINK_STALE", "cl_age_sec": age}
+                self.diag[sym] = {"status": "CHAINLINK_STALE", "cl_age_sec": age, "entry_blocked": "CHAINLINK_STALE"}
                 continue
             lead = st.cex_lead_price(now)
             st.tracker.on_price(now, lead or cl_px)
@@ -210,18 +281,21 @@ class OracleSniperRunner:
             cvd, _obi, flow = st.tracker.get_orderflow_metrics(now)
             strike, src = self._strike(sym, st)
             if strike is None:
-                self.diag[sym] = {"status": "NO_STRIKE"}
+                self.diag[sym] = {"status": "NO_STRIKE", "entry_blocked": "NO_STRIKE"}
                 continue
-            if self.cfg.use_twap_projection:
+            c_sym = self._cfg_for(sym)
+            if c_sym.use_twap_projection:
                 a_mean, a_sec = self._realized_twap_240(sym, st.window_ts, elapsed)
-                fv = estimate_twap_fair_value(strike, cl_px, 300.0 - elapsed, vol, (a_mean, a_sec), (flow, gap, cvd), self.cfg)
+                fv = estimate_twap_fair_value(strike, cl_px, 300.0 - elapsed, vol, (a_mean, a_sec), (flow, gap, cvd), c_sym)
             else:
-                fv = estimate_fair_value(strike, cl_px, 300.0 - elapsed, vol, flow, gap, self.cfg.student_t_df, cvd)
+                fv = estimate_fair_value(strike, cl_px, 300.0 - elapsed, vol, flow, gap, c_sym.student_t_df, cvd)
             if fv is None:
                 continue
             book = self._book_for(st, now, elapsed)
             views[sym] = (fv, book)
-            self.diag[sym] = self._diag_row(fv, book, src, age, st)
+            row = self._diag_row(fv, book, src, age, st)
+            row["entry_blocked"] = self._entry_feed_block_reason(sym, st, now)
+            self.diag[sym] = row
         return views
 
     @staticmethod
@@ -257,43 +331,83 @@ class OracleSniperRunner:
         return self.ledger.performance_lines(total, cash, vault)
 
     # ------------------------------------------------------------------ entry
+    def _config_parity_ok(self) -> bool:
+        if not self.policy.frozen_config_path or not self.policy.frozen_model_name:
+            return True
+        ok, _diffs = check_frozen_config_parity(self.cfg, self.policy.frozen_config_path, self.policy.frozen_model_name)
+        return ok
+
     def _entry_allowed(self, window_ts: int, now: float) -> bool:
-        if window_ts in self._traded_windows or self.ledger.guard_reason() is not None:
+        if len(self._positions) >= self.policy.max_concurrent_positions:
             return False
-        if self.ledger.state.get("pending_entry"):
-            return False  # an unconfirmed order is still being reconciled
-        if self._attempts.get(window_ts, 0) >= MAX_ENTRY_ATTEMPTS_PER_WINDOW:
+        if self.policy.max_concurrent_positions == 1 and window_ts in self._traded_windows:
+            return False
+        if self.ledger.guard_reason() is not None or self.ledger.state.get("pending_entry"):
+            return False
+        if self.policy.max_concurrent_positions == 1 and self._win_attempts.get(window_ts, 0) >= MAX_ENTRY_ATTEMPTS_PER_WINDOW:
             return False
         if now - self._last_attempt_ts < ATTEMPT_SPACING_SEC or not self._wallet_fresh(now):
             return False
+        if not self._config_parity_ok():
+            self.ledger.bump_skip("FROZEN_CONFIG_DRIFT")
+            return False
         return bool((self.auto_trader.last_geoblock_status or {}).get("can_trade_api", False))
+
+    def _symbol_can_enter(self, sym: str, window_ts: int) -> bool:
+        if sym in self._positions or (sym, window_ts) in self._traded_coin_windows:
+            return False
+        if any(t.get("symbol") == sym for t in self.ledger.state.get("settling", [])):
+            return False
+        if self.ledger.symbol_paused(sym) or self._attempts.get((sym, window_ts), 0) >= MAX_ENTRY_ATTEMPTS_PER_WINDOW:
+            return False
+        blk = (self.diag.get(sym) or {}).get("entry_blocked")
+        if blk:
+            self.ledger.bump_skip(str(blk))
+            return False
+        return True
 
     async def _seek_entry(self, views: dict[str, View], window_ts: int, elapsed: float, now: float) -> None:
         cands: list[Candidate] = []
         for sym, (fv, book) in views.items():
-            if self.ledger.symbol_paused(sym):
+            if not self._symbol_can_enter(sym, window_ts):
                 continue
-            cand = evaluate_entry(sym, self.cfg, elapsed, fv, book)
+            cand = evaluate_entry(sym, self._cfg_for(sym), elapsed, fv, book)
             if cand is not None:
                 cands.append(cand)
-        best = pick_best_candidate(cands)
-        if best is not None:
-            await self._enter(best, window_ts, now, len(cands))
+        if not cands:
+            return
+        if self.policy.max_concurrent_positions == 1:
+            best = pick_best_candidate(cands)
+            if best is not None:
+                await self._enter(best, window_ts, now, len(cands))
+            return
+        remaining = self.policy.max_concurrent_positions - len(self._positions)
+        ranked = sorted(cands, key=lambda c: c.net_ev + (0.01 if c.symbol == "BTCUSDT" else 0.0), reverse=True)
+        for cand in ranked[:remaining]:
+            if self.ledger.guard_reason() is not None:
+                break
+            await self._enter(cand, window_ts, now, len(cands))
 
     def _plan_size(self, cand: Candidate, limit_px: float) -> tuple[float, str]:
         total, cash, vault = self._equity()
         tradable = max(0.0, total - vault)
-        shares = compute_shares(self.cfg, tradable, cand.total_cost_per_share)
-        if shares <= 0.0:
-            return 0.0, "BELOW_MIN_LOT"
+        if self.policy.pilot_fixed_shares is not None:
+            shares = float(self.policy.pilot_fixed_shares)
+            if tradable < shares * cand.total_cost_per_share + 0.05:
+                return 0.0, "BELOW_MIN_LOT"
+        else:
+            shares = compute_shares(self._cfg_for(cand.symbol), tradable, cand.total_cost_per_share)
+            if shares <= 0.0:
+                return 0.0, "BELOW_MIN_LOT"
         if (cash - vault) < shares * limit_px * 1.03 + 0.05:
             return 0.0, "INSUFFICIENT_CASH"
         return shares, ""
 
     async def _enter(self, cand: Candidate, window_ts: int, now: float, n_cands: int) -> None:
-        self._attempts[window_ts] = self._attempts.get(window_ts, 0) + 1
+        self._attempts[(cand.symbol, window_ts)] = self._attempts.get((cand.symbol, window_ts), 0) + 1
+        self._win_attempts[window_ts] = self._win_attempts.get(window_ts, 0) + 1
         self._last_attempt_ts = now
-        limit_px = entry_limit_price(self.cfg, cand.ask, cand.p_true)
+        limit_px = entry_limit_price(self._cfg_for(cand.symbol), cand.ask, cand.p_true)
         shares, why = self._plan_size(cand, limit_px)
         st = self.hub.states[cand.symbol]
         token = st.up_token if cand.side == "UP" else st.down_token
@@ -306,8 +420,15 @@ class OracleSniperRunner:
             "limit_px": limit_px, "est_cost_usd": round(shares * limit_px * 1.02, 4), "n_cands": n_cands,
             "cand": asdict(cand),
         }
-        self.ledger.set_pending_entry(intent)  # write-ahead: survives a crash between send and ledger write
+        self.ledger.set_pending_entry(intent)
+        t_send = time.monotonic()
         fill = await self.auto_trader.sniper_buy(token, shares, cand.ask, limit_px)
+        lat_ms = round((time.monotonic() - t_send) * 1000.0, 1)
+        self.ledger.record_attempt({
+            "ts": now, "window_ts": window_ts, "symbol": cand.symbol, "side": cand.side, "sim_ask": cand.ask,
+            "limit_px": limit_px, "filled": bool(fill.get("filled")), "actual_price": fill.get("avg_price"),
+            "status": fill.get("status"), "latency_ms": lat_ms,
+        })
         if fill.get("filled"):
             self._register_entry(cand, window_ts, now, n_cands, fill, token, limit_px)
             self.ledger.set_pending_entry(None)
@@ -320,7 +441,8 @@ class OracleSniperRunner:
             f"t={cand.elapsed_sec:.0f}s book_age={now - side_ts:.1f}s"
         )
         if fill.get("status") in UNCERTAIN_FILL_STATUSES:
-            self._traded_windows.add(window_ts)  # never risk a second buy in this window
+            self._traded_windows.add(window_ts)
+            self._traded_coin_windows.add((cand.symbol, window_ts))
             self._spawn(self._reconcile_pending(intent))
         else:
             self.ledger.set_pending_entry(None)
@@ -356,66 +478,71 @@ class OracleSniperRunner:
         self, cand: Candidate, window_ts: int, now: float, n_cands: int, fill: dict[str, Any], token: str, limit_px: float
     ) -> None:
         st = self.hub.states[cand.symbol]
+        fee_r = self._fee_for(cand.symbol)
         shares = float(fill["shares"])
         price = float(fill.get("avg_price") or cand.ask)
-        cost_ps = price + taker_fee_per_share(price, self.cfg.fee_rate)
-        cost_usd = round(float(fill.get("usd") or shares * price) + shares * taker_fee_per_share(price, self.cfg.fee_rate), 4)
-        self._pos = OpenPosition(cand.symbol, cand.side, window_ts, shares, price, cost_ps, cand.p_true, cand.z)
-        self._trade = {
+        cost_ps = price + taker_fee_per_share(price, fee_r)
+        cost_usd = round(float(fill.get("usd") or shares * price) + shares * taker_fee_per_share(price, fee_r), 4)
+        self._positions[cand.symbol] = OpenPosition(cand.symbol, cand.side, window_ts, shares, price, cost_ps, cand.p_true, cand.z)
+        trade = {
             "id": f"{window_ts}-{cand.symbol}-{int(now * 1000)}", "symbol": cand.symbol, "side": cand.side, "window_ts": window_ts,
             "slug": st.slug, "token_id": token, "condition_id": st.condition_id, "shares": shares,
-            "shares_open": shares, "entry_price": price, "cost_per_share": cost_ps, "cost_usd": cost_usd,
-            "entry_ts": now, "entry_elapsed": cand.elapsed_sec, "p_true": cand.p_true, "z": cand.z,
-            "net_ev": cand.net_ev, "candidates": n_cands, "limit_px": limit_px, "order_id": fill.get("order_id", ""),
-            "strike": st.price_to_beat, "partial_proceeds_usd": 0.0, "fill_status": fill.get("status"),
+            "shares_open": shares, "entry_price": price, "sim_ask": cand.ask, "cost_per_share": cost_ps,
+            "cost_usd": cost_usd, "fee_rate": fee_r, "entry_ts": now, "entry_elapsed": cand.elapsed_sec,
+            "p_true": cand.p_true, "z": cand.z, "net_ev": cand.net_ev, "candidates": n_cands, "limit_px": limit_px,
+            "order_id": fill.get("order_id", ""), "strike": st.price_to_beat, "partial_proceeds_usd": 0.0,
+            "fill_status": fill.get("status"),
         }
+        self._trades[cand.symbol] = trade
         self._traded_windows.add(window_ts)
-        self._exit_attempts = 0
-        self.ledger.open_trade(self._trade)
-        self._spawn(self._notify(entry_message(self._trade, self._perf_lines()), "SNIPER_ENTRY", cand.symbol))
+        self._traded_coin_windows.add((cand.symbol, window_ts))
+        self._exit_attempts[cand.symbol] = 0
+        self.ledger.open_trade(trade)
+        self._spawn(self._notify(entry_message(trade, self._perf_lines()), "SNIPER_ENTRY", cand.symbol))
         self._spawn(self.auto_trader.sync_live_wallet_balance())
 
     # ------------------------------------------------------------------ exit
-    async def _manage_position(self, views: dict[str, View], elapsed: float, now: float) -> None:
-        pos, trade = self._pos, self._trade
-        if pos is None or trade is None or pos.symbol not in views:
+    async def _manage_position(self, sym: str, views: dict[str, View], elapsed: float, now: float) -> None:
+        pos, trade = self._positions.get(sym), self._trades.get(sym)
+        if pos is None or trade is None or sym not in views:
             return
-        if now < self._next_exit_ts or self._exit_attempts >= MAX_EXIT_ATTEMPTS:
+        if now < self._next_exit_ts.get(sym, 0.0) or self._exit_attempts.get(sym, 0) >= MAX_EXIT_ATTEMPTS:
             return
-        fv, book = views[pos.symbol]
-        decision = evaluate_exit(self.cfg, pos, elapsed, fv, book)
+        fv, book = views[sym]
+        decision = evaluate_exit(self._cfg_for(sym), pos, elapsed, fv, book)
         if decision is None:
             return
-        self._exit_attempts += 1
-        self._next_exit_ts = now + EXIT_RETRY_SPACING_SEC
+        self._exit_attempts[sym] = self._exit_attempts.get(sym, 0) + 1
+        self._next_exit_ts[sym] = now + EXIT_RETRY_SPACING_SEC
         slip = 0.05 if decision.reason == "EMERGENCY_STOP_LOSS" else 0.03
         sell = await self.auto_trader.sniper_sell(trade["token_id"], pos.shares, max(0.01, round(decision.bid - slip, 2)))
         if sell.get("status") == "NO_BALANCE":
-            self._reconcile_gone_position(decision, now)
+            self._reconcile_gone_position(sym, decision, now)
             return
         if not sell.get("filled"):
             self.ledger.bump_skip("EXIT_NO_FILL")
             print(f"[Sniper] exit {decision.reason} not filled: {sell.get('status')} {sell.get('error')}")
             return
-        self._apply_sale(decision.reason, sell, now)
+        self._apply_sale(sym, decision.reason, sell, now)
 
-    def _reconcile_gone_position(self, decision: Any, now: float) -> None:
+    def _reconcile_gone_position(self, sym: str, decision: Any, now: float) -> None:
         """Verified zero balance while the ledger says we hold shares: an earlier sell must have filled."""
-        trade = self._trade
+        trade = self._trades.get(sym)
         if trade is None:
             return
         trade["reconciled_from_balance"] = True
-        self._apply_sale(decision.reason, {"shares": float(trade["shares_open"]), "avg_price": decision.bid}, now)
+        self._apply_sale(sym, decision.reason, {"shares": float(trade["shares_open"]), "avg_price": decision.bid}, now)
         self._spawn(self._notify(alert_message(
             [f"{trade['symbol']} 賣出回應遺失但餘額已為 0，已依 ${decision.bid:.2f} 對帳結案（以錢包為準，請核對）"],
             self._perf_lines()), "SNIPER_ALERT", "SYSTEM"))
 
-    def _apply_sale(self, reason: str, sell: dict[str, Any], now: float) -> None:
-        pos, trade = self._pos, self._trade
+    def _apply_sale(self, sym: str, reason: str, sell: dict[str, Any], now: float) -> None:
+        pos, trade = self._positions.get(sym), self._trades.get(sym)
         if pos is None or trade is None:
             return
         sold = float(sell["shares"])
-        net_ps = effective_exit_proceeds(float(sell["avg_price"]), self.cfg.fee_rate)
+        fee_r = float(trade.get("fee_rate", self._fee_for(sym)))
+        net_ps = effective_exit_proceeds(float(sell["avg_price"]), fee_r)
         trade["partial_proceeds_usd"] = round(float(trade["partial_proceeds_usd"]) + sold * net_ps, 4)
         trade["shares_open"] = round(max(0.0, float(trade["shares_open"]) - sold), 4)
         pos.shares = trade["shares_open"]
@@ -428,13 +555,14 @@ class OracleSniperRunner:
         self._finish_trade(trade, info)
 
     # ------------------------------------------------------------------ settlement
-    def _begin_settlement(self) -> None:
-        trade = self._trade
-        self._pos = None
-        self._trade = None
-        if trade is not None:
-            self.ledger.mark_settling(trade)
-            self._spawn(self._settle(trade))
+    def _begin_settlement(self, sym: Optional[str] = None) -> None:
+        targets = [sym] if sym is not None else list(self._positions.keys())
+        for target_sym in targets:
+            self._positions.pop(target_sym, None)
+            trade = self._trades.pop(target_sym, None)
+            if trade is not None:
+                self.ledger.mark_settling(trade)
+                self._spawn(self._settle(trade))
 
     def _chainlink_price_at(self, sym: str, ts: float) -> Optional[float]:
         buf = self.chainlink.ticks.get(sym) or []
@@ -489,9 +617,10 @@ class OracleSniperRunner:
 
     # ------------------------------------------------------------------ bookkeeping / notify
     def _finish_trade(self, trade: dict[str, Any], info: dict[str, Any]) -> None:
-        if self._trade is trade:
-            self._pos = None
-            self._trade = None
+        sym = str(trade.get("symbol") or "")
+        if self._trades.get(sym) is trade:
+            self._positions.pop(sym, None)
+            self._trades.pop(sym, None)
         alerts = self.ledger.close_trade(trade, info)
         closed = self.ledger.state["trades"][0]
         self._spawn(self._notify(exit_message(closed, self._perf_lines()), "SNIPER_EXIT", str(closed["symbol"])))
@@ -506,13 +635,19 @@ class OracleSniperRunner:
         })
 
     def _seed_traded_windows(self) -> None:
-        """A restart inside a window must not allow a second entry in that window."""
+        """A restart inside a window must not allow a second entry in that same coin+window."""
         st = self.ledger.state
         rows = list(st.get("trades", [])[:50]) + list(st.get("settling", []))
+        rows.extend((st.get("open_positions") or {}).values())
         for key in ("open_position", "pending_entry"):
             if st.get(key):
                 rows.append(st[key])
-        self._traded_windows.update(int(r["window_ts"]) for r in rows if r.get("window_ts"))
+        for r in rows:
+            if r.get("window_ts"):
+                w = int(r["window_ts"])
+                self._traded_windows.add(w)
+                if r.get("symbol"):
+                    self._traded_coin_windows.add((str(r["symbol"]), w))
 
     def _recover_open_position(self) -> None:
         pending_entry = self.ledger.state.get("pending_entry")
@@ -520,15 +655,20 @@ class OracleSniperRunner:
             self._spawn(self._reconcile_pending(dict(pending_entry)))
         for pending in list(self.ledger.state.get("settling", [])):
             self._spawn(self._settle(dict(pending)))
-        op = self.ledger.state.get("open_position")
-        if not op or self._pos is not None:
-            return
-        self._trade = dict(op)
-        self._pos = OpenPosition(
-            op["symbol"], op["side"], int(op["window_ts"]), float(op["shares_open"]), float(op["entry_price"]),
-            float(op["cost_per_share"]), float(op["p_true"]), float(op["z"]),
-        )
-        self._traded_windows.add(int(op["window_ts"]))
+        ops = dict(self.ledger.state.get("open_positions") or {})
+        if not ops and self.ledger.state.get("open_position"):
+            op0 = self.ledger.state["open_position"]
+            ops[str(op0["symbol"])] = op0
+        for sym, op in ops.items():
+            if sym in self._positions:
+                continue
+            self._trades[sym] = dict(op)
+            self._positions[sym] = OpenPosition(
+                op["symbol"], op["side"], int(op["window_ts"]), float(op["shares_open"]), float(op["entry_price"]),
+                float(op["cost_per_share"]), float(op["p_true"]), float(op["z"]),
+            )
+            self._traded_windows.add(int(op["window_ts"]))
+            self._traded_coin_windows.add((sym, int(op["window_ts"])))
 
     # ------------------------------------------------------------------ control / status
     def set_enabled(self, enabled: bool) -> None:
@@ -536,15 +676,14 @@ class OracleSniperRunner:
         self.ledger.set_enabled(enabled)
 
     def telegram_text(self) -> str:
-        """Compact Telegram status block (state, position, per-coin live model view, performance)."""
+        """Compact Telegram status block (state, positions, per-coin live model view, performance)."""
         guard = self.ledger.guard_reason()
         state = "🟢 運行中" if guard is None else f"⏸ 暫停（{guard}）"
-        pos = self._pos
-        if pos is not None:
-            pos_txt = f"{pos.symbol[:3]} {pos.side} {pos.shares:.2f}股 @ ${pos.entry_price:.3f}"
+        if self._positions:
+            pos_txt = "｜".join(f"{p.symbol[:3]} {p.side} {p.shares:.2f}股 @ ${p.entry_price:.3f}" for p in self._positions.values())
         else:
             pos_txt = "空倉（等待 150–255s 狙擊窗口）"
-        lines = [f"🎯 新策略｜Chainlink 狙擊·實盤｜{state}", f"• 持倉：{pos_txt}"]
+        lines = [f"🎯 新策略｜Chainlink TWAP V2｜{state}", f"• 持倉（{len(self._positions)}/{self.policy.max_concurrent_positions}）：{pos_txt}"]
         for sym in SYMBOLS:
             d = self.diag.get(sym, {})
             if d.get("status") == "OK":
@@ -565,6 +704,7 @@ class OracleSniperRunner:
         return {
             "enabled": self.ledger.enabled, "running": self.running,
             "guard_reason": self.ledger.guard_reason(),
+            "frozen_parity_ok": self._config_parity_ok(),
             "pending_entry": self.ledger.state.get("pending_entry"),
             "load_alert": self.ledger.state.get("load_alert"),
             "heartbeat_age_sec": round(now - self.heartbeat_ts, 1) if self.heartbeat_ts else None,
@@ -572,12 +712,14 @@ class OracleSniperRunner:
             "equity": {"total_u": round(total, 4), "cash_u": round(cash, 4), "vault_u": vault,
                        "initial_u": self.ledger.state.get("initial_equity_u")},
             "stats": self.ledger.stats(),
+            "daily_report": self.ledger.generate_daily_report(),
             "open_position": pos, "open_trade": self._trade,
+            "open_positions": {k: asdict(v) for k, v in self._positions.items()},
             "symbol_pause_until_ms": dict(self.ledger.state["pause"]["symbol_until_ms"]),
             "global_pause_until_ms": self.ledger.state["pause"]["global_until_ms"],
             "recent_trades": self.ledger.state["trades"][:10],
             "diag": self.diag, "feeds": self.hub.health(),
             "config": {k: v for k, v in asdict(self.cfg).items() if k in (
                 "min_z_score", "min_true_prob", "min_entry_price", "max_entry_price", "min_net_edge",
-                "entry_start_elapsed_sec", "entry_end_elapsed_sec", "min_shares", "risk_fraction")},
+                "entry_start_elapsed_sec", "entry_end_elapsed_sec", "min_shares", "risk_fraction", "use_twap_projection")},
         }

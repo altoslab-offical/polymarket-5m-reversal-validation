@@ -36,6 +36,7 @@ from engine.chainlink_oracle import ChainlinkRTDSFeed
 from engine.oracle_sniper import (
     DEFAULT_SNIPER_CONFIG,
     TWAP_V2_FILTERED_CONFIG,
+    TWAP_V2_HIGHBAND_SHADOW_CONFIG,
     TWAP_V2_PURE_CONFIG,
     FairValueEstimate,
     OpenPosition,
@@ -134,12 +135,14 @@ def write_frozen_config(
         "primary_eval_start_utc": "2026-11-21T00:00:00Z",
         "primary_eval_start_ts": NOV21_UTC_TS,
         "pre_registered_models": ["v2_pure", "v2_filtered", "v1"],
+        "shadow_models": ["v2_highband_shadow"],
         "bonferroni_alpha": round(0.05 / 3, 6),
         "bonferroni_ci_pct": 98.33,
         "effective_fees_post_nov20": {"BTCUSDT": 0.05, "ETHUSDT": 0.01, "SOLUSDT": 0.01},
         "sniper_config": cfg_dict,
         "sniper_config_v2_filtered": asdict(TWAP_V2_FILTERED_CONFIG),
         "sniper_config_v2_pure": asdict(TWAP_V2_PURE_CONFIG),
+        "shadow_config_v2_highband": {**asdict(TWAP_V2_HIGHBAND_SHADOW_CONFIG), "_meta": {"bonferroni_included": False, "role": "data_collection_only_not_for_launch"}},
         "execution_rules": {
             "fill_delay_sec_primary": 1, "fill_delay_sec_stress": 2,
             "require_top_ask_px_le_limit": True, "require_top_ask_sz_ge_shares": True,
@@ -730,6 +733,24 @@ def _summarize_model_trades(df_t: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
+def _append_shadow_section(lines: List[str], shadow: Dict[str, Any]) -> None:
+    lines += [
+        "",
+        "## Shadow Model (`v2_highband_shadow`: [0.84, 0.95] — Excluded from 3-Config Bonferroni Gate & Launch Decision)",
+        "",
+        "| Split | Signals | Filled +1s | Missed | Miss Rate | Filled WR | Missed Would-Win | Mean Spread t0 | Mean PnL +1s | 95% CI (Ref Only) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+    ]
+    sh = shadow.get("v2_highband_shadow") or {}
+    for split_lbl in ("post_nov21", "pre_nov21"):
+        st = sh.get(split_lbl) or {}
+        lines.append(
+            f"| `{split_lbl}` | {st.get('signals', 0)} | {st.get('filled_1s', 0)} | {st.get('missed_1s', 0)} | "
+            f"{st.get('miss_rate')} | {st.get('wr_1s')} | {st.get('missed_would_win_rate')} | "
+            f"{st.get('mean_spread_t0')} | {st.get('mean_pnl_1s')} | `{st.get('ci95_1s')}` |"
+        )
+
+
 def _write_daily_report_md(report: Dict[str, Any], out_dir: pathlib.Path) -> pathlib.Path:
     lines = [
         "# Section 4.2 Daily Monitoring Report (Read-Only, Pre-Registered 3 Configs, Bonferroni 98.3% CI)",
@@ -750,6 +771,7 @@ def _write_daily_report_md(report: Dict[str, Any], out_dir: pathlib.Path) -> pat
             f"{st.get('miss_rate')} | {st.get('wr_1s')} | {st.get('missed_would_win_rate')} | "
             f"{st.get('mean_pnl_1s')} | `{st.get('ci95_1s')}` | `{st.get('ci98_3_bonferroni_1s')}` | **{status}** |"
         )
+    _append_shadow_section(lines, report.get("shadow") or {})
     for sec_name in ("post_nov21", "pre_nov21"):
         sec_title = "Primary Per-Coin (`post_nov21`)" if sec_name == "post_nov21" else "Pre-Nov21 Baseline (`window_ts < 1795219200`)"
         lines += ["", f"## {sec_title}", "", "| Model | Coin | Signals | Filled +1s | Miss Rate | Mean Spread t0 | Filled WR | Missed Would-Win | Mean PnL +1s | 98.3% Bonferroni CI |", "|---|---|---:|---:|---:|---:|---:|---:|---:|---|"]
@@ -769,7 +791,7 @@ def analyze_recording(
     db_path: pathlib.Path = DEFAULT_DB, frozen_path: pathlib.Path = FROZEN_CFG_PATH,
     out_dir: pathlib.Path = ROOT, daily_report: bool = False,
 ) -> dict[str, Any]:
-    """Conservative (+1s / +2s) 3-config simulation split pre/post 2026-11-21T00:00Z with Bonferroni CIs."""
+    """Conservative (+1s / +2s) 3-config Bonferroni simulation + excluded shadow tracker."""
     frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
     fee_map = frozen.get("effective_fees_post_nov20", {"BTCUSDT": 0.05, "ETHUSDT": 0.01, "SOLUSDT": 0.01})
     con = sqlite3.connect(db_path)
@@ -794,18 +816,27 @@ def analyze_recording(
     for lbl, cfg in models.items():
         df_t = _sim_one_cfg(cfg, fee_map, settled_ts, snap_by_wt_sym, w_meta)
         df_t.to_csv(out_dir / f"phase42_trades_1s_{lbl}.csv", index=False)
-        pre_df = df_t[df_t["window_ts"] < NOV21_UTC_TS] if len(df_t) else df_t
-        post_df = df_t[df_t["window_ts"] >= NOV21_UTC_TS] if len(df_t) else df_t
-        pre_summaries[lbl] = _summarize_model_trades(pre_df)
-        post_summaries[lbl] = _summarize_model_trades(post_df)
+        pre_summaries[lbl] = _summarize_model_trades(df_t[df_t["window_ts"] < NOV21_UTC_TS] if len(df_t) else df_t)
+        post_summaries[lbl] = _summarize_model_trades(df_t[df_t["window_ts"] >= NOV21_UTC_TS] if len(df_t) else df_t)
         combined[lbl] = _summarize_model_trades(df_t)
+    raw_sh = {k: v for k, v in (frozen.get("shadow_config_v2_highband") or {}).items() if k != "_meta"}
+    sh_cfg = _cfg_from_dict(raw_sh) if raw_sh else TWAP_V2_HIGHBAND_SHADOW_CONFIG
+    df_sh = _sim_one_cfg(sh_cfg, fee_map, settled_ts, snap_by_wt_sym, w_meta)
+    df_sh.to_csv(out_dir / "phase42_trades_1s_v2_highband_shadow.csv", index=False)
+    shadow_out = {
+        "v2_highband_shadow": {
+            "bonferroni_included": False,
+            "post_nov21": _summarize_model_trades(df_sh[df_sh["window_ts"] >= NOV21_UTC_TS] if len(df_sh) else df_sh),
+            "pre_nov21": _summarize_model_trades(df_sh[df_sh["window_ts"] < NOV21_UTC_TS] if len(df_sh) else df_sh),
+        }
+    }
     v2_post = post_summaries["v2_filtered"]
     report: Dict[str, Any] = {
         "windows_recorded": int(len(df_w)), "windows_settled": int(len(settled)),
         "r1_twap_parity": None if np.isnan(r1_parity) else round(float(r1_parity), 4),
         "primary_eval_start_ts": NOV21_UTC_TS, "signals_total_post_nov21": v2_post["signals"],
         "filled_1s_post_nov21": v2_post["filled_1s"], "mean_pnl_per_share_1s_post_nov21": v2_post["mean_pnl_1s"],
-        "post_nov21": post_summaries, "pre_nov21": pre_summaries, "all_combined": combined,
+        "post_nov21": post_summaries, "pre_nov21": pre_summaries, "all_combined": combined, "shadow": shadow_out,
     }
     if daily_report:
         report["daily_report_path"] = str(_write_daily_report_md(report, out_dir))

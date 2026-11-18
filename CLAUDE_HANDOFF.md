@@ -114,3 +114,20 @@
 一旦 `post_nov21` 累積 **`>= 300` 筆** `+1s` 保守模擬單且滿足 **Bonferroni `98.3% CI 下界 > 0`（並滿足正幣數 ≥ 2、回撤 ≤ 40%、R1 parity ≥ 99%）**，實盤試跑將嚴格遵守已寫入 `frozen_config.json` 之紀律：
 1. **試跑規格**：固定最低 **`5 股/單`** 實盤連跑 **`100 單`**，核驗真實成交均價與紙上模擬差距 **`<= 1¢`**。
 2. **硬停機保護**：連輸 **`3` 單**或當日虧損 **`>= $10U`** 當日停機；最近 **`50` 單滾動勝率** 低於「損益兩平勝率 `+ 2 個百分點`」立即停機檢討。
+
+---
+
+## 六、Round-4 同步更新：影子設定 (`v2_highband_shadow`) 與第 3 節正式環境機制
+
+> 回覆規劃者《對第三輪（`14f4ad2` / `3d6da5e`）的回覆》全部要求：
+
+1. **同意關於 L2 嚴格因果表的核心結論**：`prices-history` 的 `0.753` 觸發價與 `0.928` `[τ+1, τ+5]` 成交價來自過期抽樣，只用來確認「模型在高價區間具備方向區分力」，絕不當作 `[0.68, 0.82]` 凍結策略的優勢證明。實盤仍維持**完全關閉 (`enabled=False`, `sniper_live=False`, port `8088` 空閒)**，靜待 `11/21 00:00 UTC` 後 `n >= 300` 與 **Bonferroni `98.3% CI > 0`** 一次判定。
+2. **新增 `v2_highband_shadow` 影子設定（完全隔離於 3 組 Bonferroni 主判定）**：
+   - 於 `engine/oracle_sniper.py` (`TWAP_V2_HIGHBAND_SHADOW_CONFIG`)、`edge_validation/frozen_config.json` (`shadow_config_v2_highband`, `bonferroni_included: false`) 及 `edge_validation/live_recorder_42.py` 新增追蹤 **`[0.84, 0.95]`**（參數同 `v2_pure`），逐單記錄於 `phase42_trades_1s_v2_highband_shadow.csv` 並在 `phase42_daily_report.md` **獨立列表**，絕不列入主判定或上線依據。
+   - 先行在 `live_btc_5m.db`（`1,013` BTC 窗，參考用 `fee=0.05`）檢驗：`+1s` Full `n=350` (`99.5/天 BTC`)、WR `90.0%`、`+0.02521/股` (`CI [-0.0047, +0.0506]`)；跨 `0` 正驗證了「只收資料、不能直接上線」的規劃原則，待 `11/21` 累積 `ETH/SOL` (`fee=0.01`) 真實盤口數據再另案評估。
+3. **第 3 節正式環境必備機制已預先完成實作與測試（`verify_section3_guards.py` PASS + `audit-code 100/100`）**：
+   - **最大 3 單同時在倉（每幣最多 1 單）**：`OracleSniperRunner` 支援 `max_concurrent_positions=3`（`BTC/ETH/SOL` 各至多 1 單）＋ 分幣費率 `{BTC:0.05, ETH:0.01, SOL:0.01}`。
+   - **硬體／資料鮮度阻擋**：下單前檢查 `Chainlink TWAP <= 3.0s`、`Binance <= 2.0s`、`RTDS WebSocket connected`，任一不符立即拒單 (`RTDS_DISCONNECTED / CHAINLINK_TWAP_STALE / BINANCE_STALE`)。
+   - **完整停機規則 (`SniperLedger`)**：`CONSEC_LOSS_3_HALT`（UTC 連輸 3 單當日停止）、`DAILY_LOSS_LIMIT`（UTC 日虧 `>= $10U` 當日停止）、`ROLLING_50_BE_HALT`（近 50 單勝率 < `平均成本損益兩平 + 2pp` 全面永久停機 `enabled=False`）。
+   - **參數防漂移 & 日報**：下單前核對 `frozen_config.json` 零漂移 (`FROZEN_CONFIG_DRIFT`)，並內建 `generate_daily_report()` 輸出 `n`、`PnL`、與 `4.2` 差距、`miss_rate`、vs 模擬滑價（試跑 `5股×100單 <= 1¢`）與成交延遲中位數。
+

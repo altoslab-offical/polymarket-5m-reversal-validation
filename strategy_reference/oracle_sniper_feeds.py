@@ -119,6 +119,9 @@ class SymbolState:
     micro: Bn1sMicroTracker = field(default_factory=Bn1sMicroTracker)
     binance_price: Optional[float] = None
     binance_ts: float = 0.0
+    bn_recv_mono_ms: float = 0.0
+    bn_recv_wall_ms: float = 0.0
+    bn_source_ts_ms: int = 0
     bn_last_close: Optional[float] = None
     bn_cur_sec: int = 0
     bn_cur_buy_usd: float = 0.0
@@ -142,11 +145,35 @@ class SymbolState:
     down_asks_raw: dict[float, float] = field(default_factory=dict)
     up_book_ts: float = 0.0
     down_book_ts: float = 0.0
+    up_recv_mono_ms: float = 0.0
+    up_recv_wall_ms: float = 0.0
+    up_source_ts_ms: int = 0
+    dn_recv_mono_ms: float = 0.0
+    dn_recv_wall_ms: float = 0.0
+    dn_source_ts_ms: int = 0
     last_ws_book_local_ts: float = 0.0
     up_local_ts: float = 0.0
     down_local_ts: float = 0.0
     meta_checked_ts: float = 0.0
     prefetch_ts: float = 0.0
+
+    def record_bn_recv(self, mono_ms: float, wall_ms: float, source_ts_ms: int = 0) -> None:
+        """Record monotonic receive timestamp and optional source timestamp for Binance."""
+        self.bn_recv_mono_ms = mono_ms
+        self.bn_recv_wall_ms = wall_ms
+        if source_ts_ms > 0:
+            self.bn_source_ts_ms = int(source_ts_ms)
+
+    def record_book_recv(self, side: str, mono_ms: float, wall_ms: float, source_ts_ms: int = 0) -> None:
+        """Record monotonic receive timestamp and optional CLOB source timestamp for a book side."""
+        if side == "UP":
+            self.up_recv_mono_ms, self.up_recv_wall_ms = mono_ms, wall_ms
+            if source_ts_ms > 0:
+                self.up_source_ts_ms = int(source_ts_ms)
+        else:
+            self.dn_recv_mono_ms, self.dn_recv_wall_ms = mono_ms, wall_ms
+            if source_ts_ms > 0:
+                self.dn_source_ts_ms = int(source_ts_ms)
 
     def ingest_binance_trade(self, now: float, price: float, qty: float, is_buyer_maker: bool) -> None:
         """Record Binance aggTrade exclusively (1s close + taker USD volume) for parity with Recorder."""
@@ -223,6 +250,12 @@ class SymbolState:
         self.down_asks_raw.clear()
         self.up_book_ts = 0.0
         self.down_book_ts = 0.0
+        self.up_recv_mono_ms = 0.0
+        self.up_recv_wall_ms = 0.0
+        self.up_source_ts_ms = 0
+        self.dn_recv_mono_ms = 0.0
+        self.dn_recv_wall_ms = 0.0
+        self.dn_source_ts_ms = 0
         self.last_ws_book_local_ts = 0.0
         self.up_local_ts = 0.0
         self.down_local_ts = 0.0
@@ -250,11 +283,16 @@ class SniperMarketHub:
     """Owns the WebSocket / REST feeds and per-symbol state for the sniper."""
 
     def __init__(
-        self, auto_trader: Any, cfg: SniperConfig = DEFAULT_SNIPER_CONFIG, clock: Callable[[], float] = time.time
+        self,
+        auto_trader: Any,
+        cfg: SniperConfig = DEFAULT_SNIPER_CONFIG,
+        clock: Callable[[], float] = time.time,
+        mono_clock_ms: Optional[Callable[[], float]] = None,
     ) -> None:
         self.auto_trader = auto_trader
         self.cfg = cfg
         self._clock = clock
+        self._custom_mono_ms = mono_clock_ms
         self.states: dict[str, SymbolState] = {
             s: SymbolState(
                 s,
@@ -269,6 +307,12 @@ class SniperMarketHub:
         self._tasks: list[asyncio.Task[None]] = []
         self._meta_tasks: set[asyncio.Task[None]] = set()
         self._session: Optional[aiohttp.ClientSession] = None
+
+    def mono_ms(self) -> float:
+        """Current monotonic clock in milliseconds (lockstep with injected test clock if custom)."""
+        if self._custom_mono_ms is not None:
+            return float(self._custom_mono_ms())
+        return (time.monotonic_ns() / 1_000_000.0) if self._clock is time.time else (self._clock() * 1000.0)
 
     # ----- lifecycle -----
     def start(self) -> None:
@@ -364,10 +408,14 @@ class SniperMarketHub:
         if st is None:
             return
         now = self._clock()
+        m_ms, w_ms = self.mono_ms(), now * 1000.0
+        src_ms = int(data.get("E") or data.get("T") or 0)
         if "aggTrade" in stream:
+            st.record_bn_recv(m_ms, w_ms, src_ms)
             st.ingest_binance_trade(now, float(data["p"]), float(data["q"]), bool(data["m"]))
         elif "bookTicker" in stream:
             # Refresh freshness timestamp only; never mix bookTicker mid/OBI into Binance-1s model vol or flow.
+            st.record_bn_recv(m_ms, w_ms, src_ms)
             bid, ask = float(data["b"]), float(data["a"])
             st.binance_price, st.binance_ts = 0.5 * (bid + ask), now
 
@@ -421,6 +469,9 @@ class SniperMarketHub:
 
     def _set_side_book(self, st: SymbolState, side: str, bid: Optional[float], ask: Optional[float], ev_ts: float, via_ws: bool) -> None:
         local = self._clock()
+        m_ms, w_ms = self.mono_ms(), local * 1000.0
+        src_ms = int(round(ev_ts * 1000.0)) if ev_ts > 0.0 else 0
+        st.record_book_recv(side, m_ms, w_ms, src_ms)
         if side == "UP":
             st.book.up_bid, st.book.up_ask = bid, ask
             st.up_book_ts, st.up_local_ts = max(st.up_book_ts, ev_ts), local
@@ -593,8 +644,10 @@ class SniperMarketHub:
             for row in rows:
                 st = self.states.get(str(row.get("symbol")))
                 if st is not None:
+                    now_r = self._clock()
                     st.binance_price = 0.5 * (float(row["bidPrice"]) + float(row["askPrice"]))
-                    st.binance_ts = self._clock()
+                    st.binance_ts = now_r
+                    st.record_bn_recv(self.mono_ms(), now_r * 1000.0, 0)
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError):
             return
 

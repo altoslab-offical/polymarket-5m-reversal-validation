@@ -14,9 +14,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pandas as pd
 
-from edge_validation.live_recorder_42 import _sim_one_cfg, init_db
+from edge_validation.live_recorder_42 import _aggregate_shadow_parity, _sim_one_cfg, analyze_recording, init_db
 from edge_validation.parity_replay import run_parity_replay
+from engine.chainlink_oracle import ChainlinkRTDSFeed
 from engine.oracle_sniper import TWAP_V2_FILTERED_CONFIG, OrderBookTop, taker_fee_per_share
+from engine.oracle_sniper_feeds import SniperMarketHub
 from engine.oracle_sniper_ledger import PAPER_40U_RISK_POLICY, PRODUCTION_RISK_POLICY, SniperLedger
 from engine.oracle_sniper_runner import PAPER_40U_EXEC_POLICY, PRODUCTION_EXEC_POLICY, OracleSniperRunner
 from engine.signal_core import (
@@ -62,11 +64,13 @@ def check_1_determinism_and_coinbase_isolation(tmp: Path) -> int:
 
 
 def check_2_historical_parity_replay(_tmp: Path) -> int:
-    """Run Path A vs Path B 1Hz parity replay over recorded DB and assert >= 99% match."""
+    """Run Path A vs Path B full per-second + ENTER parity replay and assert >=99.5% / >=99%."""
     res = run_parity_replay()
+    assert res["per_second_total"] > 0 and res["per_second_parity_rate"] >= 0.995, res
+    assert len(res.get("by_decision_group") or {}) >= 2, res
     assert res["coin_window_union_signals"] > 0, res
-    assert res["coin_window_parity_rate"] >= 0.99, res
-    assert res["single_slot_parity_rate"] >= 0.99, res
+    assert res["coin_window_parity_rate"] >= 0.99 and res["single_slot_parity_rate"] >= 0.99, res
+    assert res["enter_parity_gate_pass"] is True and "enter_sample_gate" in res, res
     return 1
 
 
@@ -80,6 +84,7 @@ def _cold_runner(tmp: Path, tag: str, cache_path: Path | None) -> tuple[OracleSn
         PAPER_40U_EXEC_POLICY,
         frozen_config_path=Path(__file__).resolve().parent / "edge_validation" / "frozen_config.json",
         vol_cache_path=cache_path,
+        live_shadow_log_path=None,
     )
     led = SniperLedger(tmp / f"{tag}.json", policy=PAPER_40U_RISK_POLICY)
     runner = OracleSniperRunner(at, cl, MagicMock(), cfg=TWAP_V2_FILTERED_CONFIG, ledger=led, policy=pol)
@@ -171,7 +176,12 @@ def check_5_freshness_codes_and_db_schema(tmp: Path) -> int:
 
     con = init_db(tmp / "schema42.db")
     cols = {r[1] for r in con.execute("PRAGMA table_info(snapshots_1hz)").fetchall()}
-    assert {"cl_twap_age_sec", "cl_spot_age_sec", "bn_age_sec", "up_book_age_sec", "down_book_age_sec"}.issubset(cols)
+    expected_cols = {
+        "cl_twap_age_sec", "cl_spot_age_sec", "bn_age_sec", "up_book_age_sec", "down_book_age_sec",
+        "cl_twap_age_ms", "cl_spot_age_ms", "bn_age_ms", "up_book_age_ms", "down_book_age_ms",
+        "cl_twap_lag_ms", "cl_spot_lag_ms", "bn_lag_ms", "up_book_lag_ms", "down_book_lag_ms",
+    }
+    assert expected_cols.issubset(cols), expected_cols - cols
     con.execute(
         "INSERT INTO signal_enters_42 (ts_sec, window_ts, symbol, model_name, side, z, p_model, sigma, ask_top, cl_twap_age_sec, cl_spot_age_sec, bn_age_sec, book_age_sec) VALUES (1,0,'BTCUSDT','v2_filtered','UP',1.8,0.92,5e-5,0.74,0.3,0.3,0.1,0.2)"
     )
@@ -221,7 +231,7 @@ def check_6_dual_track_stop_loss_and_frozen_param(_tmp: Path) -> int:
         w_meta[(wt, "BTCUSDT")] = meta
     df_s = pd.DataFrame(all_rows)
     snap_by_wt_sym = {(int(k[0]), str(k[1])): g for k, g in df_s.groupby(["window_ts", "symbol"])}
-    df_t, _, _ = _sim_one_cfg(TWAP_V2_FILTERED_CONFIG, {"BTCUSDT": 0.05}, settled, snap_by_wt_sym, w_meta)
+    df_t, _, _, _ = _sim_one_cfg(TWAP_V2_FILTERED_CONFIG, {"BTCUSDT": 0.05}, settled, snap_by_wt_sym, w_meta)
     assert len(df_t) == 1, df_t
     tr = df_t.iloc[0]
     assert bool(tr["sl_triggered"]) and bool(tr["sl_was_wrong"])
@@ -241,7 +251,7 @@ def check_7_single_slot_aligned(tmp: Path) -> int:
         r, at, _cl, w = _make_strict_runner(tmp, f"slot_{label}", cash=100.0)
         r.policy = replace(
             pol_base, frozen_config_path=r.policy.frozen_config_path, vol_cache_path=None,
-            paper_fill_delay_sec=0.0, clock=lambda w=w: float(w + 200),
+            paper_fill_delay_sec=0.0, clock=lambda w=w: float(w + 200), live_shadow_log_path=None,
         )
         r.ledger = SniperLedger(tmp / f"led_{label}.json", policy=risk_pol)
         asyncio.run(r._tick(float(w + 200)))
@@ -250,8 +260,108 @@ def check_7_single_slot_aligned(tmp: Path) -> int:
     return 1
 
 
+def _make_mono_runner(tmp: Path, tag: str, shadow_p: Path | None = None) -> tuple[OracleSniperRunner, ChainlinkRTDSFeed, SniperMarketHub, list[float], list[float], int]:
+    wall_ref, mono_ref = [1795020200.0], [50_000.0]
+    w = 1795020000
+    at = MagicMock()
+    at.last_geoblock_status = {"can_trade_api": True}
+    cl = ChainlinkRTDSFeed(clock=lambda: wall_ref[0], mono_clock_ms=lambda: mono_ref[0])
+    cl.connected = True
+    hub = SniperMarketHub(at, TWAP_V2_FILTERED_CONFIG, clock=lambda: wall_ref[0], mono_clock_ms=lambda: mono_ref[0])
+    pol = replace(
+        PAPER_40U_EXEC_POLICY,
+        frozen_config_path=Path(__file__).resolve().parent / "edge_validation" / "frozen_config.json",
+        vol_cache_path=None, clock=lambda: wall_ref[0], mono_clock_ms=lambda: mono_ref[0], live_shadow_log_path=shadow_p,
+    )
+    runner = OracleSniperRunner(at, cl, MagicMock(), cfg=TWAP_V2_FILTERED_CONFIG, ledger=SniperLedger(tmp / f"{tag}.json", policy=PAPER_40U_RISK_POLICY), hub=hub, policy=pol)
+    st = hub.states["BTCUSDT"]
+    st.reset_for_window(w)
+    st.up_token, st.down_token, st.price_to_beat = "BTC-up", "BTC-dn", 100.0
+    st.meta_checked_ts = st.prefetch_ts = 1e12
+    for i in range(1800):
+        ts_i = int(wall_ref[0]) - 1800 + i
+        st.micro.ingest_bn_1s(ts_i, 100.0 + 0.048 * ((i + 1) / 1800.0), 0.0, 0.0, real_trade=True)
+    return runner, cl, hub, wall_ref, mono_ref, w
+
+
+def _pulse_all_feeds(cl: ChainlinkRTDSFeed, hub: SniperMarketHub, wall_ref: list[float], mono_ref: list[float], pause: str = "") -> None:
+    src_ms = int((wall_ref[0] - 0.25) * 1000.0)
+    if pause != "cl_spot":
+        cl.ingest_tick("btc/usd", 100.048, src_ms, recv_mono_ms=mono_ref[0], recv_wall_ms=wall_ref[0] * 1000.0)
+    if pause != "cl_twap":
+        cl.ingest_twap_tick("btc/usd", 100.048, src_ms, recv_mono_ms=mono_ref[0], recv_wall_ms=wall_ref[0] * 1000.0)
+    if pause != "bn":
+        hub._on_binance_message({"stream": "btcusdt@aggTrade", "data": {"p": "100.048", "q": "0.1", "m": False, "E": src_ms}})
+    if pause != "book":
+        hub.apply_book("BTCUSDT", "UP", {"asset_id": "BTC-up", "timestamp": src_ms, "bids": [{"price": "0.72", "size": "100"}], "asks": [{"price": "0.74", "size": "100"}]}, via_ws=True)
+
+
+def check_8_monotonic_ms_age_lag_and_4s_pause(tmp: Path) -> int:
+    """Pause each feed 4s under monotonic_ns tracking -> exact STALE_*; verify lag_ms & wall-jump invariance."""
+    expected_map = {"cl_twap": "STALE_CL_TWAP", "cl_spot": "STALE_CL_SPOT", "bn": "STALE_BN", "book": "STALE_BOOK"}
+    for idx, paused_feed in enumerate(expected_map):
+        runner, cl, hub, wall_r, mono_r, w = _make_mono_runner(tmp, f"pause_{idx}")
+        _pulse_all_feeds(cl, hub, wall_r, mono_r, pause="")
+        _, d0 = runner.evaluate_second(wall_r[0], w)
+        assert d0["BTCUSDT"].action == "ENTER", d0["BTCUSDT"]
+        # Advance 4.0s and refresh every OTHER feed while pausing only `paused_feed`
+        wall_r[0] += 4.0
+        mono_r[0] += 4000.0
+        _pulse_all_feeds(cl, hub, wall_r, mono_r, pause=paused_feed)
+        _, d1 = runner.evaluate_second(wall_r[0], w)
+        assert d1["BTCUSDT"].action == "SKIP" and d1["BTCUSDT"].reason == expected_map[paused_feed], (paused_feed, d1["BTCUSDT"])
+
+    # Wall clock NTP +4s jump must NOT break monotonic freshness while preserving exact upstream lag_ms
+    runner, cl, hub, wall_r, mono_r, w = _make_mono_runner(tmp, "wall_jump")
+    _pulse_all_feeds(cl, hub, wall_r, mono_r, pause="")
+    wall_r[0] += 4.0
+    mono_r[0] += 300.0
+    _, d_j = runner.evaluate_second(wall_r[0], w)
+    assert d_j["BTCUSDT"].action == "ENTER", d_j["BTCUSDT"]
+    assert abs(runner.diag["BTCUSDT"]["ages_ms"]["cl_spot"] - 300.0) < 1e-3
+    assert abs(runner.diag["BTCUSDT"]["lags_ms"]["cl_spot_ms"] - 250.0) < 1e-3
+    return 1
+
+
+def check_9_live_shadow_parity_and_reports(tmp: Path) -> int:
+    """Verify Runner JSONL shadow emission, daily shadow parity calculation, R1 mismatch & WARMUP report."""
+    sh_p = tmp / "shadow.jsonl"
+    runner, cl, hub, wall_r, mono_r, w = _make_mono_runner(tmp, "shadow", shadow_p=sh_p)
+    _pulse_all_feeds(cl, hub, wall_r, mono_r, pause="")
+    _, decs_sh = runner.evaluate_second(wall_r[0], w)
+    z_sh = float(decs_sh["BTCUSDT"].z or 0.0)
+    assert sh_p.exists() and '"type": "ENTER"' in sh_p.read_text(encoding="utf-8")
+
+    # Verify aggregate parity matcher on matching vs mismatched shadow days
+    good = _aggregate_shadow_parity([(w, "BTCUSDT")], {(w, "BTCUSDT"): ("UP", int(wall_r[0]), 2.0, 0.74)}, {(w, "BTCUSDT"): ("UP", int(wall_r[0]) + 1, 2.01, 0.74)})
+    bad = _aggregate_shadow_parity([(w, "BTCUSDT")], {(w, "BTCUSDT"): ("UP", int(wall_r[0]), 2.0, 0.74)}, {(w, "BTCUSDT"): ("DOWN", int(wall_r[0]), 2.0, 0.74)})
+    assert good["parity_rate"] == 1.0 and good["gate_pass"] is True
+    assert bad["parity_rate"] == 0.0 and bad["gate_pass"] is False
+
+    # End-to-end analyze_recording check on synthetic DB + frozen.json + shadow JSONL
+    db_p = tmp / "shadow42.db"
+    con = init_db(db_p)
+    con.execute("INSERT INTO windows_42 (window_ts,symbol,slug,twap_strike,twap_close,resolved_outcome) VALUES (?,?,?,?,?,?)", (w, "BTCUSDT", f"btc-updown-5m-{w}", 100.0, 100.05, "DOWN"))
+    con.execute("INSERT INTO signal_enters_42 (ts_sec,window_ts,symbol,model_name,side,z,p_model,sigma,ask_top) VALUES (?,?,?,?,?,?,?,?,?)", (int(wall_r[0]), w, "BTCUSDT", "v2_filtered", "UP", z_sh, 0.95, 5e-5, 0.74))
+    for sec in range(150, 220):
+        con.execute("INSERT INTO snapshots_1hz (ts_sec,window_ts,symbol,elapsed_sec,cl_spot,cl_twap60,bn_close,bn_trades,cl_twap_age_sec,cl_spot_age_sec,bn_age_sec,up_book_age_sec,down_book_age_sec,cl_twap_age_ms,cl_spot_age_ms,bn_age_ms,up_book_age_ms,down_book_age_ms,cl_spot_lag_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (w + sec, w, "BTCUSDT", sec, 100.04, 100.04, 100.04, 1, 0.4, 0.4, 0.2, 0.1, 0.1, 400.0, 400.0, 200.0, 100.0, 100.0, 250.0))
+    con.commit()
+    con.close()
+    fr_p = tmp / "frozen.json"
+    fr_data = json.loads((Path(__file__).resolve().parent / "edge_validation" / "frozen_config.json").read_text(encoding="utf-8"))
+    fr_data["count_start_window_ts"] = w
+    fr_p.write_text(json.dumps(fr_data), encoding="utf-8")
+    rep = analyze_recording(db_path=db_p, frozen_path=fr_p, out_dir=tmp, daily_report=True, shadow_log_path=sh_p)
+    assert rep["live_shadow_parity"]["matched"] == 1 and rep["live_shadow_parity"]["parity_rate"] == 1.0
+    assert len(rep["r1_diagnostics"]["mismatches"]) == 1
+    assert abs(rep["freshness_ms"]["age_ms"]["cl_spot"]["p50"] - 400.0) < 1e-3
+    md = (tmp / "phase42_daily_report.md").read_text(encoding="utf-8")
+    assert "P99 (ms)" in md and "Live Shadow Parity" in md and "R1 TWAP Parity Mismatches" in md
+    return 1
+
+
 def main() -> None:
-    """Execute all 7 verification checks against isolated temporary state."""
+    """Execute all 9 verification checks against isolated temporary state."""
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         tests = (
@@ -262,6 +372,8 @@ def main() -> None:
             check_5_freshness_codes_and_db_schema,
             check_6_dual_track_stop_loss_and_frozen_param,
             check_7_single_slot_aligned,
+            check_8_monotonic_ms_age_lag_and_4s_pause,
+            check_9_live_shadow_parity_and_reports,
         )
         passed = sum(fn(tmp) for fn in tests)
     print(json.dumps({"status": "SIGNAL_CORE_AND_PARITY_PASSED", "groups_passed": passed}))

@@ -41,13 +41,23 @@ class EnterPoint:
 
 
 def same_signal(a: Optional[EnterPoint], b: Optional[EnterPoint]) -> bool:
-    """Acceptance predicate from spec: same side, |dt| <= 1s, |dz| <= 0.02."""
+    """Acceptance predicate from spec: same side, |dt| <= 1s, |dz| <= 0.02, |dask| <= 0.001."""
     if a is None and b is None:
         return True
     if (a is None) != (b is None):
         return False
     assert a is not None and b is not None
-    return a.side == b.side and abs(a.ts - b.ts) <= 1 and abs(a.z - b.z) <= 0.02
+    return a.side == b.side and abs(a.ts - b.ts) <= 1 and abs(a.z - b.z) <= 0.02 and abs(a.ask_top - b.ask_top) <= 0.001
+
+
+def _row_age_ms(row: Any, ms_col: str, sec_col: str) -> Optional[float]:
+    ms_v = getattr(row, ms_col, None)
+    if ms_v is not None and pd.notna(ms_v):
+        return float(ms_v)
+    sec_v = getattr(row, sec_col, None)
+    if sec_v is not None and pd.notna(sec_v):
+        return float(sec_v) * 1000.0
+    return None
 
 
 def _make_replay_runner(tmp_dir: pathlib.Path, clock_ref: List[float]) -> Tuple[ChainlinkRTDSFeed, SniperMarketHub, OracleSniperRunner]:
@@ -72,19 +82,26 @@ def _feed_ws_row(
     st.slug = f"{sym[:3].lower()}-updown-5m-{w}"
     st.price_to_beat = None
     st.meta_checked_ts = st.prefetch_ts = 1e12
-    elapsed = t_sec - w
-    if elapsed > 8 and cl.get_settlement_twap_at(sym, w) is None and wm is not None and pd.notna(wm.twap_strike):
+    if (t_sec - w) > 8 and cl.get_settlement_twap_at(sym, w) is None and wm is not None and pd.notna(wm.twap_strike):
         cl.twap_bucket_opens[sym][w] = (float(wm.twap_strike), w * 1000)
-    sp_age_col = getattr(row, "cl_spot_age_sec", None)
-    tw_age_col = getattr(row, "cl_twap_age_sec", None)
-    has_ages = sp_age_col is not None and pd.notna(sp_age_col) and tw_age_col is not None and pd.notna(tw_age_col)
+    sp_ms_age = _row_age_ms(row, "cl_spot_age_ms", "cl_spot_age_sec")
+    tw_ms_age = _row_age_ms(row, "cl_twap_age_ms", "cl_twap_age_sec")
+    has_ages = sp_ms_age is not None and tw_ms_age is not None
     raw_s = {"BTCUSDT": "btc/usd", "ETHUSDT": "eth/usd", "SOLUSDT": "sol/usd"}[sym]
     if pd.notna(row.cl_spot):
-        sp_ms = int((float(t_sec) - float(sp_age_col)) * 1000.0) if has_ages else t_sec * 1000
-        cl.ingest_tick(raw_s, float(row.cl_spot), sp_ms)
+        sp_m = float(t_sec) * 1000.0 - float(sp_ms_age or 0.0)
+        sp_lag_col = getattr(row, "cl_spot_lag_ms", None)
+        sp_src = sp_m - (float(sp_lag_col) if (sp_lag_col is not None and pd.notna(sp_lag_col)) else 0.0)
+        cl.ingest_tick(raw_s, float(row.cl_spot), int(round(sp_src)) if has_ages else t_sec * 1000, recv_mono_ms=sp_m, recv_wall_ms=float(t_sec) * 1000.0)
+        if has_ages:
+            cl._spot_mono_ms[sym] = sp_m
     if pd.notna(row.cl_twap60):
-        tw_ms = int((float(t_sec) - float(tw_age_col)) * 1000.0) if has_ages else t_sec * 1000
-        cl.ingest_twap_tick(raw_s, float(row.cl_twap60), tw_ms)
+        tw_m = float(t_sec) * 1000.0 - float(tw_ms_age or 0.0)
+        tw_lag_col = getattr(row, "cl_twap_lag_ms", None)
+        tw_src = tw_m - (float(tw_lag_col) if (tw_lag_col is not None and pd.notna(tw_lag_col)) else 0.0)
+        cl.ingest_twap_tick(raw_s, float(row.cl_twap60), int(round(tw_src)) if has_ages else t_sec * 1000, recv_mono_ms=tw_m, recv_wall_ms=float(t_sec) * 1000.0)
+        if has_ages:
+            cl._twap_mono_ms[sym] = tw_m
     _feed_bn_and_book(row, sym, t_sec, has_ages, hub, prev_bn)
 
 
@@ -107,20 +124,31 @@ def _feed_bn_and_book(
             hub._on_binance_message({"stream": f"{sym.lower()}@aggTrade", "data": {"p": px, "q": str(s_vol), "m": True}})
         if b_vol <= 0.0 and s_vol <= 0.0:
             hub._on_binance_message({"stream": f"{sym.lower()}@aggTrade", "data": {"p": px, "q": "0", "m": False}})
-    if has_ages and pd.notna(row.bn_age_sec) and st.binance_price is not None:
-        st.binance_ts = float(t_sec) - float(row.bn_age_sec)
+    bn_ms_age = _row_age_ms(row, "bn_age_ms", "bn_age_sec")
+    if has_ages and bn_ms_age is not None and st.binance_price is not None:
+        st.binance_ts = float(t_sec) - bn_ms_age / 1000.0
+        st.bn_recv_mono_ms = float(t_sec) * 1000.0 - bn_ms_age
+    _apply_side_books(row, sym, t_sec, has_ages, hub)
+
+
+def _apply_side_books(row: Any, sym: str, t_sec: int, has_ages: bool, hub: SniperMarketHub) -> None:
+    st = hub.states[sym]
     up_b = _parse_levels_json(getattr(row, "up_bids_json", None), True)
     up_a = _parse_levels_json(getattr(row, "up_asks_json", None), False)
     dn_b = _parse_levels_json(getattr(row, "down_bids_json", None), True)
     dn_a = _parse_levels_json(getattr(row, "down_asks_json", None), False)
     if up_b or up_a:
         hub.apply_book(sym, "UP", {"asset_id": st.up_token, "timestamp": t_sec * 1000, "bids": [{"price": str(p), "size": str(q)} for p, q in up_b], "asks": [{"price": str(p), "size": str(q)} for p, q in up_a]}, via_ws=True)
-        if has_ages and pd.notna(getattr(row, "up_book_age_sec", None)):
-            st.up_local_ts = float(t_sec) - float(row.up_book_age_sec)
+        up_ms_age = _row_age_ms(row, "up_book_age_ms", "up_book_age_sec")
+        if has_ages and up_ms_age is not None:
+            st.up_local_ts = float(t_sec) - up_ms_age / 1000.0
+            st.up_recv_mono_ms = float(t_sec) * 1000.0 - up_ms_age
     if dn_b or dn_a:
         hub.apply_book(sym, "DOWN", {"asset_id": st.down_token, "timestamp": t_sec * 1000, "bids": [{"price": str(p), "size": str(q)} for p, q in dn_b], "asks": [{"price": str(p), "size": str(q)} for p, q in dn_a]}, via_ws=True)
-        if has_ages and pd.notna(getattr(row, "down_book_age_sec", None)):
-            st.down_local_ts = float(t_sec) - float(row.down_book_age_sec)
+        dn_ms_age = _row_age_ms(row, "down_book_age_ms", "down_book_age_sec")
+        if has_ages and dn_ms_age is not None:
+            st.down_local_ts = float(t_sec) - dn_ms_age / 1000.0
+            st.dn_recv_mono_ms = float(t_sec) * 1000.0 - dn_ms_age
 
 
 def _to_point(dec: Optional[SignalDecision], ts: int) -> Optional[EnterPoint]:
@@ -156,8 +184,18 @@ def _compare_entries(a_map: Dict[Any, EnterPoint], b_map: Dict[Any, EnterPoint])
     return matched, len(union_keys), rate, mismatches
 
 
+def _decision_match(da: SignalDecision, db: SignalDecision) -> bool:
+    if da.action != db.action or da.reason != db.reason:
+        return False
+    if da.z is not None and db.z is not None and abs(da.z - db.z) > 0.02:
+        return False
+    if da.ask_top is not None and db.ask_top is not None and abs(da.ask_top - db.ask_top) > 0.001:
+        return False
+    return True
+
+
 def run_parity_replay(db_path: pathlib.Path = DEFAULT_DB, report_path: pathlib.Path = REPORT_PATH) -> dict[str, Any]:
-    """Run Path A (Recorder) vs Path B (Runner) chronologically and write `parity_replay_report.md`."""
+    """Run full per-second + ENTER parity replay (Path A vs Path B) and write `parity_replay_report.md`."""
     w_meta, by_sec, ts_list = _load_db(db_path)
     rec_state = RecorderStreamState()
     cfgs = {s: SniperConfig(**{**asdict(TWAP_V2_FILTERED_CONFIG), "fee_rate": PRODUCTION_FEE_RATES[s]}) for s in SYMBOLS}
@@ -165,6 +203,7 @@ def run_parity_replay(db_path: pathlib.Path = DEFAULT_DB, report_path: pathlib.P
     b_coin: Dict[Tuple[int, str], EnterPoint] = {}
     a_win: Dict[int, EnterPoint] = {}
     b_win: Dict[int, EnterPoint] = {}
+    sec_stats: Dict[str, Any] = {"total": 0, "matched": 0, "enter_union": 0, "enter_matched": 0, "groups": {}, "mismatches": []}
     clock_ref = [float(ts_list[0]) if ts_list else 0.0]
     prev_bn: Dict[str, Optional[float]] = {}
     with tempfile.TemporaryDirectory() as td:
@@ -180,31 +219,57 @@ def run_parity_replay(db_path: pathlib.Path = DEFAULT_DB, report_path: pathlib.P
             for s, row in sec_rows.items():
                 _feed_ws_row(row, s, w, t_sec, w_meta.get((w, s)), (cl, hub, prev_bn))
             _views, decs_b = runner.evaluate_second(float(t_sec), w)
-            _record_step(w, t_sec, decs_a, decs_b, (a_coin, b_coin, a_win, b_win))
-    m_coin, n_coin, rate_coin, mm_coin = _compare_entries(a_coin, b_coin)
-    m_win, n_win, rate_win, mm_win = _compare_entries(a_win, b_win)
-    summary = {
-        "rows_replayed": sum(len(by_sec[t]) for t in ts_list), "seconds_replayed": len(ts_list),
-        "coin_window_union_signals": n_coin, "coin_window_matched": m_coin, "coin_window_parity_rate": round(rate_coin, 6),
-        "single_slot_union_windows": n_win, "single_slot_matched": m_win, "single_slot_parity_rate": round(rate_win, 6),
-        "coin_window_mismatches": mm_coin, "single_slot_mismatches": mm_win,
-    }
+            _record_step(w, t_sec, decs_a, decs_b, (a_coin, b_coin, a_win, b_win), sec_stats)
+    summary = _build_summary(ts_list, by_sec, a_coin, b_coin, a_win, b_win, sec_stats)
     _write_report(summary, report_path)
     return summary
+
+
+def _build_summary(
+    ts_list: List[int], by_sec: Dict[int, Dict[str, Any]],
+    a_coin: Dict[Tuple[int, str], EnterPoint], b_coin: Dict[Tuple[int, str], EnterPoint],
+    a_win: Dict[int, EnterPoint], b_win: Dict[int, EnterPoint], sec_stats: Dict[str, Any],
+) -> dict[str, Any]:
+    m_coin, n_coin, rate_coin, mm_coin = _compare_entries(a_coin, b_coin)
+    m_win, n_win, rate_win, mm_win = _compare_entries(a_win, b_win)
+    n_sec = int(sec_stats["total"])
+    rate_sec = (sec_stats["matched"] / n_sec) if n_sec else 1.0
+    n_es = int(sec_stats["enter_union"])
+    rate_es = (sec_stats["enter_matched"] / n_es) if n_es else 1.0
+    by_group = {
+        k: {"total": v["total"], "matched": v["matched"], "parity_rate": round(v["matched"] / v["total"], 6) if v["total"] else 1.0}
+        for k, v in sorted(sec_stats["groups"].items(), key=lambda kv: -kv[1]["total"])
+    }
+    return {
+        "rows_replayed": sum(len(by_sec[t]) for t in ts_list), "seconds_replayed": len(ts_list),
+        "per_second_total": n_sec, "per_second_matched": sec_stats["matched"], "per_second_parity_rate": round(rate_sec, 6),
+        "per_second_enter_union": n_es, "per_second_enter_matched": sec_stats["enter_matched"], "per_second_enter_parity_rate": round(rate_es, 6),
+        "by_decision_group": by_group,
+        "coin_window_union_signals": n_coin, "coin_window_matched": m_coin, "coin_window_parity_rate": round(rate_coin, 6),
+        "single_slot_union_windows": n_win, "single_slot_matched": m_win, "single_slot_parity_rate": round(rate_win, 6),
+        "per_second_gate_pass": rate_sec >= 0.995,
+        "enter_parity_gate_pass": rate_coin >= 0.99 and rate_win >= 0.99 and rate_sec >= 0.995,
+        "enter_sample_gate": "PASS" if n_coin >= 100 else f"PENDING ({n_coin}/100)",
+        "coin_window_mismatches": mm_coin, "single_slot_mismatches": mm_win, "per_second_mismatches": sec_stats["mismatches"],
+    }
 
 
 def _record_step(
     w: int, t_sec: int, decs_a: Dict[str, SignalDecision], decs_b: Dict[str, SignalDecision],
     maps: Tuple[Dict[Tuple[int, str], EnterPoint], Dict[Tuple[int, str], EnterPoint], Dict[int, EnterPoint], Dict[int, EnterPoint]],
+    sec_stats: Optional[Dict[str, Any]] = None,
 ) -> None:
     a_coin, b_coin, a_win, b_win = maps
     for s in SYMBOLS:
+        da, db = decs_a.get(s), decs_b.get(s)
+        if sec_stats is not None and da is not None and db is not None:
+            _tally_second(t_sec, s, da, db, sec_stats)
         if (w, s) not in a_coin:
-            pt = _to_point(decs_a.get(s), t_sec)
+            pt = _to_point(da, t_sec)
             if pt is not None:
                 a_coin[(w, s)] = pt
         if (w, s) not in b_coin:
-            pt = _to_point(decs_b.get(s), t_sec)
+            pt = _to_point(db, t_sec)
             if pt is not None:
                 b_coin[(w, s)] = pt
     if w not in a_win:
@@ -217,28 +282,58 @@ def _record_step(
             b_win[w] = EnterPoint(best_b.side, t_sec, round(best_b.z, 6), round(best_b.p_true, 6), float(decs_b[best_b.symbol].sigma or 0.0), float(best_b.ask))
 
 
+def _tally_second(t_sec: int, s: str, da: SignalDecision, db: SignalDecision, sec_stats: Dict[str, Any]) -> None:
+    sec_stats["total"] += 1
+    grp_key = f"{da.action}:{da.reason}"
+    grp = sec_stats["groups"].setdefault(grp_key, {"total": 0, "matched": 0})
+    grp["total"] += 1
+    ok = _decision_match(da, db)
+    if da.action == "ENTER" or db.action == "ENTER":
+        sec_stats["enter_union"] += 1
+        if ok:
+            sec_stats["enter_matched"] += 1
+    if ok:
+        sec_stats["matched"] += 1
+        grp["matched"] += 1
+    elif len(sec_stats["mismatches"]) < 20:
+        sec_stats["mismatches"].append({
+            "ts_sec": t_sec, "symbol": s,
+            "recorder": {"action": da.action, "reason": da.reason, "z": da.z, "ask": da.ask_top},
+            "runner": {"action": db.action, "reason": db.reason, "z": db.z, "ask": db.ask_top},
+        })
+
+
 def _write_report(summary: dict[str, Any], path: pathlib.Path) -> None:
     lines = [
-        "# Path A (Recorder) vs Path B (Runner) Parity Replay Report",
+        "# Path A (Recorder) vs Path B (Runner) Full Per-Second & ENTER Parity Report",
         "",
         f"- Database rows replayed: `{summary['rows_replayed']}` across `{summary['seconds_replayed']}` 1Hz ticks",
-        f"- Coin-window signal union (`ENTER`): `{summary['coin_window_union_signals']}`, matched: `{summary['coin_window_matched']}`, parity: **`{summary['coin_window_parity_rate'] * 100:.2f}%`**",
-        f"- Single-slot window union (`ENTER`): `{summary['single_slot_union_windows']}`, matched: `{summary['single_slot_matched']}`, parity: **`{summary['single_slot_parity_rate'] * 100:.2f}%`**",
-        f"- Gate (`>= 99.0%`): **{'PASS' if min(summary['coin_window_parity_rate'], summary['single_slot_parity_rate']) >= 0.99 else 'FAIL'}**",
+        f"- Per-second full-decision parity (`action`, `reason`, `|dz|<=0.02`, `|dask|<=0.001`): `{summary['per_second_matched']}` / `{summary['per_second_total']}` (**`{summary['per_second_parity_rate'] * 100:.4f}%`** | gate `>= 99.5%`: **{'PASS' if summary['per_second_gate_pass'] else 'FAIL'}**)",
+        f"- Per-second `ENTER` union: `{summary['per_second_enter_matched']}` / `{summary['per_second_enter_union']}` (**`{summary['per_second_enter_parity_rate'] * 100:.2f}%`**)",
+        f"- Coin-window signal union (`ENTER`): `{summary['coin_window_matched']}` / `{summary['coin_window_union_signals']}` (**`{summary['coin_window_parity_rate'] * 100:.2f}%`** | sample gate `>= 100`: **{summary['enter_sample_gate']}**)",
+        f"- Single-slot window union (`ENTER`): `{summary['single_slot_matched']}` / `{summary['single_slot_union_windows']}` (**`{summary['single_slot_parity_rate'] * 100:.2f}%`**)",
+        f"- Parity gate (`per_sec >= 99.5%` & `ENTER >= 99.0%`): **{'PASS' if summary['enter_parity_gate_pass'] else 'FAIL'}** (Overall ENTER sample gate: **{summary['enter_sample_gate']}**)",
         "",
-        "## Discrepancies",
+        "## Per-Decision Group Agreement (`Path A Recorder` Baseline)",
         "",
+        "| Decision Group (`Action:Reason`) | Rows | Matched | Agreement |",
+        "|---|---:|---:|---:|",
     ]
+    for grp, st in (summary.get("by_decision_group") or {}).items():
+        lines.append(f"| `{grp}` | {st['total']} | {st['matched']} | {st['parity_rate'] * 100:.4f}% |")
+    lines += ["", "## Discrepancies", ""]
     all_mm = [("coin_window", m) for m in summary["coin_window_mismatches"]] + [("single_slot", m) for m in summary["single_slot_mismatches"]]
-    if not all_mm:
-        lines.append("Zero discrepancies between Path A (Recorder) and Path B (Runner) across the entire historical recording.")
+    if not all_mm and not summary.get("per_second_mismatches"):
+        lines.append("Zero discrepancies between Path A (Recorder) and Path B (Runner) across all replayed rows.")
     else:
         for scope, m in all_mm:
             lines.append(f"- `{scope}` `{m['key']}`: recorder=`{m['recorder']}` vs runner=`{m['runner']}`")
+        for m in summary.get("per_second_mismatches") or []:
+            lines.append(f"- `sec` `{m['ts_sec']}` `{m['symbol']}`: recorder=`{m['recorder']}` vs runner=`{m['runner']}`")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
     out = run_parity_replay()
     print(json.dumps(out, indent=2))
-    assert out["coin_window_parity_rate"] >= 0.99 and out["single_slot_parity_rate"] >= 0.99, out
+    assert out["per_second_parity_rate"] >= 0.995 and out["coin_window_parity_rate"] >= 0.99 and out["single_slot_parity_rate"] >= 0.99, out

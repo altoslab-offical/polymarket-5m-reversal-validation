@@ -81,10 +81,13 @@ class SniperExecutionPolicy:
     enforce_vol_warmup: bool = False
     vol_cache_path: Optional[pathlib.Path] = None
     clock: Optional[Callable[[], float]] = None
+    mono_clock_ms: Optional[Callable[[], float]] = None
+    live_shadow_log_path: Optional[pathlib.Path] = None
 
 
 _DEFAULT_FROZEN_PATH = pathlib.Path(__file__).resolve().parent.parent / "edge_validation" / "frozen_config.json"
 _DEFAULT_VOL_CACHE_PATH = pathlib.Path(__file__).resolve().parent.parent / "data" / "sniper_vol_hist.json"
+_DEFAULT_SHADOW_LOG_PATH = pathlib.Path(__file__).resolve().parent.parent / "data" / "validation_42" / "runner_shadow_events.jsonl"
 
 PRODUCTION_EXEC_POLICY = SniperExecutionPolicy(
     max_concurrent_positions=1,
@@ -117,6 +120,7 @@ PAPER_40U_EXEC_POLICY = SniperExecutionPolicy(
     paper_initial_equity_u=40.0,
     enforce_vol_warmup=True,
     vol_cache_path=_DEFAULT_VOL_CACHE_PATH,
+    live_shadow_log_path=_DEFAULT_SHADOW_LOG_PATH,
 )
 
 PAPER_43U_EXEC_POLICY = SniperExecutionPolicy(
@@ -156,7 +160,8 @@ class OracleSniperRunner:
         self.cfg = cfg
         self.ledger = ledger or SniperLedger()
         self._custom_clock = policy.clock
-        self.hub = hub or SniperMarketHub(auto_trader, cfg, clock=self._now)
+        self._custom_mono_ms = policy.mono_clock_ms
+        self.hub = hub or SniperMarketHub(auto_trader, cfg, clock=self._now, mono_clock_ms=policy.mono_clock_ms)
         self.policy = policy
         self.running = False
         self._task: Optional[asyncio.Task[None]] = None
@@ -178,10 +183,19 @@ class OracleSniperRunner:
         self.diag: dict[str, dict[str, Any]] = {}
         self._decisions: dict[str, SignalDecision] = {}
         self._last_ages: dict[str, dict[str, float]] = {}
+        self._last_lags: dict[str, dict[str, Optional[float]]] = {}
+        self._warm_logged_windows: set[tuple[int, str]] = set()
         self._load_vol_cache()
 
     def _now(self) -> float:
         return time.time() if self._custom_clock is None else float(self._custom_clock())
+
+    def _mono_ms(self) -> float:
+        if self._custom_mono_ms is not None:
+            return float(self._custom_mono_ms())
+        if self._custom_clock is not None:
+            return float(self._custom_clock()) * 1000.0
+        return self.hub.mono_ms()
 
     def _max_ages(self) -> dict[str, float]:
         cl_lim = float(min(CHAINLINK_MAX_AGE_SEC, self.policy.max_chainlink_age_sec))
@@ -344,12 +358,19 @@ class OracleSniperRunner:
         has_twap = bool(getattr(self.chainlink, "twap_ticks", {}).get(sym))
         return opened, ("POLY_TWAP_60S" if has_twap else "RTDS_BUCKET_OPEN")
 
+    def _side_book_age_sec(self, st: SymbolState, side: str, now: float, now_m: float) -> float:
+        mono = st.up_recv_mono_ms if side == "UP" else st.dn_recv_mono_ms
+        if mono > 0.0:
+            return max(0.0, (now_m - mono) / 1000.0)
+        loc = st.up_local_ts if side == "UP" else st.down_local_ts
+        return max(0.0, now - loc) if loc > 0.0 else 9999.0
+
     def _book_for(self, st: SymbolState, now: float, elapsed: float) -> OrderBookTop:
         if elapsed < 1.5:
             return OrderBookTop()
-        b = st.book
-        up_ok = (now - st.up_local_ts) <= self.policy.max_book_age_sec
-        dn_ok = (now - st.down_local_ts) <= self.policy.max_book_age_sec
+        b, now_m = st.book, self._mono_ms()
+        up_ok = self._side_book_age_sec(st, "UP", now, now_m) <= self.policy.max_book_age_sec
+        dn_ok = self._side_book_age_sec(st, "DOWN", now, now_m) <= self.policy.max_book_age_sec
         return OrderBookTop(
             b.up_bid if up_ok else None, b.up_ask if up_ok else None,
             b.down_bid if dn_ok else None, b.down_ask if dn_ok else None,
@@ -361,38 +382,86 @@ class OracleSniperRunner:
             return raw_sorted
         return [(float(top_px), 100.0)] if top_px is not None else []
 
-    def _assemble_inputs(self, sym: str, st: SymbolState, now: float, window_ts: int) -> tuple[MarketInputs, str]:
-        cl_spot, sp_age = self.chainlink.get_latest_price(sym, max_age_sec=9999.0)
-        tw_fn = getattr(self.chainlink, "get_latest_twap", None)
-        if callable(tw_fn):
-            cl_twap, tw_age = tw_fn(sym, max_age_sec=9999.0)
-        elif self.policy.require_twap_fresh:
-            cl_twap, tw_age = None, 9999.0
+    def _read_chainlink_ages(self, sym: str) -> tuple[Optional[float], Optional[float], float, float, Optional[float], Optional[float]]:
+        sp_m = getattr(self.chainlink, "get_latest_price_metrics", None)
+        if callable(sp_m):
+            cl_spot, sp_ms, sp_lag = sp_m(sym, max_age_sec=9999.0)
+            sp_age = round(sp_ms / 1000.0, 3)
         else:
-            cl_twap, tw_age = cl_spot, sp_age
+            cl_spot, sp_age = self.chainlink.get_latest_price(sym, max_age_sec=9999.0)
+            sp_lag = None
+        tw_m = getattr(self.chainlink, "get_latest_twap_metrics", None)
+        tw_fn = getattr(self.chainlink, "get_latest_twap", None)
+        if callable(tw_m):
+            cl_twap, tw_ms, tw_lag = tw_m(sym, max_age_sec=9999.0)
+            tw_age = round(tw_ms / 1000.0, 3)
+        elif callable(tw_fn):
+            cl_twap, tw_age = tw_fn(sym, max_age_sec=9999.0)
+            tw_lag = None
+        elif self.policy.require_twap_fresh:
+            cl_twap, tw_age, tw_lag = None, 9999.0, None
+        else:
+            cl_twap, tw_age, tw_lag = cl_spot, sp_age, sp_lag
         if self.policy.require_rtds_connected and not bool(getattr(self.chainlink, "connected", True)):
-            sp_age, tw_age = 9999.0, 9999.0
+            return cl_spot, cl_twap, 9999.0, 9999.0, sp_lag, tw_lag
+        return cl_spot, cl_twap, sp_age, tw_age, sp_lag, tw_lag
+
+    def _assemble_inputs(self, sym: str, st: SymbolState, now: float, window_ts: int) -> tuple[MarketInputs, str]:
+        cl_spot, cl_twap, sp_age, tw_age, sp_lag, tw_lag = self._read_chainlink_ages(sym)
+        now_m = self._mono_ms()
         st.sync_micro_at(now, cl_spot, window_ts)
         bn_px = st.micro.prices[-1] if st.micro.prices else st.binance_price
-        bn_age = (now - st.binance_ts) if (st.binance_price is not None and st.binance_ts > 0.0) else 9999.0
+        if st.bn_recv_mono_ms > 0.0:
+            bn_age = max(0.0, (now_m - st.bn_recv_mono_ms) / 1000.0)
+        else:
+            bn_age = max(0.0, now - st.binance_ts) if (st.binance_price is not None and st.binance_ts > 0.0) else 9999.0
         if self.policy.max_binance_age_sec is None and st.binance_price is None and cl_spot is not None:
             bn_px, bn_age = cl_spot, 0.0
         strike, src = self._strike(sym, st)
-        up_age = (now - st.up_local_ts) if st.up_local_ts > 0.0 else 9999.0
-        dn_age = (now - st.down_local_ts) if st.down_local_ts > 0.0 else 9999.0
+        up_age = self._side_book_age_sec(st, "UP", now, now_m)
+        dn_age = self._side_book_age_sec(st, "DOWN", now, now_m)
         bk_age = directional_book_age(cl_spot, strike, up_age, dn_age)
+        bk_src = st.up_source_ts_ms if (cl_spot is None or strike is None or cl_spot >= strike) else st.dn_source_ts_ms
+        bk_wall = st.up_recv_wall_ms if (cl_spot is None or strike is None or cl_spot >= strike) else st.dn_recv_wall_ms
+        self._last_lags[sym] = {
+            "cl_twap_ms": tw_lag, "cl_spot_ms": sp_lag,
+            "bn_ms": round(st.bn_recv_wall_ms - st.bn_source_ts_ms, 2) if st.bn_source_ts_ms > 0 else None,
+            "book_ms": round(bk_wall - bk_src, 2) if bk_src > 0 else None,
+        }
         cvd, flow = st.micro.get_orderflow_metrics(int(now))
-        gap = st.micro._last_basis_gap_bps
-        r240 = st.micro.get_realized_twap_240(window_ts, int(now), fallback_spot=cl_spot)
-        up_asks = self._levels_or_top(st.sorted_asks("UP"), st.book.up_ask)
-        dn_asks = self._levels_or_top(st.sorted_asks("DOWN"), st.book.down_ask)
-        up_bids = self._levels_or_top(st.sorted_bids("UP"), st.book.up_bid)
-        dn_bids = self._levels_or_top(st.sorted_bids("DOWN"), st.book.down_bid)
+        gap, r240 = st.micro._last_basis_gap_bps, st.micro.get_realized_twap_240(window_ts, int(now), fallback_spot=cl_spot)
+        up_asks, dn_asks = self._levels_or_top(st.sorted_asks("UP"), st.book.up_ask), self._levels_or_top(st.sorted_asks("DOWN"), st.book.down_ask)
+        up_bids, dn_bids = self._levels_or_top(st.sorted_bids("UP"), st.book.up_bid), self._levels_or_top(st.sorted_bids("DOWN"), st.book.down_bid)
         ages = {"cl_twap": round(tw_age, 3), "cl_spot": round(sp_age, 3), "bn": round(bn_age, 3), "book": round(bk_age, 3)}
-        return MarketInputs(
-            sym, window_ts, now, strike, cl_twap, cl_spot, bn_px, tuple(st.micro.prices),
-            up_asks, dn_asks, up_bids, dn_bids, ages, flow, cvd, gap, r240,
-        ), src
+        return MarketInputs(sym, window_ts, now, strike, cl_twap, cl_spot, bn_px, tuple(st.micro.prices), up_asks, dn_asks, up_bids, dn_bids, ages, flow, cvd, gap, r240), src
+
+    def _maybe_log_shadow(self, win_ts: int, now: float, elapsed: float, dec: SignalDecision, inp: MarketInputs) -> None:
+        path = self.policy.live_shadow_log_path
+        if path is None:
+            return
+        cfg_sym = self._cfg_for(inp.symbol)
+        in_win = cfg_sym.entry_start_elapsed_sec <= elapsed <= cfg_sym.entry_end_elapsed_sec
+        events: list[dict[str, Any]] = []
+        key = (win_ts, inp.symbol)
+        if in_win and dec.reason != "WARMUP" and key not in self._warm_logged_windows:
+            self._warm_logged_windows.add(key)
+            for old_k in [k for k in self._warm_logged_windows if k[0] < win_ts - 3600]:
+                self._warm_logged_windows.discard(old_k)
+            events.append({"type": "WARM_WINDOW", "ts_sec": int(now), "window_ts": win_ts, "symbol": inp.symbol, "vol_samples": len(inp.vol_hist)})
+        if dec.action == "ENTER":
+            events.append({
+                "type": "ENTER", "ts_sec": int(now), "window_ts": win_ts, "symbol": inp.symbol, "side": dec.side,
+                "z": round(float(dec.z or 0.0), 6), "p_model": round(float(dec.p_model or 0.0), 6),
+                "sigma": float(dec.sigma or 0.0), "ask_top": float(dec.ask_top or 0.0),
+                "ages_ms": {k: round(float(v) * 1000.0, 2) for k, v in inp.ages.items()},
+                "lags_ms": self._last_lags.get(inp.symbol, {}),
+            })
+        if not events:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            for ev in events:
+                fh.write(json.dumps(ev) + "\n")
 
     def evaluate_second(
         self, now: float, window_ts: Optional[int] = None
@@ -409,6 +478,7 @@ class OracleSniperRunner:
             dec = evaluate_signal(inp, cfg_sym, max_ages=lims, enforce_warmup=self.policy.enforce_vol_warmup)
             decisions[sym] = dec
             self._last_ages[sym] = dict(inp.ages)
+            self._maybe_log_shadow(win_ts, now, elapsed, dec, inp)
             book = self._book_for(st, now, elapsed)
             fv = dec.fv
             if fv is None and sym in self._positions and float(inp.ages.get("cl_spot", 9999.0)) <= float(lims.get("cl_spot", 3.0)):
@@ -416,7 +486,7 @@ class OracleSniperRunner:
                 fv = res[1] if res is not None else None
             if fv is not None:
                 views[sym] = (fv, book)
-            self.diag[sym] = self._diag_row(dec, book, src, inp.ages, st, len(inp.vol_hist))
+            self.diag[sym] = self._diag_row(dec, book, src, inp.ages, st, len(inp.vol_hist), self._last_lags.get(sym))
         self._decisions = decisions
         return views, decisions
 
@@ -426,12 +496,20 @@ class OracleSniperRunner:
 
     @staticmethod
     def _diag_row(
-        dec: SignalDecision, book: OrderBookTop, src: str, ages: dict[str, float], st: SymbolState, vol_n: int
+        dec: SignalDecision,
+        book: OrderBookTop,
+        src: str,
+        ages: dict[str, float],
+        st: SymbolState,
+        vol_n: int,
+        lags_ms: Optional[dict[str, Optional[float]]] = None,
     ) -> dict[str, Any]:
         status = "OK" if dec.fv is not None else dec.reason
         row: dict[str, Any] = {
             "status": status, "decision": dec.action, "reason": dec.reason, "strike_src": src,
-            "cl_age_sec": ages.get("cl_spot"), "ages": ages, "vol_samples": vol_n,
+            "cl_age_sec": ages.get("cl_spot"), "ages": ages,
+            "ages_ms": {k: round(float(v) * 1000.0, 2) for k, v in ages.items()},
+            "lags_ms": lags_ms or {}, "vol_samples": vol_n,
             "up": [book.up_bid, book.up_ask], "down": [book.down_bid, book.down_ask], "has_tokens": bool(st.up_token),
         }
         if dec.fv is not None:
@@ -559,12 +637,12 @@ class OracleSniperRunner:
         st = self.hub.states[cand.symbol]
         live_ask = st.book.up_ask if cand.side == "UP" else st.book.down_ask
         asks = self._levels_or_top(st.sorted_asks(cand.side), live_ask)
-        side_ts = st.up_local_ts if cand.side == "UP" else st.down_local_ts
         now_val = self._now()
+        bk_age = self._side_book_age_sec(st, cand.side, now_val, self._mono_ms())
         if not asks:
             return {"filled": False, "shares": 0.0, "filled_partial": 0.0, "usd": 0.0, "avg_price": 0.0, "order_id": "", "status": "PAPER_NO_BOOK", "error": "ask_missing"}
-        if side_ts > 0 and (now_val - side_ts) > self.policy.max_book_age_sec and self.policy.paper_fill_delay_sec >= 0.5:
-            return {"filled": False, "shares": 0.0, "filled_partial": 0.0, "usd": 0.0, "avg_price": 0.0, "order_id": "", "status": "PAPER_STALE_BOOK", "error": f"book_age={now_val - side_ts:.1f}s>{self.policy.max_book_age_sec}s"}
+        if 9000.0 > bk_age > self.policy.max_book_age_sec and self.policy.paper_fill_delay_sec >= 0.5:
+            return {"filled": False, "shares": 0.0, "filled_partial": 0.0, "usd": 0.0, "avg_price": 0.0, "order_id": "", "status": "PAPER_STALE_BOOK", "error": f"book_age={bk_age:.1f}s>{self.policy.max_book_age_sec}s"}
         res = simulate_fak_buy(asks, shares, limit_px)
         if not res.filled or res.avg_px is None:
             return {"filled": False, "shares": 0.0, "filled_partial": res.filled_shares, "usd": 0.0, "avg_price": res.avg_px or 0.0, "order_id": "", "status": f"PAPER_{res.status}", "error": f"top={asks[0][0]:.3f} filled={res.filled_shares:.2f}/{shares:.2f} lim={limit_px:.2f}"}

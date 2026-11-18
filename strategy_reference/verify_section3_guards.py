@@ -162,7 +162,7 @@ def check_paper_40u_simulation(tmp: Path) -> int:
     """Verify $40U single-slot paper simulation never hits real CLOB, simulates +1s depth/price FAK miss, and updates cash."""
     r, at, cl, w = _make_strict_runner(tmp, "paper40")
     r.ledger = SniperLedger(tmp / "paper40_state.json", policy=PAPER_40U_RISK_POLICY)
-    r.policy = replace(PAPER_40U_EXEC_POLICY, frozen_config_path=Path(__file__).resolve().parent / "edge_validation" / "frozen_config.json", paper_fill_delay_sec=0.0, vol_cache_path=None)
+    r.policy = replace(PAPER_40U_EXEC_POLICY, frozen_config_path=Path(__file__).resolve().parent / "edge_validation" / "frozen_config.json", paper_fill_delay_sec=0.0, vol_cache_path=None, live_shadow_log_path=None)
     r.ledger.ensure_baseline(40.0)
     now = float(w + 200)
     asyncio.run(r._tick(now))
@@ -175,7 +175,7 @@ def check_paper_40u_simulation(tmp: Path) -> int:
     # Verify +1s price spike causes PAPER_MISSED_PRICE and shallow ask causes PAPER_MISSED_DEPTH
     r2, _at2, _cl2, _w2 = _make_strict_runner(tmp, "paper_miss")
     r2.ledger = SniperLedger(tmp / "paper_miss_state.json", policy=PAPER_40U_RISK_POLICY)
-    r2.policy = replace(PAPER_40U_EXEC_POLICY, frozen_config_path=Path(__file__).resolve().parent / "edge_validation" / "frozen_config.json", paper_fill_delay_sec=0.0, vol_cache_path=None)
+    r2.policy = replace(PAPER_40U_EXEC_POLICY, frozen_config_path=Path(__file__).resolve().parent / "edge_validation" / "frozen_config.json", paper_fill_delay_sec=0.0, vol_cache_path=None, live_shadow_log_path=None)
     r2.hub.states["BTCUSDT"].book = OrderBookTop(0.94, 0.96, 0.02, 0.04)
     res_miss = asyncio.run(r2._paper_buy(MagicMock(symbol="BTCUSDT", side="UP"), 5.0, 0.82))
     assert not res_miss["filled"] and res_miss["status"] == "PAPER_MISSED_PRICE", res_miss
@@ -274,6 +274,7 @@ def check_forensics_regression_fixes(tmp: Path) -> int:
     # 3. _paper_buy must reject genuinely stale books when paper_fill_delay_sec >= 0.5
     r.policy = replace(r.policy, paper_simulation=True, paper_fill_delay_sec=0.5)
     st.up_local_ts = time.time() - 10.0
+    st.up_recv_mono_ms = r._mono_ms() - 10_000.0
     st.book = OrderBookTop(0.79, 0.80, 0.19, 0.20)
     st.up_asks_raw.clear()
     res_stale = asyncio.run(r._paper_buy(MagicMock(symbol="ETHUSDT", side="UP"), 5.0, 0.82))

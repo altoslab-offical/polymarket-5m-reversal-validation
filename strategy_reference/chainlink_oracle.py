@@ -34,11 +34,16 @@ class ChainlinkRTDSFeed:
     """
 
     def __init__(
-        self, proxy_url: str | None = None, max_ticks_per_symbol: int = 25000, clock: Callable[[], float] = time.time
+        self,
+        proxy_url: str | None = None,
+        max_ticks_per_symbol: int = 25000,
+        clock: Callable[[], float] = time.time,
+        mono_clock_ms: Callable[[], float] | None = None,
     ) -> None:
         self.proxy_url = (proxy_url or "").strip() or None
         self.max_ticks = max(1000, int(max_ticks_per_symbol))
         self._clock = clock
+        self._custom_mono_ms = mono_clock_ms
         self.ticks: dict[str, deque[tuple[int, float]]] = {
             "BTCUSDT": deque(maxlen=self.max_ticks),
             "ETHUSDT": deque(maxlen=self.max_ticks),
@@ -60,6 +65,12 @@ class ChainlinkRTDSFeed:
             "ETHUSDT": {},
             "SOLUSDT": {},
         }
+        self._spot_mono_ms: dict[str, float] = {}
+        self._spot_wall_ms: dict[str, float] = {}
+        self._spot_src_ms: dict[str, int] = {}
+        self._twap_mono_ms: dict[str, float] = {}
+        self._twap_wall_ms: dict[str, float] = {}
+        self._twap_src_ms: dict[str, int] = {}
         self.connected: bool = False
         self.total_ticks: int = 0
         self.total_twap_ticks: int = 0
@@ -67,6 +78,13 @@ class ChainlinkRTDSFeed:
         self.last_error: str | None = None
         self._running: bool = False
         self._task: asyncio.Task[None] | None = None
+
+    def _mono_ms(self) -> float:
+        if self._custom_mono_ms is not None:
+            return float(self._custom_mono_ms())
+        if self._clock is not time.time:
+            return float(self._clock()) * 1000.0
+        return time.monotonic_ns() / 1_000_000.0
 
     @staticmethod
     def _boundary_rank(dt_ms: float) -> tuple[int, float]:
@@ -92,23 +110,35 @@ class ChainlinkRTDSFeed:
             for old_b in [k for k in table[sym] if k < cutoff_b]:
                 table[sym].pop(old_b, None)
 
-    def ingest_tick(self, raw_symbol: str, value: float, ts_ms: int) -> None:
+    def ingest_tick(
+        self, raw_symbol: str, value: float, ts_ms: int, recv_mono_ms: float | None = None, recv_wall_ms: float | None = None
+    ) -> None:
         sym = CHAINLINK_SYMBOL_MAP.get(str(raw_symbol).strip().lower())
         if not sym or value <= 0.0 or ts_ms <= 0:
             return
         buf = self.ticks[sym]
         if buf and buf[-1][0] == ts_ms and buf[-1][1] == value:
             return
+        now_m = self._mono_ms() if recv_mono_ms is None else float(recv_mono_ms)
+        now_w = (self._clock() * 1000.0) if recv_wall_ms is None else float(recv_wall_ms)
+        if not buf or ts_ms >= buf[-1][0]:
+            self._spot_mono_ms[sym] = now_m
+            self._spot_wall_ms[sym] = now_w
+            self._spot_src_ms[sym] = int(ts_ms)
         buf.append((int(ts_ms), float(value)))
         self.total_ticks += 1
-        self.last_tick_recv_ms = int(self._clock() * 1000)
+        self.last_tick_recv_ms = int(now_w)
         self._record_bucket_open(self.bucket_opens, sym, value, ts_ms)
 
-    def ingest_twap_tick(self, raw_symbol: str, value: float, ts_ms: int) -> None:
+    def ingest_twap_tick(
+        self, raw_symbol: str, value: float, ts_ms: int, recv_mono_ms: float | None = None, recv_wall_ms: float | None = None
+    ) -> None:
         sym = CHAINLINK_SYMBOL_MAP.get(str(raw_symbol).strip().lower())
         if not sym or value <= 0.0 or ts_ms <= 0:
             return
         buf = self.twap_ticks[sym]
+        now_m = self._mono_ms() if recv_mono_ms is None else float(recv_mono_ms)
+        now_w = (self._clock() * 1000.0) if recv_wall_ms is None else float(recv_wall_ms)
         if buf:
             if ts_ms == buf[-1][0]:
                 if buf[-1][1] == value:
@@ -123,30 +153,45 @@ class ChainlinkRTDSFeed:
                 buf.extend(ordered)
                 self._record_bucket_open(self.twap_bucket_opens, sym, value, ts_ms)
                 return
+        self._twap_mono_ms[sym] = now_m
+        self._twap_wall_ms[sym] = now_w
+        self._twap_src_ms[sym] = int(ts_ms)
         buf.append((int(ts_ms), float(value)))
         self.total_twap_ticks += 1
-        self.last_tick_recv_ms = int(self._clock() * 1000)
+        self.last_tick_recv_ms = int(now_w)
         self._record_bucket_open(self.twap_bucket_opens, sym, value, ts_ms)
 
+    def get_latest_price_metrics(self, symbol: str, max_age_sec: float = 20.0) -> tuple[float | None, float, float | None]:
+        """Return `(value, age_ms, lag_ms)` measured strictly from `monotonic_ns` recv time."""
+        sym = symbol.upper()
+        buf = self.ticks.get(sym)
+        if not buf or sym not in self._spot_mono_ms:
+            return None, 9_999_000.0, None
+        age_ms = max(0.0, self._mono_ms() - self._spot_mono_ms[sym])
+        lag_ms = self._spot_wall_ms[sym] - float(self._spot_src_ms[sym])
+        if (age_ms / 1000.0) > max_age_sec:
+            return None, round(age_ms, 2), round(lag_ms, 2)
+        return float(buf[-1][1]), round(age_ms, 2), round(lag_ms, 2)
+
+    def get_latest_twap_metrics(self, symbol: str, max_age_sec: float = 20.0) -> tuple[float | None, float, float | None]:
+        """Return `(twap60, age_ms, lag_ms)` measured strictly from `monotonic_ns` recv time."""
+        sym = symbol.upper()
+        buf = self.twap_ticks.get(sym)
+        if not buf or sym not in self._twap_mono_ms:
+            return None, 9_999_000.0, None
+        age_ms = max(0.0, self._mono_ms() - self._twap_mono_ms[sym])
+        lag_ms = self._twap_wall_ms[sym] - float(self._twap_src_ms[sym])
+        if (age_ms / 1000.0) > max_age_sec:
+            return None, round(age_ms, 2), round(lag_ms, 2)
+        return float(buf[-1][1]), round(age_ms, 2), round(lag_ms, 2)
+
     def get_latest_price(self, symbol: str, max_age_sec: float = 20.0) -> tuple[float | None, float]:
-        buf = self.ticks.get(symbol.upper())
-        if not buf:
-            return None, 9999.0
-        ts_ms, val = buf[-1]
-        age_sec = max(0.0, (self._clock() * 1000.0 - float(ts_ms)) / 1000.0)
-        if age_sec > max_age_sec:
-            return None, round(age_sec, 2)
-        return float(val), round(age_sec, 2)
+        val, age_ms, _lag_ms = self.get_latest_price_metrics(symbol, max_age_sec=max_age_sec)
+        return val, round(age_ms / 1000.0, 3)
 
     def get_latest_twap(self, symbol: str, max_age_sec: float = 20.0) -> tuple[float | None, float]:
-        buf = self.twap_ticks.get(symbol.upper())
-        if not buf:
-            return None, 9999.0
-        ts_ms, val = buf[-1]
-        age_sec = max(0.0, (self._clock() * 1000.0 - float(ts_ms)) / 1000.0)
-        if age_sec > max_age_sec:
-            return None, round(age_sec, 2)
-        return float(val), round(age_sec, 2)
+        val, age_ms, _lag_ms = self.get_latest_twap_metrics(symbol, max_age_sec=max_age_sec)
+        return val, round(age_ms / 1000.0, 3)
 
     def get_settlement_twap_at(
         self, symbol: str, target_ts_sec: int, max_dist_ms: int = 4000, allow_pre_boundary: bool = False
@@ -269,23 +314,20 @@ class ChainlinkRTDSFeed:
     def _ingest_rtds_message(self, data: dict[str, Any]) -> None:
         topic = str(data.get("topic") or "")
         payload = data.get("payload")
-        if not isinstance(payload, dict):
+        if not isinstance(payload, dict) or not payload.get("symbol"):
             return
-        raw_sym = payload.get("symbol")
-        if not raw_sym:
-            return
-        is_twap = topic == "crypto_prices_twap_sixty"
-        ingest = self.ingest_twap_tick if is_twap else self.ingest_tick
+        raw_sym = str(payload["symbol"])
+        ingest = self.ingest_twap_tick if topic == "crypto_prices_twap_sixty" else self.ingest_tick
+        recv_m, recv_w = self._mono_ms(), self._clock() * 1000.0
         arr = payload.get("data")
         if isinstance(arr, list):
             for pt in arr:
                 if isinstance(pt, dict) and pt.get("value") is not None and pt.get("timestamp") is not None:
-                    ingest(str(raw_sym), float(pt["value"]), int(pt["timestamp"]))
+                    ingest(raw_sym, float(pt["value"]), int(pt["timestamp"]), recv_m, recv_w)
             return
-        val = payload.get("value")
-        ts = payload.get("timestamp")
+        val, ts = payload.get("value"), payload.get("timestamp")
         if val is not None and ts is not None:
-            ingest(str(raw_sym), float(val), int(ts))
+            ingest(raw_sym, float(val), int(ts), recv_m, recv_w)
 
     async def _consume_ws(self, ws: Any, sub_msg: str) -> None:
         self.connected = True

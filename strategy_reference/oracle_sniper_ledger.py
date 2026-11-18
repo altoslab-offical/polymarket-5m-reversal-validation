@@ -11,6 +11,7 @@ from typing import Any, Optional
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 STATE_PATH = ROOT_DIR / "data" / "oracle_sniper_state.json"
+PAPER_STATE_PATH = ROOT_DIR / "data" / "oracle_sniper_paper_43u.json"
 MAX_TRADES_KEPT = 500
 SYMBOL_ORDER = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 
@@ -37,6 +38,7 @@ class SniperRiskPolicy:
     symbol_min_win_rate: float = 0.75
     pause_seconds: int = 3 * 3600
     use_utc_day: bool = False
+    paper_initial_equity_u: Optional[float] = None
 
 
 PRODUCTION_RISK_POLICY = SniperRiskPolicy(
@@ -46,6 +48,16 @@ PRODUCTION_RISK_POLICY = SniperRiskPolicy(
     rolling_be_buffer=0.02,
     rolling_halt_permanent=True,
     use_utc_day=True,
+)
+
+PAPER_43U_RISK_POLICY = SniperRiskPolicy(
+    fixed_daily_loss_cap_u=10.0,
+    consec_loss_day_halt=3,
+    rolling_window=50,
+    rolling_be_buffer=0.02,
+    rolling_halt_permanent=True,
+    use_utc_day=True,
+    paper_initial_equity_u=43.0,
 )
 
 
@@ -80,15 +92,17 @@ class SniperLedger:
 
     # ----- persistence -----
     def _fresh(self) -> dict[str, Any]:
+        init_u = float(self.policy.paper_initial_equity_u or 0.0)
         return {
             "version": 2,
             "enabled": True,
             "halt_reason": "",
             "started_at_ms": int(time.time() * 1000),
-            "initial_equity_u": 0.0,
-            "peak_equity_u": 0.0,
+            "initial_equity_u": init_u,
+            "peak_equity_u": init_u,
             "vault_locked_u": 0.0,
-            "daily": {"date": self._today(), "start_equity_u": 0.0, "pnl_usd": 0.0, "trades": 0, "consec_losses": 0, "halted": False, "halt_reason": ""},
+            "paper_cash_u": init_u,
+            "daily": {"date": self._today(), "start_equity_u": init_u, "pnl_usd": 0.0, "trades": 0, "consec_losses": 0, "halted": False, "halt_reason": ""},
             "pause": {"global_until_ms": 0, "reason": "", "symbol_until_ms": {s: 0 for s in SYMBOL_ORDER}},
             "open_position": None,
             "open_positions": {},
@@ -98,6 +112,22 @@ class SniperLedger:
             "attempts": [],
             "skips": {},
         }
+
+    def paper_debit(self, amount_u: float) -> float:
+        """Deduct cost from simulated paper cash balance atomically."""
+        cur = float(self.state.get("paper_cash_u", self.policy.paper_initial_equity_u or 0.0))
+        nxt = round(max(0.0, cur - float(amount_u)), 4)
+        self.state["paper_cash_u"] = nxt
+        self.save()
+        return nxt
+
+    def paper_credit(self, amount_u: float) -> float:
+        """Credit settlement/exit proceeds to simulated paper cash balance atomically."""
+        cur = float(self.state.get("paper_cash_u", self.policy.paper_initial_equity_u or 0.0))
+        nxt = round(cur + float(amount_u), 4)
+        self.state["paper_cash_u"] = nxt
+        self.save()
+        return nxt
 
     def _merge_defaults(self, raw: dict[str, Any]) -> dict[str, Any]:
         merged = self._fresh()

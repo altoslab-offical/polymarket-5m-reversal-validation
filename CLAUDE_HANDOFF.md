@@ -121,7 +121,7 @@
 
 > 回覆規劃者《對第三輪（`14f4ad2` / `3d6da5e`）的回覆》全部要求：
 
-1. **同意關於 L2 嚴格因果表的核心結論**：`prices-history` 的 `0.753` 觸發價與 `0.928` `[τ+1, τ+5]` 成交價來自過期抽樣，只用來確認「模型在高價區間具備方向區分力」，絕不當作 `[0.68, 0.82]` 凍結策略的優勢證明。實盤仍維持**完全關閉 (`enabled=False`, `sniper_live=False`, port `8088` 空閒)**，靜待 `11/21 00:00 UTC` 後 `n >= 300` 與 **Bonferroni `98.3% CI > 0`** 一次判定。
+1. **同意關於 L2 嚴格因果表的核心結論**：`prices-history` 的 `0.753` 觸發價與 `0.928` `[τ+1, τ+5]` 成交價來自過期抽樣，只用來確認「模型在高價區間具備方向區分力」，絕不當作 `[0.68, 0.82]` 凍結策略的優勢證明。**真錢實盤仍維持完全關閉 (`sniper_live=False`, `dry_run=True`)**，靜待 `11/21 00:00 UTC` 後 `4.2` 累積 `n >= 300` 與 **Bonferroni `98.3% CI > 0`** 一次判定。
 2. **新增 `v2_highband_shadow` 影子設定（完全隔離於 3 組 Bonferroni 主判定）**：
    - 於 `engine/oracle_sniper.py` (`TWAP_V2_HIGHBAND_SHADOW_CONFIG`)、`edge_validation/frozen_config.json` (`shadow_config_v2_highband`, `bonferroni_included: false`) 及 `edge_validation/live_recorder_42.py` 新增追蹤 **`[0.84, 0.95]`**（參數同 `v2_pure`），逐單記錄於 `phase42_trades_1s_v2_highband_shadow.csv` 並在 `phase42_daily_report.md` **獨立列表**，絕不列入主判定或上線依據。
    - 先行在 `live_btc_5m.db`（`1,013` BTC 窗，參考用 `fee=0.05`）檢驗：`+1s` Full `n=350` (`99.5/天 BTC`)、WR `90.0%`、`+0.02521/股` (`CI [-0.0047, +0.0506]`)；跨 `0` 正驗證了「只收資料、不能直接上線」的規劃原則，待 `11/21` 累積 `ETH/SOL` (`fee=0.01`) 真實盤口數據再另案評估。
@@ -130,4 +130,22 @@
    - **硬體／資料鮮度阻擋**：下單前檢查 `Chainlink TWAP <= 3.0s`、`Binance <= 2.0s`、`RTDS WebSocket connected`，任一不符立即拒單 (`RTDS_DISCONNECTED / CHAINLINK_TWAP_STALE / BINANCE_STALE`)。
    - **完整停機規則 (`SniperLedger`)**：`CONSEC_LOSS_3_HALT`（UTC 連輸 3 單當日停止）、`DAILY_LOSS_LIMIT`（UTC 日虧 `>= $10U` 當日停止）、`ROLLING_50_BE_HALT`（近 50 單勝率 < `平均成本損益兩平 + 2pp` 全面永久停機 `enabled=False`）。
    - **參數防漂移 & 日報**：下單前核對 `frozen_config.json` 零漂移 (`FROZEN_CONFIG_DRIFT`)，並內建 `generate_daily_report()` 輸出 `n`、`PnL`、與 `4.2` 差距、`miss_rate`、vs 模擬滑價（試跑 `5股×100單 <= 1¢`）與成交延遲中位數。
+
+---
+
+## 七、`$43U` 即時 `+1s` 延遲模擬觀察模式 (`PAPER_43U_EXEC_POLICY`)
+
+依使用者要求啟動「零真錢風險」之即時前端模擬監督，已於 `strategy_reference/oracle_sniper_runner.py` 與 `oracle_sniper_ledger.py` 實作完整隔離之 Paper 模式：
+
+1. **三套狀態完全實體隔離（互不干擾）**：
+   - **真錢實盤開關鎖死**：`sniper_live=False, dry_run=True`（真錢帳戶 `oracle_sniper_state.json` 維持關閉 `enabled=False`，`sniper_buy / sniper_sell` 不會被模擬盤呼叫）。
+   - **Section `4.2` 統計錄製獨立運行**：`live_recorder_42.py` 持續寫入獨立 SQLite `live_3coin_42.db`（主判定組 3 組 Bonferroni + 影子組），作為 `11/21` 後唯一過關裁決基準。
+   - **`$43U` 模擬盤獨立帳本**：`data/oracle_sniper_paper_43u.json` 以 **`$43.00U`** 起始，僅作即時實戰行為體驗與 Telegram 開關單通知監督，絕不替代 `4.2` 之 `n >= 300` Bonferroni 統計判定。
+2. **選用設定與三段 Half-Kelly 複利邏輯**：
+   - 選用 **`v2_filtered` (`TWAP_V2_FILTERED_CONFIG`)**：在 `@0.785` 二元賠率下（1 負約抵 3.6 勝），透過 Order-Flow + Basis 過濾維持較高勝率（1s-CLOB 參考 `87.2%` vs `v2_pure` `81.9%`），搭配三幣同時可持各 1 單（日均參考 ~30 單）。
+   - 倉位曲線：`< $80U` 固定最低 **`5 股`**（約 `$3.9U`）→ `$80U ~ $200U` **Half-Kelly `5%`** 動態放大 → `>= $200U` 自動降檔 **`3%`**（並搭配 `vault_locked_u` 鎖利保護＋第 3 節連輸 3 單 / 日虧 `$10U` / 滾動 50 單 `BE+2pp` 停機）。
+3. **模擬成交與結算保守原則（拒絕零滑價作弊）**：
+   - 觸發訊號後實等 **`paper_fill_delay_sec = 1.0s`** 再讀取當時最新 CLOB top ask；若 ask 已超過 `limit_px` 直接記為 **`PAPER_MISSED_1S` 錯過不成交**。
+   - 成交後即時扣除 `shares * (ask@+1s + taker_fee(symbol))`，並等待官方 **Polymarket Gamma API (`query_live_market_resolution`)** 結算後再將派彩入帳至模擬現金，同步透過 `strategy_reference/oracle_sniper_notify.py` 推播至 Telegram 私訊與已綁定頻道（訊息清楚標註 `TWAP V2·🧪 模擬盤 $43U`）。
+4. **驗證程式 (`verify_section3_guards.py`)**：已在倉庫補充公開驗證腳本（涵蓋並發 3 單/1幣1單、鮮度阻擋、漂移阻擋、3 段停機線、`$43U` `+1s` 模擬錯過/成交與多頻道廣播去除鍵盤按鍵測試）。
 

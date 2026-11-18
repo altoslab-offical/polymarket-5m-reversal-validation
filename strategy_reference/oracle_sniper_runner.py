@@ -63,6 +63,9 @@ class SniperExecutionPolicy:
     frozen_config_path: Optional[pathlib.Path] = None
     frozen_model_name: Optional[str] = None
     pilot_fixed_shares: Optional[float] = None
+    paper_simulation: bool = False
+    paper_fill_delay_sec: float = 1.0
+    paper_initial_equity_u: float = 43.0
 
 
 PRODUCTION_EXEC_POLICY = SniperExecutionPolicy(
@@ -75,6 +78,21 @@ PRODUCTION_EXEC_POLICY = SniperExecutionPolicy(
     frozen_config_path=pathlib.Path(__file__).resolve().parent.parent / "edge_validation" / "frozen_config.json",
     frozen_model_name="v2_filtered",
     pilot_fixed_shares=5.0,
+)
+
+PAPER_43U_EXEC_POLICY = SniperExecutionPolicy(
+    max_concurrent_positions=3,
+    per_symbol_fees=PRODUCTION_FEE_RATES,
+    require_rtds_connected=True,
+    require_twap_fresh=True,
+    max_chainlink_age_sec=3.0,
+    max_binance_age_sec=2.0,
+    frozen_config_path=pathlib.Path(__file__).resolve().parent.parent / "edge_validation" / "frozen_config.json",
+    frozen_model_name="v2_filtered",
+    pilot_fixed_shares=None,
+    paper_simulation=True,
+    paper_fill_delay_sec=1.0,
+    paper_initial_equity_u=43.0,
 )
 
 
@@ -308,9 +326,15 @@ class OracleSniperRunner:
 
     # ------------------------------------------------------------------ equity / wallet
     def _equity(self) -> tuple[float, float, float]:
-        w = self.auto_trader.live_wallet_state or {}
-        cash = float(w.get("cash_pusd", 0.0))
-        total = cash + float(w.get("portfolio_pusd", 0.0))
+        if self.policy.paper_simulation:
+            cash = float(self.ledger.state.get("paper_cash_u", self.policy.paper_initial_equity_u))
+            open_cost = sum(float(t.get("cost_usd", 0.0)) for t in self._trades.values())
+            open_cost += sum(float(t.get("cost_usd", 0.0)) for t in self.ledger.state.get("settling", []))
+            total = cash + open_cost
+        else:
+            w = self.auto_trader.live_wallet_state or {}
+            cash = float(w.get("cash_pusd", 0.0))
+            total = cash + float(w.get("portfolio_pusd", 0.0))
         vault, _next, _lbl = compute_vault_locked_u(
             max(float(self.ledger.state.get("peak_equity_u", 0.0)), total), float(self.ledger.state.get("vault_locked_u", 0.0))
         )
@@ -318,11 +342,15 @@ class OracleSniperRunner:
         return total, cash, vault
 
     def _maybe_refresh_wallet(self, now: float) -> None:
+        if self.policy.paper_simulation:
+            return
         if now - self._last_wallet_ts >= WALLET_REFRESH_SEC:
             self._last_wallet_ts = now
             self._spawn(self.auto_trader.sync_live_wallet_balance(include_portfolio=True))
 
     def _wallet_fresh(self, now: float) -> bool:
+        if self.policy.paper_simulation:
+            return True
         updated_ms = float((self.auto_trader.live_wallet_state or {}).get("updated_at_ms", 0) or 0)
         return updated_ms > 0 and (now * 1000.0 - updated_ms) < 180_000.0
 
@@ -351,6 +379,8 @@ class OracleSniperRunner:
         if not self._config_parity_ok():
             self.ledger.bump_skip("FROZEN_CONFIG_DRIFT")
             return False
+        if self.policy.paper_simulation:
+            return True
         return bool((self.auto_trader.last_geoblock_status or {}).get("can_trade_api", False))
 
     def _symbol_can_enter(self, sym: str, window_ts: int) -> bool:
@@ -396,12 +426,30 @@ class OracleSniperRunner:
             if tradable < shares * cand.total_cost_per_share + 0.05:
                 return 0.0, "BELOW_MIN_LOT"
         else:
-            shares = compute_shares(self._cfg_for(cand.symbol), tradable, cand.total_cost_per_share)
+            c_sym = self._cfg_for(cand.symbol)
+            if total >= 200.0 and c_sym.risk_fraction > 0.03:
+                c_sym = SniperConfig(**{**asdict(c_sym), "risk_fraction": 0.03})
+            shares = compute_shares(c_sym, tradable, cand.total_cost_per_share)
             if shares <= 0.0:
                 return 0.0, "BELOW_MIN_LOT"
         if (cash - vault) < shares * limit_px * 1.03 + 0.05:
             return 0.0, "INSUFFICIENT_CASH"
         return shares, ""
+
+    async def _paper_buy(self, cand: Candidate, shares: float, limit_px: float) -> dict[str, Any]:
+        """Simulate realistic delayed (+1s) top-of-book fill in paper mode (zero real orders)."""
+        if self.policy.paper_fill_delay_sec > 0.0:
+            await asyncio.sleep(self.policy.paper_fill_delay_sec)
+        st = self.hub.states[cand.symbol]
+        live_ask = st.book.up_ask if cand.side == "UP" else st.book.down_ask
+        side_ts = st.up_local_ts if cand.side == "UP" else st.down_local_ts
+        if live_ask is None or (time.time() - side_ts) > BOOK_MAX_AGE_SEC and side_ts > 0 and self.policy.paper_fill_delay_sec >= 0.5:
+            # Allow unit tests with synthetic timestamps close to tick `now`, block genuine dead WS feeds
+            if live_ask is None:
+                return {"filled": False, "shares": 0.0, "usd": 0.0, "avg_price": 0.0, "order_id": "", "status": "PAPER_NO_BOOK", "error": "ask_missing"}
+        if live_ask > limit_px:
+            return {"filled": False, "shares": 0.0, "usd": 0.0, "avg_price": 0.0, "order_id": "", "status": "PAPER_MISSED_1S", "error": f"ask@+1s={live_ask:.3f}>{limit_px:.2f}"}
+        return {"filled": True, "shares": shares, "usd": round(shares * live_ask, 4), "avg_price": float(live_ask), "order_id": f"paper-{int(time.time() * 1000)}", "status": "PAPER_FILLED_1S", "error": None}
 
     async def _enter(self, cand: Candidate, window_ts: int, now: float, n_cands: int) -> None:
         self._attempts[(cand.symbol, window_ts)] = self._attempts.get((cand.symbol, window_ts), 0) + 1
@@ -420,9 +468,10 @@ class OracleSniperRunner:
             "limit_px": limit_px, "est_cost_usd": round(shares * limit_px * 1.02, 4), "n_cands": n_cands,
             "cand": asdict(cand),
         }
-        self.ledger.set_pending_entry(intent)
+        if not self.policy.paper_simulation:
+            self.ledger.set_pending_entry(intent)
         t_send = time.monotonic()
-        fill = await self.auto_trader.sniper_buy(token, shares, cand.ask, limit_px)
+        fill = await (self._paper_buy(cand, shares, limit_px) if self.policy.paper_simulation else self.auto_trader.sniper_buy(token, shares, cand.ask, limit_px))
         lat_ms = round((time.monotonic() - t_send) * 1000.0, 1)
         self.ledger.record_attempt({
             "ts": now, "window_ts": window_ts, "symbol": cand.symbol, "side": cand.side, "sim_ask": cand.ask,
@@ -431,7 +480,8 @@ class OracleSniperRunner:
         })
         if fill.get("filled"):
             self._register_entry(cand, window_ts, now, n_cands, fill, token, limit_px)
-            self.ledger.set_pending_entry(None)
+            if not self.policy.paper_simulation:
+                self.ledger.set_pending_entry(None)
             return
         self.ledger.bump_skip("NO_FILL")
         side_ts = st.up_local_ts if cand.side == "UP" else st.down_local_ts
@@ -440,11 +490,11 @@ class OracleSniperRunner:
             f"ask={cand.ask:.3f} cap={limit_px:.2f} bid={cand.bid} z={cand.z:.2f} p={cand.p_true:.3f} "
             f"t={cand.elapsed_sec:.0f}s book_age={now - side_ts:.1f}s"
         )
-        if fill.get("status") in UNCERTAIN_FILL_STATUSES:
+        if not self.policy.paper_simulation and fill.get("status") in UNCERTAIN_FILL_STATUSES:
             self._traded_windows.add(window_ts)
             self._traded_coin_windows.add((cand.symbol, window_ts))
             self._spawn(self._reconcile_pending(intent))
-        else:
+        elif not self.policy.paper_simulation:
             self.ledger.set_pending_entry(None)
 
     async def _reconcile_pending(self, intent: dict[str, Any]) -> None:
@@ -491,15 +541,27 @@ class OracleSniperRunner:
             "cost_usd": cost_usd, "fee_rate": fee_r, "entry_ts": now, "entry_elapsed": cand.elapsed_sec,
             "p_true": cand.p_true, "z": cand.z, "net_ev": cand.net_ev, "candidates": n_cands, "limit_px": limit_px,
             "order_id": fill.get("order_id", ""), "strike": st.price_to_beat, "partial_proceeds_usd": 0.0,
-            "fill_status": fill.get("status"),
+            "fill_status": fill.get("status"), "paper_mode": bool(self.policy.paper_simulation),
         }
+        if self.policy.paper_simulation:
+            self.ledger.paper_debit(cost_usd)
         self._trades[cand.symbol] = trade
         self._traded_windows.add(window_ts)
         self._traded_coin_windows.add((cand.symbol, window_ts))
         self._exit_attempts[cand.symbol] = 0
         self.ledger.open_trade(trade)
         self._spawn(self._notify(entry_message(trade, self._perf_lines()), "SNIPER_ENTRY", cand.symbol))
-        self._spawn(self.auto_trader.sync_live_wallet_balance())
+        if not self.policy.paper_simulation:
+            self._spawn(self.auto_trader.sync_live_wallet_balance())
+
+    async def _paper_sell(self, sym: str, pos: OpenPosition, trade: dict[str, Any], min_bid: float) -> dict[str, Any]:
+        if self.policy.paper_fill_delay_sec > 0.0:
+            await asyncio.sleep(self.policy.paper_fill_delay_sec)
+        st = self.hub.states[sym]
+        live_bid = st.book.up_bid if pos.side == "UP" else st.book.down_bid
+        if live_bid is None or live_bid < min_bid:
+            return {"filled": False, "shares": 0.0, "avg_price": 0.0, "status": "PAPER_EXIT_MISS", "error": f"bid={live_bid}<{min_bid}"}
+        return {"filled": True, "shares": pos.shares, "avg_price": float(live_bid), "status": "PAPER_SOLD_1S", "error": None}
 
     # ------------------------------------------------------------------ exit
     async def _manage_position(self, sym: str, views: dict[str, View], elapsed: float, now: float) -> None:
@@ -515,7 +577,8 @@ class OracleSniperRunner:
         self._exit_attempts[sym] = self._exit_attempts.get(sym, 0) + 1
         self._next_exit_ts[sym] = now + EXIT_RETRY_SPACING_SEC
         slip = 0.05 if decision.reason == "EMERGENCY_STOP_LOSS" else 0.03
-        sell = await self.auto_trader.sniper_sell(trade["token_id"], pos.shares, max(0.01, round(decision.bid - slip, 2)))
+        min_bid = max(0.01, round(decision.bid - slip, 2))
+        sell = await (self._paper_sell(sym, pos, trade, min_bid) if self.policy.paper_simulation else self.auto_trader.sniper_sell(trade["token_id"], pos.shares, min_bid))
         if sell.get("status") == "NO_BALANCE":
             self._reconcile_gone_position(sym, decision, now)
             return
@@ -543,7 +606,10 @@ class OracleSniperRunner:
         sold = float(sell["shares"])
         fee_r = float(trade.get("fee_rate", self._fee_for(sym)))
         net_ps = effective_exit_proceeds(float(sell["avg_price"]), fee_r)
-        trade["partial_proceeds_usd"] = round(float(trade["partial_proceeds_usd"]) + sold * net_ps, 4)
+        got_usd = round(sold * net_ps, 4)
+        if self.policy.paper_simulation:
+            self.ledger.paper_credit(got_usd)
+        trade["partial_proceeds_usd"] = round(float(trade["partial_proceeds_usd"]) + got_usd, 4)
         trade["shares_open"] = round(max(0.0, float(trade["shares_open"]) - sold), 4)
         pos.shares = trade["shares_open"]
         if float(trade["shares_open"]) >= 0.5:
@@ -595,7 +661,10 @@ class OracleSniperRunner:
             return
         won = bool(res.get("polymarket_won"))
         payout = 1.0 if won else 0.0
-        proceeds = float(trade.get("partial_proceeds_usd", 0.0)) + float(trade["shares_open"]) * payout
+        rem_proceeds = round(float(trade["shares_open"]) * payout, 4)
+        if self.policy.paper_simulation and rem_proceeds > 0.0:
+            self.ledger.paper_credit(rem_proceeds)
+        proceeds = float(trade.get("partial_proceeds_usd", 0.0)) + rem_proceeds
         info = {
             "exit_reason": f"SETTLED_{trade['side'] if won else ('DOWN' if trade['side'] == 'UP' else 'UP')}",
             "exit_price": payout, "exit_shares": float(trade["shares_open"]), "payout_per_share": payout,
@@ -604,7 +673,7 @@ class OracleSniperRunner:
             "provisional": bool(res.get("provisional", False)),
         }
         self._finish_trade(trade, info)
-        if won:
+        if won and not self.policy.paper_simulation:
             self._spawn(self._redeem_and_sync())
 
     async def _redeem_and_sync(self) -> None:
@@ -626,7 +695,8 @@ class OracleSniperRunner:
         self._spawn(self._notify(exit_message(closed, self._perf_lines()), "SNIPER_EXIT", str(closed["symbol"])))
         if alerts:
             self._spawn(self._notify(alert_message(alerts, self._perf_lines()), "SNIPER_ALERT", "SYSTEM"))
-        self._spawn(self.auto_trader.sync_live_wallet_balance(include_portfolio=True))
+        if not self.policy.paper_simulation:
+            self._spawn(self.auto_trader.sync_live_wallet_balance(include_portfolio=True))
 
     async def _notify(self, text: str, event_type: str, symbol: str) -> None:
         await self.notifier.dispatch_signal({
@@ -683,7 +753,8 @@ class OracleSniperRunner:
             pos_txt = "｜".join(f"{p.symbol[:3]} {p.side} {p.shares:.2f}股 @ ${p.entry_price:.3f}" for p in self._positions.values())
         else:
             pos_txt = "空倉（等待 150–255s 狙擊窗口）"
-        lines = [f"🎯 新策略｜Chainlink TWAP V2｜{state}", f"• 持倉（{len(self._positions)}/{self.policy.max_concurrent_positions}）：{pos_txt}"]
+        mode_hdr = "🧪 模擬盤 $43U" if self.policy.paper_simulation else "實盤"
+        lines = [f"🎯 新策略｜Chainlink TWAP V2・{mode_hdr}｜{state}", f"• 持倉（{len(self._positions)}/{self.policy.max_concurrent_positions}）：{pos_txt}"]
         for sym in SYMBOLS:
             d = self.diag.get(sym, {})
             if d.get("status") == "OK":

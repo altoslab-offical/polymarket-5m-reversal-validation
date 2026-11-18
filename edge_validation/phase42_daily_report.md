@@ -1,8 +1,9 @@
 # Section 4.2 Daily Monitoring Report (Read-Only, Pre-Registered 3 Configs, Bonferroni 98.3% CI)
 
-- Generated UTC: `2026-11-18T13:51:28Z`
+- Generated UTC: `2026-11-18T16:55:34Z`
+- Re-freeze count start boundary: `window_ts >= 1795021200`
 - Primary evaluation window boundary: `>= 2026-11-21T00:00:00Z` (`window_ts >= 1795219200`)
-- Windows recorded / settled: `204` / `197` | R1 TWAP parity: `0.9948`
+- Windows recorded / settled: `315` / `308` | R1 TWAP parity: `0.9934`
 
 ## Primary Gate (`post_nov21`) — Gate Pending Until `filled_1s >= 300`
 
@@ -17,22 +18,42 @@
 | Split | Signals | Filled +1s | Missed | Miss Rate | Filled WR | Missed Would-Win | Mean Spread t0 | Mean PnL +1s | 95% CI (Ref Only) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | `post_nov21` | 0 | 0 | 0 | None | None | None | None | None | `None` |
-| `pre_nov21` | 54 | 48 | 6 | 0.1111 | 0.8958 | 0.8333 | 0.01141 | 0.04759 | `[-0.01436, 0.09493]` |
+| `pre_nov21` | 0 | 0 | 0 | None | None | None | None | None | `None` |
+
+## Feed Freshness Distribution (`v2_filtered` Window 150–255s)
+
+| Feed | Samples | P50 (s) | P90 (s) | P99 (s) |
+|---|---:|---:|---:|---:|
+| `cl_twap` | 32094 | 0.0 | 0.0 | 0.0 |
+| `cl_spot` | 32094 | 0.0 | 0.0 | 0.0 |
+| `bn` | 32094 | 0.0 | 2.0 | 6.0 |
+| `book` | 32094 | 0.0 | 0.0 | 0.0 |
+
+## Signal Skip Breakdown (`v2_filtered` Window 150–255s)
+
+| Reason | Count |
+|---|---:|
+| `WARMUP` | 26803 |
+| `Z_LOW` | 3024 |
+| `FLOW_BLOCKED` | 910 |
+| `ASK_OUT_OF_BAND` | 811 |
+| `NO_BOOK` | 487 |
+| `STALE_BN` | 54 |
+
+## Depth vs Price Miss Ratio (`+1s` FAK) & Dual-Track Stop-Loss vs Hold-to-Settle
+
+| Scope / Model | Missed Total | `MISSED_DEPTH` | `MISSED_PRICE` | `pnl_with_sl` (Mean/sh) | `pnl_hold_to_settle` (Mean/sh) | SL Triggered (`wrong`) |
+|---|---:|---:|---:|---:|---:|---:|
+| `all / v2_pure` | 1 | 0 (0.0%) | 1 (100.0%) | 0.21769 | 0.07455 | 1 (0) |
+| `all / v2_filtered` | 1 | 0 (0.0%) | 1 (100.0%) | 0.17439 | -0.04031 | 1 (0) |
+| `all / v1` | 0 | 0 (0.0%) | 0 (0.0%) | 0.18072 | 0.2017 | 0 (0) |
 
 ## Primary Per-Coin (`post_nov21`)
 
 | Model | Coin | Signals | Filled +1s | Miss Rate | Mean Spread t0 | Filled WR | Missed Would-Win | Mean PnL +1s | 98.3% Bonferroni CI |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---|
 
-## Pre-Nov21 Baseline (`window_ts < 1795219200`)
+## Post-Reset Pre-Nov21 Baseline
 
 | Model | Coin | Signals | Filled +1s | Miss Rate | Mean Spread t0 | Filled WR | Missed Would-Win | Mean PnL +1s | 98.3% Bonferroni CI |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---|
-| `v2_pure` | `BTCUSDT` | 11 | 11 | 0.0 | 0.01273 | 0.9091 | None | 0.17558 | `[0.10526, 0.2404]` |
-| `v2_pure` | `ETHUSDT` | 8 | 5 | 0.375 | 0.01625 | 1.0 | 0.6667 | 0.23422 | `[0.18448, 0.28931]` |
-| `v2_pure` | `SOLUSDT` | 10 | 6 | 0.4 | 0.013 | 0.8333 | 1.0 | 0.05495 | `[-0.44506, 0.25809]` |
-| `v2_filtered` | `BTCUSDT` | 8 | 7 | 0.125 | 0.01125 | 1.0 | 1.0 | 0.19755 | `[0.12282, 0.27469]` |
-| `v2_filtered` | `ETHUSDT` | 4 | 3 | 0.25 | 0.0125 | 1.0 | 0.0 | 0.19177 | `[0.17852, 0.20834]` |
-| `v2_filtered` | `SOLUSDT` | 10 | 6 | 0.4 | 0.015 | 0.8333 | 1.0 | 0.05495 | `[-0.44506, 0.25809]` |
-| `v1` | `BTCUSDT` | 2 | 1 | 0.5 | 0.015 | 1.0 | 1.0 | 0.2099 | `None` |
-| `v1` | `SOLUSDT` | 1 | 0 | 1.0 | 0.01 | None | 1.0 | None | `None` |

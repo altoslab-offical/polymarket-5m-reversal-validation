@@ -23,13 +23,16 @@ from edge_validation.exploration_grid import (
     _variant_cfg_for,
     build_e4_diff_table,
     build_grid_variants,
+    compute_base_min_net_ev,
     compute_paired_stats,
     simulate_grid,
     summarize_variant,
     verify_all_primary_parity,
     verify_base_recorder_parity,
 )
-from engine.oracle_sniper import TWAP_V2_FILTERED_CONFIG
+from edge_validation.live_recorder_42 import NOV21_UTC_TS
+from edge_validation.run_daily_bundle import evaluate_day10_early_stop
+from engine.oracle_sniper import TWAP_V2_FILTERED_CONFIG, taker_fee_per_share
 from engine.signal_core import MarketInputs, evaluate as evaluate_signal
 
 
@@ -235,3 +238,46 @@ def test_paired_stats_and_194se_math() -> None:
     v = GridVariant("TEST", "T", "desc")
     sm = summarize_variant(v, df_v, df_b, span_days=1.0)
     assert abs(sm["null_194se"] - 1.94 * sm["se_pnl_sh"]) < 1e-4
+
+
+def test_f2_annotation_and_base_min_net_ev() -> None:
+    """Verify `F2` carries duplicate tag and `compute_base_min_net_ev` handles empty & mixed fills."""
+    by_code = {v.code: v for v in build_grid_variants()}
+    assert "與 BASE 相同" in by_code["F2"].description
+    empty_res = compute_base_min_net_ev(pd.DataFrame())
+    assert empty_res["n_all"] == 0 and empty_res["min_net_ev_all"] is None and empty_res["min_net_ev_filled"] is None
+
+    df_b = pd.DataFrame([
+        {"window_ts": 100, "symbol": "BTCUSDT", "side": "UP", "ask_t0": 0.82, "entry_p_true": 0.901, "entry_z": 1.30, "fee_rate": 0.05, "filled_1s": False},
+        {"window_ts": 400, "symbol": "ETHUSDT", "side": "DOWN", "ask_t0": 0.80, "entry_p_true": 0.910, "entry_z": 1.35, "fee_rate": 0.01, "filled_1s": True},
+    ])
+    ev_res = compute_base_min_net_ev(df_b)
+    exp_all = round(0.901 - (0.82 + taker_fee_per_share(0.82, 0.05)), 6)
+    exp_fill = round(0.910 - (0.80 + taker_fee_per_share(0.80, 0.01)), 6)
+    assert ev_res["n_all"] == 2 and ev_res["n_filled"] == 1
+    assert abs(ev_res["min_net_ev_all"] - exp_all) < 1e-6
+    assert abs(ev_res["min_net_ev_filled"] - exp_fill) < 1e-6
+
+
+def test_day10_early_stop_fail_only_rule() -> None:
+    """Verify Day-10 check triggers fail-only stop strictly when all 3 `CI_hi < +2c` after Day 10."""
+    low_cis = {"post_nov21": {
+        "v2_pure": {"filled_1s": 120, "mean_pnl_1s": 0.005, "ci98_3_bonferroni_1s": [-0.02, 0.019]},
+        "v2_filtered": {"filled_1s": 90, "mean_pnl_1s": 0.001, "ci98_3_bonferroni_1s": [-0.03, 0.015]},
+        "v1": {"filled_1s": 30, "mean_pnl_1s": -0.01, "ci98_3_bonferroni_1s": [-0.05, 0.018]},
+    }}
+    pre = evaluate_day10_early_stop(low_cis, now_ts=NOV21_UTC_TS + 9.5 * 86400)
+    assert pre["status"] == "PRE_DAY10"
+    stop = evaluate_day10_early_stop(low_cis, now_ts=NOV21_UTC_TS + 10.1 * 86400)
+    assert stop["status"] == "EARLY_STOP_INSUFFICIENT_EDGE"
+
+    one_strong = {"post_nov21": {
+        **low_cis["post_nov21"],
+        "v2_filtered": {"filled_1s": 100, "mean_pnl_1s": 0.12, "ci98_3_bonferroni_1s": [0.05, 0.20]},
+    }}
+    cont = evaluate_day10_early_stop(one_strong, now_ts=NOV21_UTC_TS + 10.5 * 86400)
+    assert cont["status"] == "CONTINUE_TO_300"
+
+    missing = {"post_nov21": {"v2_pure": low_cis["post_nov21"]["v2_pure"], "v2_filtered": {}, "v1": low_cis["post_nov21"]["v1"]}}
+    cont_missing = evaluate_day10_early_stop(missing, now_ts=NOV21_UTC_TS + 11.0 * 86400)
+    assert cont_missing["status"] == "CONTINUE_TO_300"

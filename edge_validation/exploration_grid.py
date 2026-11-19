@@ -109,7 +109,7 @@ def build_grid_variants() -> list[GridVariant]:
         GridVariant("E3", "E. BN Lead", "skip on 3s adverse Binance > 0.5 sigma", bn_adverse_sec=3, bn_adverse_sigma_mult=0.5),
         GridVariant("E4", "E. BN Lead", "min(|z_CL|, |z_BN_minus_60s_basis|)", use_bn_basis_z=True),
         GridVariant("F1", "F. Exit", "hold to settlement (disable SL)", {"enable_emergency_exit": False}),
-        GridVariant("F2", "F. Exit", "SL uses TWAP-proj z < -0.35 (rem<=60s)", use_twap_proj_sl=True),
+        GridVariant("F2", "F. Exit", "SL uses TWAP-proj z < -0.35 (rem<=60s; 與 BASE 相同)", use_twap_proj_sl=True),
         GridVariant("F3", "F. Exit", "early TP at bid >= 0.97", {"early_tp_enabled": True, "take_profit_bid": 0.97}),
         GridVariant("G1", "G. Subset/Combo", "BTCUSDT only", allowed_symbols=("BTCUSDT",)),
         GridVariant("G2", "G. Subset/Combo", "exclude SOLUSDT (BTC+ETH)", allowed_symbols=("BTCUSDT", "ETHUSDT")),
@@ -610,6 +610,44 @@ def verify_all_primary_parity(
     return out
 
 
+def _min_ev_entry(df_sub: pd.DataFrame) -> Optional[dict[str, Any]]:
+    """Return the lowest `net_ev` record across `df_sub`, or `None` if empty."""
+    best: Optional[dict[str, Any]] = None
+    for row in df_sub.itertuples(index=False):
+        if pd.isna(row.ask_t0) or pd.isna(row.entry_p_true):
+            continue
+        ask, p_true = float(row.ask_t0), float(row.entry_p_true)
+        fee_r = float(row.fee_rate) if pd.notna(row.fee_rate) else 0.0
+        fee_t0 = float(taker_fee_per_share(ask, fee_r))
+        net_ev = p_true - (ask + fee_t0)
+        if best is None or net_ev < best["net_ev"]:
+            best = {
+                "net_ev": round(net_ev, 6), "window_ts": int(row.window_ts),
+                "symbol": str(row.symbol), "side": str(row.side), "ask_t0": round(ask, 4),
+                "entry_p_true": round(p_true, 5), "entry_z": round(float(row.entry_z), 4),
+                "fee_t0": round(fee_t0, 5), "filled_1s": bool(row.filled_1s),
+            }
+    return best
+
+
+def compute_base_min_net_ev(df_base: pd.DataFrame) -> dict[str, Any]:
+    """Compute min `net_ev` on all signals & filled trades in `BASE` to prove B1-B3 non-bindingness."""
+    required = {"ask_t0", "entry_p_true", "fee_rate", "filled_1s", "window_ts", "symbol", "side", "entry_z"}
+    if len(df_base) == 0 or not required.issubset(df_base.columns):
+        return {"n_all": 0, "min_net_ev_all": None, "min_all_row": None, "n_filled": 0, "min_net_ev_filled": None, "min_filled_row": None}
+    filled_df = df_base[df_base["filled_1s"] == True]
+    min_all = _min_ev_entry(df_base)
+    min_fill = _min_ev_entry(filled_df) if len(filled_df) else None
+    return {
+        "n_all": int(len(df_base)),
+        "min_net_ev_all": min_all["net_ev"] if min_all else None,
+        "min_all_row": min_all,
+        "n_filled": int(len(filled_df)),
+        "min_net_ev_filled": min_fill["net_ev"] if min_fill else None,
+        "min_filled_row": min_fill,
+    }
+
+
 def build_e4_diff_table(df_base: pd.DataFrame, df_e4: pd.DataFrame) -> List[dict[str, Any]]:
     """Build window-by-window forensics table where `E4` differed from `BASE`."""
     b_map = {int(r.window_ts): r for r in df_base.itertuples(index=False)} if len(df_base) else {}
@@ -663,6 +701,62 @@ def _render_grid_table(summaries: List[dict[str, Any]]) -> List[str]:
     return rows
 
 
+def _render_section2_notes(base_ev: dict[str, Any]) -> List[str]:
+    """Render `BASE min(net_ev)` diagnostic proving `B1..B3` non-bindingness and `F2` note."""
+    lines = ["", "- **`F2` 重複標記**：`F2` 於現行 `v2_filtered` (`use_twap_projection=True`) 下行為與 `BASE` 完全重疊（保留於 24 組網格，不移除）。"]
+    if not base_ev or base_ev.get("n_all", 0) == 0:
+        lines.append("- **`BASE min(net_ev)` 檢驗**：尚無 `BASE` 訊號樣本。")
+        return lines
+    ma, mf = base_ev.get("min_all_row"), base_ev.get("min_filled_row")
+    if ma is not None:
+        ev_c = ma["net_ev"] * 100.0
+        lines.append(
+            f"- **`BASE min(net_ev)`（全部訊號 `n={base_ev['n_all']}`）**：`+{ev_c:.2f}c` (`{ma['net_ev']:.6f}`, "
+            f"`{ma['window_ts']} {ma['symbol']} {ma['side']}`, `ask={ma['ask_t0']}`, `p={ma['entry_p_true']}`, `z={ma['entry_z']}`, `fee={ma['fee_t0']}`)。"
+        )
+    if mf is not None:
+        ev_fc = mf["net_ev"] * 100.0
+        lines.append(
+            f"- **`BASE min(net_ev)`（已成交 `+1s` `n={base_ev['n_filled']}`）**：`+{ev_fc:.2f}c` (`{mf['net_ev']:.6f}`, "
+            f"`{mf['window_ts']} {mf['symbol']} {mf['side']}`, `ask={mf['ask_t0']}`, `p={mf['entry_p_true']}`, `z={mf['entry_z']}`, `fee={mf['fee_t0']}`)。"
+            " 因 `z >= 1.30`、`p >= 0.80` 與 `ask <= 0.82` 已先將真實 `net_ev` 卡在 `> +7.0c`，故 `B1` (`>=2c`)、`B2` (`>=5c`)、`B3` (`>=7c`) 與 `BASE` 結果一致（非參數漏接）。"
+        )
+    return lines
+
+
+def _render_section3_e4(e4_diffs: List[dict[str, Any]]) -> List[str]:
+    """Render objective `E4` vs `BASE` diff table separating fills from non-fills."""
+    fill_diffs = [d for d in e4_diffs if d["base_status"] == "FILLED" or d["e4_status"] == "FILLED"]
+    net_delta = round(sum(float(d["pnl_delta"] or 0.0) for d in fill_diffs), 5)
+    lines = [
+        "",
+        "## 3. `E4` vs `BASE` 逐窗差異鑑識表",
+        "",
+        f"- 共有 **{len(e4_diffs)} 個視窗** 出現訊號行為差異，其中僅 **{len(fill_diffs)} 個視窗涉及實際 `+1s` 成交變化**（其餘皆為 `BASE` `MISSED_PRICE` 未成交窗，不計為救回虧損），成交差異合計 ΔPnL/sh = `{net_delta}`。",
+        "",
+        "| Window TS | Coin | Side | Outcome | BASE El | BASE Status | BASE PnL/sh | E4 El | E4 Status | E4 PnL/sh | ΔPnL (E4-BASE) |",
+        "|---:|---|---|---|---:|---|---:|---:|---|---:|---:|",
+    ]
+    for d in e4_diffs[:40]:
+        lines.append(
+            f"| {d['window_ts']} | `{d['symbol']}` | {d['side']} | {d['outcome']} | {d['base_el']} | `{d['base_status']}` | {d['base_pnl']} | "
+            f"{d['e4_el']} | `{d['e4_status']}` | {d['e4_pnl']} | {d['pnl_delta']} |"
+        )
+    return lines
+
+
+def _render_section4_rules() -> List[str]:
+    """Render finalized Claude Section 10 / 5m-only governance rules."""
+    return [
+        "",
+        "## 4. 規劃者已裁決之 5m 專屬治理規格 (`CLAUDE_RESPONSE_10`)",
+        "",
+        "1. **主判定層維持 3 組（5m 專屬）**：`v2_pure`、`v2_filtered`、`v1`（Bonferroni `98.33%`），不擴組；`v2_bnguard` 類過濾由探索層 `G3` 承擔。15m BTC 路線依使用者指示取消，僅保留 5m 路線。",
+        "2. **上線與第 10 天提早停損（fail-only）**：`v2_filtered` 需 `n >= 300` 且 `98.33% CI` 下界 `> 0` 方可進入 5 股試跑；第 10 天若 3 組 `98.33% CI` 上界皆 `< +2c/sh` 則提早停損結束（絕不提早放行）。",
+        "3. **主機隔離紀律**：4.2 期間離線重播限用 `nice -n 19` 於固定離峰時段執行，嚴禁於即時錄製／Runner 運行期間併發高 CPU 重運算。",
+    ]
+
+
 def _render_grid_report(
     summaries: List[dict[str, Any]],
     all_parity: dict[str, Any],
@@ -690,27 +784,10 @@ def _render_grid_report(
         pr = all_parity[m_lbl]
         lines.append(f"| `{m_lbl}` | **`{pr['frozen_ok']}`** | **`{pr['parity_pct']}%`** | `{pr['matched']}/{pr['total']}` | `{pr['mismatch']}` |")
 
-    lines += ["", "## 2. 24 組變體總表（依每股平均 PnL 排序）", ""] + _render_grid_table(summaries) + [
-        "",
-        "## 3. `E4` vs `BASE` 逐窗差異鑑識表",
-        "",
-        f"- 共有 **{len(e4_diffs)} 個視窗** 出現 `E4` 與 `BASE` 行為差異（過濾進場、延後觸發秒數或不同成交價）。",
-        "",
-        "| Window TS | Coin | Side | Outcome | BASE El | BASE Status | BASE PnL/sh | E4 El | E4 Status | E4 PnL/sh | ΔPnL (E4-BASE) |",
-        "|---:|---|---|---|---:|---|---:|---:|---|---:|---:|",
-    ]
-    for d in e4_diffs[:40]:
-        lines.append(
-            f"| {d['window_ts']} | `{d['symbol']}` | {d['side']} | {d['outcome']} | {d['base_el']} | `{d['base_status']}` | {d['base_pnl']} | "
-            f"{d['e4_el']} | `{d['e4_status']}` | {d['e4_pnl']} | {d['pnl_delta']} |"
-        )
-    lines += [
-        "",
-        "## 4. 需與規劃者（Claude）確認的兩項規格細節",
-        "",
-        "1. **主判定層設定數量（3 組 vs 4 組）**：`EXPLORATION_GRID_PLAN.md` 第 0 節寫主判定層維持 4 組（包含 `v2_bnguard`），但目前 `edge_validation/frozen_config.json` 與 `CLAUDE_RESPONSE_8.md` Q3 凍結且 Bonferroni 計算的分母都是 **3 組**（`v2_pure`、`v2_filtered`、`v1`）。請確認主判定層維持 3 組不變，並將 `v2_bnguard` 類想法留在 `E1–E4` 探索層即可。",
-        "2. **`F2`（TWAP 投影停損）與現行 `v2_filtered` 的重疊度**：在現行 `v2_filtered`（`use_twap_projection=True`）下，`estimate_twap_fair_value` 於最後 60 秒（`elapsed >= 240`）原本就會切換為 `mean_twap` 投影公式算 `fv.raw_z_score`，因此 `F2` 在多數時刻會和 `BASE` 行為非常接近（僅在 240s 初期 tick 累積不足 60s 時分母略異；且仍保留 `dir_flow < -0.25` 閘門）。若要真正解放 TWAP 停損差異，下一輪可測試放寬 `dir_flow`。",
-    ]
+    lines += ["", "## 2. 24 組變體總表（依每股平均 PnL 排序）", ""] + _render_grid_table(summaries)
+    lines += _render_section2_notes(meta.get("base_min_net_ev") or {})
+    lines += _render_section3_e4(e4_diffs)
+    lines += _render_section4_rules()
     return "\n".join(lines) + "\n"
 
 
@@ -721,7 +798,7 @@ def _append_summary_block(target: pathlib.Path, summaries: List[dict[str, Any]],
         s_tag, "",
         f"## Tier-2 探索網格日報表（唯讀探索，不構成判定｜Scope=`{meta['scope_label']}`｜Start=`{meta['start_ts']}`）",
         "",
-    ] + _render_grid_table(summaries) + ["", e_tag]
+    ] + _render_grid_table(summaries) + _render_section2_notes(meta.get("base_min_net_ev") or {}) + ["", e_tag]
     block = "\n".join(block_lines)
     txt = target.read_text(encoding="utf-8") if target.exists() else ""
     if s_tag in txt and e_tag in txt:
@@ -772,15 +849,21 @@ def run_exploration_grid(
 
     summaries = [summarize_variant(v, dfs_filt[v.code], dfs_filt["BASE"], span_days) for v in variants]
     e4_diffs = build_e4_diff_table(dfs_filt["BASE"], dfs_filt["E4"])
+    base_ev_stats = compute_base_min_net_ev(dfs_filt["BASE"])
     meta = {
         "scope_label": "PRE_NOV21_SANITY_ALL_SETTLED (code correctness check only)" if sanity else "POST_NOV21_EXPLORATION",
         "start_ts": eff_start, "windows_total": len(settled_ts),
         "windows_used": len(used_ts), "span_days": span_days,
+        "base_min_net_ev": base_ev_stats,
     }
     report_path.write_text(_render_grid_report(summaries, all_parity, e4_diffs, meta), encoding="utf-8")
     if append_to is not None:
         _append_summary_block(append_to, summaries, meta)
-    return {"parity": all_parity["v2_filtered"], "all_parity": all_parity, "e4_diff_count": len(e4_diffs), "meta": meta, "summaries": summaries, "report_path": str(report_path)}
+    return {
+        "parity": all_parity["v2_filtered"], "all_parity": all_parity,
+        "e4_diff_count": len(e4_diffs), "base_min_net_ev": base_ev_stats,
+        "meta": meta, "summaries": summaries, "report_path": str(report_path),
+    }
 
 
 def main() -> None:

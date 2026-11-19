@@ -155,6 +155,7 @@ def write_frozen_config(
     fee_rate_override: float | None = None,
     git_sha_override: str | None = None,
     count_start_window_ts: int | None = None,
+    reset_note: str | None = None,
 ) -> dict[str, Any]:
     """Write frozen Section 4.2 parameters, SHA, fee schedule, and pre-registered gates."""
     sha, dirty = _resolve_git_sha(REPO)
@@ -170,6 +171,7 @@ def write_frozen_config(
         "git_sha": sha,
         "engine_dirty": dirty,
         "count_start_window_ts": start_wt,
+        "reset_note": str(reset_note or ""),
         "primary_eval_start_utc": "2026-11-21T00:00:00Z",
         "primary_eval_start_ts": NOV21_UTC_TS,
         "position_policy": "single_slot",
@@ -222,15 +224,20 @@ class CoinState42:
         self.bn_recv_mono_ms: float = 0.0
         self.bn_recv_wall_ms: float = 0.0
         self.bn_source_ts_ms: int = 0
-        self.bn_sec_bucket = 0
         self.bn_vol = self.bn_buy = self.bn_sell = 0.0
         self.bn_n = 0
+        self.up_bids_raw: Dict[float, float] = {}
+        self.up_asks_raw: Dict[float, float] = {}
+        self.dn_bids_raw: Dict[float, float] = {}
+        self.dn_asks_raw: Dict[float, float] = {}
         self.up_bids: List[Tuple[float, float]] = []
         self.up_asks: List[Tuple[float, float]] = []
         self.dn_bids: List[Tuple[float, float]] = []
         self.dn_asks: List[Tuple[float, float]] = []
         self.up_book_ts: float = 0.0
         self.dn_book_ts: float = 0.0
+        self.up_ev_ts_ms: int = 0
+        self.dn_ev_ts_ms: int = 0
         self.up_recv_mono_ms: float = 0.0
         self.up_recv_wall_ms: float = 0.0
         self.up_source_ts_ms: int = 0
@@ -239,19 +246,40 @@ class CoinState42:
         self.dn_source_ts_ms: int = 0
 
     def reset_window(self, window_ts: int) -> None:
-        """Reset market tokens and top-5 orderbooks on window rollover."""
+        """Reset market tokens and full-depth orderbooks on window rollover."""
         self.window_ts = window_ts
         self.slug = f"{COIN_MAP[self.symbol]}-updown-5m-{window_ts}"
         self.condition_id = self.up_token = self.down_token = ""
+        self.up_bids_raw.clear()
+        self.up_asks_raw.clear()
+        self.dn_bids_raw.clear()
+        self.dn_asks_raw.clear()
         self.up_bids.clear()
         self.up_asks.clear()
         self.dn_bids.clear()
         self.dn_asks.clear()
         self.up_book_ts = 0.0
         self.dn_book_ts = 0.0
+        self.up_ev_ts_ms = self.dn_ev_ts_ms = 0
         self.up_recv_mono_ms = self.up_recv_wall_ms = 0.0
         self.dn_recv_mono_ms = self.dn_recv_wall_ms = 0.0
         self.up_source_ts_ms = self.dn_source_ts_ms = 0
+
+    def flush_bn_bucket(self) -> Tuple[float, float, float, int]:
+        """Atomically read and reset accumulated Binance trades since previous 1Hz snapshot."""
+        vals = (self.bn_vol, self.bn_buy, self.bn_sell, self.bn_n)
+        self.bn_vol = self.bn_buy = self.bn_sell = 0.0
+        self.bn_n = 0
+        return vals
+
+    def refresh_top_levels(self, side: str) -> None:
+        """Project full-depth book maps down to sorted top-10 lists for 1Hz snapshot/eval."""
+        if side == "UP":
+            self.up_bids = sorted(self.up_bids_raw.items(), key=lambda t: t[0], reverse=True)[:10]
+            self.up_asks = sorted(self.up_asks_raw.items(), key=lambda t: t[0])[:10]
+        else:
+            self.dn_bids = sorted(self.dn_bids_raw.items(), key=lambda t: t[0], reverse=True)[:10]
+            self.dn_asks = sorted(self.dn_asks_raw.items(), key=lambda t: t[0])[:10]
 
 
 class LiveRecorder42:
@@ -320,9 +348,6 @@ class LiveRecorder42:
         if "p" not in data or "q" not in data:
             return
         px, qty = float(data["p"]), float(data["q"])
-        ts_s = int(now_r)
-        if ts_s != st.bn_sec_bucket:
-            st.bn_sec_bucket, st.bn_vol, st.bn_buy, st.bn_sell, st.bn_n = ts_s, 0.0, 0.0, 0.0, 0
         st.bn_last_px = px
         st.bn_last_ts = now_r
         st.bn_vol += qty
@@ -352,80 +377,83 @@ class LiveRecorder42:
             v = float(raw_ts)
         except (TypeError, ValueError):
             return 0
-        if v <= 0.0:
-            return 0
-        return int(round(v if v > 1e11 else v * 1000.0))
+        return int(round(v if v > 1e11 else v * 1000.0)) if v > 0.0 else 0
 
-    def _apply_book(self, token_id: str, bids_raw: Any, asks_raw: Any, source_ts_ms: int = 0) -> None:
+    @staticmethod
+    def _parse_book_dict(raw_lvls: Any) -> Dict[float, float]:
+        out: Dict[float, float] = {}
+        for x in raw_lvls or ():
+            px, sz = float(x.get("price") or 0), float(x.get("size") or 0)
+            if sz > 0.0 and 0.0 < px < 1.0:
+                out[px] = sz
+        return out
+
+    @staticmethod
+    def _stamp_book_recv(st: CoinState42, side: str, ts_tuple: Tuple[float, float, int, bool]) -> None:
+        now_m, now_r, src_ms, via_ws = ts_tuple
+        if side == "UP":
+            st.up_book_ts = now_r
+            st.up_recv_mono_ms, st.up_recv_wall_ms = now_m, now_r * 1000.0
+            if src_ms > 0:
+                st.up_ev_ts_ms = max(st.up_ev_ts_ms, src_ms)
+            if via_ws and src_ms > 0:
+                st.up_source_ts_ms = src_ms
+        else:
+            st.dn_book_ts = now_r
+            st.dn_recv_mono_ms, st.dn_recv_wall_ms = now_m, now_r * 1000.0
+            if src_ms > 0:
+                st.dn_ev_ts_ms = max(st.dn_ev_ts_ms, src_ms)
+            if via_ws and src_ms > 0:
+                st.dn_source_ts_ms = src_ms
+
+    def _apply_book(
+        self, token_id: str, bids_raw: Any, asks_raw: Any, source_ts_ms: int = 0, via_ws: bool = True
+    ) -> None:
         meta = self.token_to_meta.get(token_id)
         if not meta:
             return
         sym, side = meta
         st = self.states[sym]
-        now_m = time.monotonic_ns() / 1_000_000.0
-        now_r = time.time()
+        held_ev = st.up_ev_ts_ms if side == "UP" else st.dn_ev_ts_ms
+        if source_ts_ms > 0 and source_ts_ms < held_ev - 50:
+            return
+        now_m, now_r = time.monotonic_ns() / 1_000_000.0, time.time()
         if bids_raw is not None:
-            lv = sorted([(float(x["price"]), float(x["size"])) for x in bids_raw if float(x.get("size", 0)) > 0], key=lambda t: t[0], reverse=True)[:10]
-            if side == "UP":
-                st.up_bids = lv
-            else:
-                st.dn_bids = lv
+            setattr(st, "up_bids_raw" if side == "UP" else "dn_bids_raw", self._parse_book_dict(bids_raw))
         if asks_raw is not None:
-            lv = sorted([(float(x["price"]), float(x["size"])) for x in asks_raw if float(x.get("size", 0)) > 0], key=lambda t: t[0])[:10]
-            if side == "UP":
-                st.up_asks = lv
-            else:
-                st.dn_asks = lv
-        if side == "UP":
-            st.up_book_ts = now_r
-            st.up_recv_mono_ms, st.up_recv_wall_ms = now_m, now_r * 1000.0
-            if source_ts_ms > 0:
-                st.up_source_ts_ms = source_ts_ms
-        else:
-            st.dn_book_ts = now_r
-            st.dn_recv_mono_ms, st.dn_recv_wall_ms = now_m, now_r * 1000.0
-            if source_ts_ms > 0:
-                st.dn_source_ts_ms = source_ts_ms
+            setattr(st, "up_asks_raw" if side == "UP" else "dn_asks_raw", self._parse_book_dict(asks_raw))
+        st.refresh_top_levels(side)
+        self._stamp_book_recv(st, side, (now_m, now_r, source_ts_ms, via_ws))
 
     def _apply_price_change(self, msg: dict[str, Any]) -> None:
-        now_m = time.monotonic_ns() / 1_000_000.0
-        now_r = time.time()
+        now_m, now_r = time.monotonic_ns() / 1_000_000.0, time.time()
         top_src = self._parse_src_ms(msg.get("timestamp"))
-        for ch in msg.get("price_changes") or []:
-            tok = str(ch.get("asset_id") or "")
-            meta = self.token_to_meta.get(tok)
+        if top_src > 0 and (now_r * 1000.0 - top_src) > 2500.0:
+            return
+        touched: Dict[Tuple[str, str], int] = {}
+        for ch in msg.get("price_changes") or ():
+            meta = self.token_to_meta.get(str(ch.get("asset_id") or ""))
             px, sz = float(ch.get("price") or 0), float(ch.get("size") or 0)
-            if not meta or px <= 0:
+            if not meta or not 0.0 < px < 1.0:
                 continue
             sym, side = meta
-            st, b_side = self.states[sym], str(ch.get("side") or "").upper()
+            st = self.states[sym]
             src_ms = top_src or self._parse_src_ms(ch.get("timestamp"))
-            if b_side == "BUY":
-                lv = dict(st.up_bids if side == "UP" else st.dn_bids)
-                if sz <= 0:
-                    lv.pop(px, None)
-                else:
-                    lv[px] = sz
-                res = sorted(lv.items(), key=lambda t: t[0], reverse=True)[:10]
-                setattr(st, "up_bids" if side == "UP" else "dn_bids", res)
-            elif b_side == "SELL":
-                lv = dict(st.up_asks if side == "UP" else st.dn_asks)
-                if sz <= 0:
-                    lv.pop(px, None)
-                else:
-                    lv[px] = sz
-                res = sorted(lv.items(), key=lambda t: t[0])[:10]
-                setattr(st, "up_asks" if side == "UP" else "dn_asks", res)
-            if side == "UP":
-                st.up_book_ts = now_r
-                st.up_recv_mono_ms, st.up_recv_wall_ms = now_m, now_r * 1000.0
-                if src_ms > 0:
-                    st.up_source_ts_ms = src_ms
-            else:
-                st.dn_book_ts = now_r
-                st.dn_recv_mono_ms, st.dn_recv_wall_ms = now_m, now_r * 1000.0
-                if src_ms > 0:
-                    st.dn_source_ts_ms = src_ms
+            held_ev = st.up_ev_ts_ms if side == "UP" else st.dn_ev_ts_ms
+            if src_ms > 0 and src_ms < held_ev - 50:
+                continue
+            b_side = str(ch.get("side") or "").upper()
+            target = (st.up_bids_raw if side == "UP" else st.dn_bids_raw) if b_side == "BUY" else (
+                (st.up_asks_raw if side == "UP" else st.dn_asks_raw) if b_side == "SELL" else None
+            )
+            if target is None:
+                continue
+            target.pop(px, None) if sz <= 0.0 else target.__setitem__(px, sz)
+            touched[(sym, side)] = max(touched.get((sym, side), 0), src_ms)
+        for (sym, side), src_ms in touched.items():
+            st = self.states[sym]
+            st.refresh_top_levels(side)
+            self._stamp_book_recv(st, side, (now_m, now_r, src_ms, True))
 
     def _handle_clob_msg(self, raw: str) -> None:
         if not raw or raw in ("PING", "PONG"):
@@ -436,7 +464,9 @@ class LiveRecorder42:
                 continue
             ev_type = str(m.get("event_type") or "")
             if ev_type == "book" and m.get("asset_id"):
-                self._apply_book(str(m["asset_id"]), m.get("bids"), m.get("asks"), self._parse_src_ms(m.get("timestamp")))
+                src_ms = self._parse_src_ms(m.get("timestamp"))
+                if src_ms <= 0 or (time.time() * 1000.0 - src_ms) <= 2500.0:
+                    self._apply_book(str(m["asset_id"]), m.get("bids"), m.get("asks"), src_ms, via_ws=True)
             elif ev_type == "price_change":
                 self._apply_price_change(m)
             elif ev_type == "last_trade_price" and m.get("asset_id"):
@@ -453,10 +483,10 @@ class LiveRecorder42:
                 continue
             self._clob_resub.clear()
             try:
-                async with websockets.connect(CLOB_WS, open_timeout=8.0, ping_interval=20.0) as ws:
+                async with websockets.connect(CLOB_WS, open_timeout=8.0, ping_interval=15.0, ping_timeout=10.0, max_queue=4096) as ws:
                     await ws.send(json.dumps({"assets_ids": assets, "type": "market"}))
                     while not self._stop.is_set() and not self._clob_resub.is_set():
-                        self._handle_clob_msg(await asyncio.wait_for(ws.recv(), timeout=15.0))
+                        self._handle_clob_msg(await asyncio.wait_for(ws.recv(), timeout=12.0))
             except asyncio.CancelledError:
                 raise
             except (websockets.WebSocketException, asyncio.TimeoutError, OSError, ValueError) as exc:
@@ -486,19 +516,19 @@ class LiveRecorder42:
         return changed
 
     async def _fill_empty_rest_books(self, client: httpx.AsyncClient, st: CoinState42) -> None:
-        now_r = time.time()
-        for tok, empty, b_ts in (
-            (st.up_token, not st.up_asks, st.up_book_ts),
-            (st.down_token, not st.dn_asks, st.dn_book_ts),
+        now_m = time.monotonic_ns() / 1_000_000.0
+        for tok, empty, m_ts in (
+            (st.up_token, not st.up_asks, st.up_recv_mono_ms),
+            (st.down_token, not st.dn_asks, st.dn_recv_mono_ms),
         ):
-            stale = b_ts <= 0.0 or (now_r - b_ts) >= 2.2
+            stale = m_ts <= 0.0 or (now_m - m_ts) >= 2500.0
             if not tok or not (empty or stale):
                 continue
             try:
                 rb = await client.get(CLOB_BOOK_URL, params={"token_id": tok}, timeout=3.0)
                 if rb.status_code == 200:
                     bk = rb.json()
-                    self._apply_book(tok, bk.get("bids"), bk.get("asks"), self._parse_src_ms(bk.get("timestamp")))
+                    self._apply_book(tok, bk.get("bids"), bk.get("asks"), self._parse_src_ms(bk.get("timestamp")), via_ws=False)
             except (httpx.HTTPError, ValueError) as exc:
                 LOG.debug("REST /book fallback failed %s: %s", tok[:10], exc)
 
@@ -568,9 +598,10 @@ class LiveRecorder42:
             tw_s = self.chainlink.get_settlement_twap_at(sym, cur_t)
             sp_s = self.chainlink.bucket_opens[sym].get(cur_t, (None, 0))[0]
             self._upsert_window_row(cur_t, elapsed, sym, st, tw_s, sp_s)
+            bn_flush = st.flush_bn_bucket()
             ms_metrics = (tw_ms_v, sp_ms_v, bn_ms_v, up_ms_v, dn_ms_v, tw_lag, sp_lag, bn_lag, up_lag, dn_lag)
-            self._insert_snapshot_row(ts_sec, cur_t, elapsed, sym, st, (cl_spot, cl_twap, tw_age, sp_age, bn_age, up_age, dn_age, ms_metrics))
-            dec, ages = self._eval_live_symbol(ts_sec, cur_t, sym, st, (cl_spot, cl_twap, tw_age, sp_age, bn_age, up_age, dn_age, tw_s))
+            self._insert_snapshot_row(ts_sec, cur_t, elapsed, sym, st, (cl_spot, cl_twap, tw_age, sp_age, bn_age, up_age, dn_age, ms_metrics, bn_flush))
+            dec, ages = self._eval_live_symbol(ts_sec, cur_t, sym, st, (cl_spot, cl_twap, tw_age, sp_age, bn_age, up_age, dn_age, tw_s, bn_flush))
             if dec.action == "ENTER":
                 self.con.execute(
                     "INSERT OR IGNORE INTO signal_enters_42 (ts_sec,window_ts,symbol,model_name,side,z,p_model,sigma,ask_top,cl_twap_age_sec,cl_spot_age_sec,bn_age_sec,book_age_sec) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -613,12 +644,12 @@ class LiveRecorder42:
                 self.con.execute("UPDATE windows_42 SET twap_close = COALESCE(twap_close, ?) WHERE window_ts=? AND symbol=?", (tw_c, prev_t, sym))
 
     def _insert_snapshot_row(self, ts_sec: int, cur_t: int, elapsed: int, sym: str, st: CoinState42, feed_vals: Tuple[Any, ...]) -> None:
-        cl_spot, cl_twap, tw_age, sp_age, bn_age, up_age, dn_age, ms_metrics = feed_vals
+        cl_spot, cl_twap, tw_age, sp_age, bn_age, up_age, dn_age, ms_metrics, bn_flush = feed_vals
         u_b1 = st.up_bids[0] if st.up_bids else (None, None)
         u_a1 = st.up_asks[0] if st.up_asks else (None, None)
         d_b1 = st.dn_bids[0] if st.dn_bids else (None, None)
         d_a1 = st.dn_asks[0] if st.dn_asks else (None, None)
-        same_sec = st.bn_sec_bucket == ts_sec
+        b_vol, b_buy, b_sell, b_n = bn_flush
         self.con.execute(
             """
             INSERT OR REPLACE INTO snapshots_1hz (
@@ -633,8 +664,7 @@ class LiveRecorder42:
             """,
             (
                 ts_sec, cur_t, sym, elapsed, cl_spot, cl_twap, st.bn_last_px,
-                st.bn_vol if same_sec else 0.0, st.bn_buy if same_sec else 0.0,
-                st.bn_sell if same_sec else 0.0, st.bn_n if same_sec else 0,
+                b_vol, b_buy, b_sell, b_n,
                 json.dumps(st.up_bids), json.dumps(st.up_asks), json.dumps(st.dn_bids), json.dumps(st.dn_asks),
                 u_b1[0], u_b1[1], u_a1[0], u_a1[1], d_b1[0], d_b1[1], d_a1[0], d_a1[1],
                 round(tw_age, 3), round(sp_age, 3), round(bn_age, 3), round(up_age, 3), round(dn_age, 3),
@@ -643,13 +673,15 @@ class LiveRecorder42:
         )
 
     def _eval_live_symbol(self, ts_sec: int, cur_t: int, sym: str, st: CoinState42, vals: Tuple[Any, ...]) -> Tuple[SignalDecision, Dict[str, float]]:
-        cl_spot, cl_twap, tw_age, sp_age, bn_age, up_age, dn_age, tw_s = vals
+        cl_spot, cl_twap, tw_age, sp_age, bn_age, up_age, dn_age, tw_s, bn_flush = vals
+        _, b_buy, b_sell, b_n = bn_flush
         tr = self.micro[sym]
-        same_sec = st.bn_sec_bucket == ts_sec
         px = float(st.bn_last_px) if st.bn_last_px else None
-        buy_u = (st.bn_buy * px) if (same_sec and px) else 0.0
-        sell_u = (st.bn_sell * px) if (same_sec and px) else 0.0
-        tr.ingest_bn_1s(ts_sec, px if bn_age <= 5.0 else None, buy_u, sell_u, real_trade=same_sec)
+        has_tr = bool(b_n > 0 and px is not None)
+        buy_u = (b_buy * px) if has_tr else 0.0
+        sell_u = (b_sell * px) if has_tr else 0.0
+        feed_alive = bool(px is not None and bn_age <= 5.0)
+        tr.ingest_bn_1s(ts_sec, px if feed_alive else None, buy_u, sell_u, real_trade=has_tr, feed_alive=feed_alive)
         gap = tr.update_basis_1s(ts_sec, cl_spot, tr.prices[-1] if tr.prices else px)
         tr.record_cl_240(cur_t, ts_sec, cl_spot)
         cvd, flow = tr.get_orderflow_metrics(ts_sec)
@@ -676,7 +708,7 @@ class LiveRecorder42:
                     if duration_sec > 0 and (t0 - t_start) >= duration_sec:
                         break
                     self._record_second(int(t0))
-                    await asyncio.sleep(max(0.05, 1.0 - (time.time() - t0)))
+                    await asyncio.sleep(max(0.05, float(int(t0)) + 1.05 - time.time()))
             finally:
                 self._stop.set()
                 for t in tasks:
@@ -775,6 +807,7 @@ def assemble_recorder_inputs(
         elif key not in state.strikes and elapsed > 8 and wm and pd.notna(wm.twap_strike):
             state.strikes[key] = float(wm.twap_strike)
         strike = state.strikes.get(key)
+        ages = _row_ages(row, s, t_sec, state, strike, cl_spot)
         tr = state.trackers[s]
         prev_bn = state.prev_vals[s].get("bn_vol_px")
         bn_upd = bool(bn_px is not None and (int(getattr(row, "bn_trades", 0) or 0) > 0 or bn_px != prev_bn))
@@ -783,12 +816,12 @@ def assemble_recorder_inputs(
         has_tr = bool(int(getattr(row, "bn_trades", 0) or 0) > 0 and bn_px is not None)
         buy_u = (float(row.bn_buy_vol or 0.0) * bn_px) if (has_tr and bn_px) else 0.0
         sell_u = (float(row.bn_sell_vol or 0.0) * bn_px) if (has_tr and bn_px) else 0.0
-        tr.ingest_bn_1s(t_sec, bn_px, buy_u, sell_u, real_trade=bn_upd)
-        bn_px_eff = tr.prices[-1] if tr.prices else (bn_px if bn_upd else None)
+        feed_alive = bool(bn_px is not None and ages["bn"] <= 5.0)
+        tr.ingest_bn_1s(t_sec, bn_px if (bn_upd or feed_alive) else None, buy_u, sell_u, real_trade=bn_upd, feed_alive=feed_alive)
+        bn_px_eff = tr.prices[-1] if tr.prices else (bn_px if (bn_upd or feed_alive) else None)
         gap = tr.update_basis_1s(t_sec, cl_spot, bn_px_eff)
         tr.record_cl_240(int(T), t_sec, cl_spot)
         cvd, flow = tr.get_orderflow_metrics(t_sec)
-        ages = _row_ages(row, s, t_sec, state, strike, cl_spot)
         r240 = tr.get_realized_twap_240(int(T), t_sec, fallback_spot=cl_spot)
         up_asks = _parse_levels_json(getattr(row, "up_asks_json", None), reverse=False)
         dn_asks = _parse_levels_json(getattr(row, "down_asks_json", None), reverse=False)
@@ -1285,6 +1318,16 @@ def _append_r1_and_shadow_tables(lines: List[str], report: Dict[str, Any]) -> No
         lines.append(f"| {m['window_ts']} | `{m['symbol']}` | `{m['slug']}` | {m['twap_strike']:.6f} | {m['twap_close']:.6f} | {m['gamma_price_to_beat']} | {m['gamma_final_price']} | `{m['resolved_outcome']}` | `{m['pred']}` |")
 
 
+def _read_parity_enter_summary(out_dir: pathlib.Path) -> str:
+    for cand in (out_dir / "parity_replay_report.md", pathlib.Path(__file__).with_name("parity_replay_report.md")):
+        if not cand.exists():
+            continue
+        for line in cand.read_text(encoding="utf-8").splitlines():
+            if "Coin-window signal union (`ENTER`):" in line:
+                return line.split(":", 1)[1].strip()
+    return ""
+
+
 def _write_daily_report_md(report: Dict[str, Any], out_dir: pathlib.Path) -> pathlib.Path:
     r1 = report.get("r1_diagnostics") or {}
     lines = [
@@ -1294,6 +1337,12 @@ def _write_daily_report_md(report: Dict[str, Any], out_dir: pathlib.Path) -> pat
         f"- Re-freeze count start boundary: `window_ts >= {report.get('count_start_window_ts', 0)}`",
         f"- Primary evaluation window boundary: `>= 2026-11-21T00:00:00Z` (`window_ts >= {report['primary_eval_window_ts']}`)",
         f"- Windows recorded / settled: `{report['windows_recorded']}` / `{report['windows_settled']}` | R1 TWAP parity (all): `{r1.get('parity_all')}` (`{r1.get('matched_all')}/{r1.get('total_all')}`) | post-reset: `{r1.get('parity_post_reset')}` (`{r1.get('matched_post_reset')}/{r1.get('total_post_reset')}`)",
+    ]
+    if report.get("reset_note"):
+        lines.append(f"- Reset note: `{report['reset_note']}`")
+    if report.get("parity_enter_summary"):
+        lines.append(f"- Cumulative ENTER parity (`parity_replay`): {report['parity_enter_summary']}")
+    lines += [
         "",
         "## Primary Gate (`post_nov21`) — Gate Pending Until `filled_1s >= 300`",
         "",
@@ -1311,11 +1360,12 @@ def _write_daily_report_md(report: Dict[str, Any], out_dir: pathlib.Path) -> pat
     _append_diagnostics_sections(lines, report)
     for sec_name in ("post_nov21", "pre_nov21"):
         sec_title = "Primary Per-Coin (`post_nov21`)" if sec_name == "post_nov21" else "Post-Reset Pre-Nov21 Baseline"
-        lines += ["", f"## {sec_title}", "", "| Model | Coin | Signals | Filled +1s | Miss Rate | Mean Spread t0 | Filled WR | Missed Would-Win | Mean PnL +1s | 98.3% Bonferroni CI |", "|---|---|---:|---:|---:|---:|---:|---:|---:|---|"]
+        lines += ["", f"## {sec_title}", "", "| Model | Coin | Signals | Filled +1s | Missed | Miss Rate | Mean Spread t0 | Filled WR | Missed Would-Win | Mean PnL +1s | 98.3% Bonferroni CI |", "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
         for lbl, st in report[sec_name].items():
             for sym, cs in (st.get("by_coin") or {}).items():
+                missed_c = cs.get("missed_1s", int(cs["signals"]) - int(cs["filled_1s"]))
                 lines.append(
-                    f"| `{lbl}` | `{sym}` | {cs['signals']} | {cs['filled_1s']} | {cs['miss_rate']} | "
+                    f"| `{lbl}` | `{sym}` | {cs['signals']} | {cs['filled_1s']} | {missed_c} | {cs['miss_rate']} | "
                     f"{cs['mean_spread_t0']} | {cs['wr_1s']} | {cs['missed_would_win_rate']} | "
                     f"{cs['mean_pnl_1s']} | `{cs['ci98_3_bonferroni_1s']}` |"
                 )
@@ -1393,6 +1443,8 @@ def analyze_recording(
         "windows_recorded": int(len(df_w)), "windows_settled": int(len(settled)),
         "r1_twap_parity": r1_diag["parity_all"], "r1_diagnostics": r1_diag,
         "count_start_window_ts": count_start_ts, "primary_eval_window_ts": primary_ts,
+        "reset_note": str(frozen.get("reset_note") or ""),
+        "parity_enter_summary": _read_parity_enter_summary(out_dir),
         "signals_total_post_nov21": v2_post["signals"],
         "filled_1s_post_nov21": v2_post["filled_1s"], "mean_pnl_per_share_1s_post_nov21": v2_post["mean_pnl_1s"],
         "post_nov21": post_summaries, "pre_nov21": pre_summaries, "all_combined": combined, "shadow": shadow_out,
@@ -1414,12 +1466,13 @@ def main() -> None:
     ap.add_argument("--freeze-config", action="store_true", help="Write frozen_config.json and exit")
     ap.add_argument("--git-sha", type=str, default="", help="Override git SHA stored in frozen_config.json")
     ap.add_argument("--count-start-ts", type=int, default=0, help="Override count_start_window_ts")
+    ap.add_argument("--reset-note", type=str, default="", help="Reset reason stored in frozen_config.json")
     ap.add_argument("--analyze", action="store_true", help="Run +1s/+2s offline fill simulation")
     ap.add_argument("--daily-report", action="store_true", help="Write phase42_daily_report.md during --analyze")
     args = ap.parse_args()
     if args.freeze_config:
-        cfg = write_frozen_config(git_sha_override=args.git_sha or None, count_start_window_ts=args.count_start_ts or None)
-        print(json.dumps({"frozen_config_written": str(FROZEN_CFG_PATH), "git_sha": cfg["git_sha"], "count_start_window_ts": cfg["count_start_window_ts"]}, indent=2))
+        cfg = write_frozen_config(git_sha_override=args.git_sha or None, count_start_window_ts=args.count_start_ts or None, reset_note=args.reset_note or None)
+        print(json.dumps({"frozen_config_written": str(FROZEN_CFG_PATH), "git_sha": cfg["git_sha"], "count_start_window_ts": cfg["count_start_window_ts"], "reset_note": cfg["reset_note"]}, indent=2))
         return
     if args.analyze:
         print(json.dumps(analyze_recording(args.db, daily_report=args.daily_report), indent=2))

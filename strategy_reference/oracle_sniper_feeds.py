@@ -193,12 +193,15 @@ class SymbolState:
             self.bn_cur_buy_usd += notional
         self.micro.ingest_bn_1s(sec, price, self.bn_cur_buy_usd, self.bn_cur_sell_usd, real_trade=True)
 
-    def sync_micro_at(self, now: float, cl_spot: Optional[float], window_ts: int) -> None:
+    def sync_micro_at(
+        self, now: float, cl_spot: Optional[float], window_ts: int, bn_age_sec: Optional[float] = None
+    ) -> None:
         """Ensure 1Hz Binance history, EWMA basis, and T+240s TWAP are stepped at second `int(now)`."""
         sec = int(now)
         if self.bn_cur_sec < sec:
-            fresh = self.bn_last_close is not None and (now - self.binance_ts) <= float(MAX_GAP_FILL_SEC)
-            self.micro.ingest_bn_1s(sec, self.bn_last_close if fresh else None, 0.0, 0.0, real_trade=False)
+            age_eff = float(bn_age_sec) if bn_age_sec is not None else ((now - self.binance_ts) if self.binance_ts > 0.0 else 9999.0)
+            fresh = self.bn_last_close is not None and age_eff <= float(MAX_GAP_FILL_SEC)
+            self.micro.ingest_bn_1s(sec, self.bn_last_close if fresh else None, 0.0, 0.0, real_trade=False, feed_alive=fresh)
         bn_for_basis = self.micro.prices[-1] if self.micro.prices else self.binance_price
         self.micro.update_basis_1s(sec, cl_spot, bn_for_basis)
         self.micro.record_cl_240(window_ts, sec, cl_spot)
@@ -414,10 +417,13 @@ class SniperMarketHub:
             st.record_bn_recv(m_ms, w_ms, src_ms)
             st.ingest_binance_trade(now, float(data["p"]), float(data["q"]), bool(data["m"]))
         elif "bookTicker" in stream:
-            # Refresh freshness timestamp only; never mix bookTicker mid/OBI into Binance-1s model vol or flow.
+            # Refresh freshness timestamp only; seed close before first trade without mixing BBO mid into vol/flow.
             st.record_bn_recv(m_ms, w_ms, src_ms)
             bid, ask = float(data["b"]), float(data["a"])
-            st.binance_price, st.binance_ts = 0.5 * (bid + ask), now
+            mid = 0.5 * (bid + ask)
+            st.binance_price, st.binance_ts = mid, now
+            if st.bn_last_close is None and mid > 0.0:
+                st.bn_last_close = mid
 
     async def _binance_ws_loop(self) -> None:
         while not self._stop.is_set():

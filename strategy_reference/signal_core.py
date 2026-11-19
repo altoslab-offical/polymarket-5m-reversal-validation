@@ -250,7 +250,7 @@ def compute_z_twap_proj_diagnostic(
     a = max(0.0, min(59.5, float(realized_240[1])))
     r = max(0.5, float(remaining_sec))
     mean_src = float(realized_240[0]) if (realized_240[0] and realized_240[0] > 0.0) else cl_spot
-    mean_end = (a * mean_src + r * cl_spot) / 60.0
+    mean_end = (a * mean_src + r * cl_spot) / max(1e-6, a + r)
     sigma_px = max(1e-7, float(sigma_1s)) * strike
     sd_end = max(1e-9, (r / 60.0) * sigma_px * math.sqrt(r / 3.0))
     sign = 1.0 if side == "UP" else -1.0
@@ -284,16 +284,23 @@ class Bn1sMicroTracker:
         self._twap_240: dict[int, list[tuple[int, float]]] = {}
 
     def ingest_bn_1s(
-        self, ts_sec: int, bn_close: Optional[float], buy_usd: float = 0.0, sell_usd: float = 0.0, real_trade: bool = True
+        self,
+        ts_sec: int,
+        bn_close: Optional[float],
+        buy_usd: float = 0.0,
+        sell_usd: float = 0.0,
+        real_trade: bool = True,
+        feed_alive: bool = False,
     ) -> None:
-        """Record 1Hz Binance close with <=5s gap-fill; any >5s gap resets contiguous warmup history."""
+        """Record 1Hz Binance close; keep history while trade or quote heartbeat is alive (<=5s gap)."""
+        alive = bool(real_trade or feed_alive)
         if real_trade and (buy_usd > 0.0 or sell_usd > 0.0):
             if self._trades_1s and self._trades_1s[-1][0] == ts_sec:
                 self._trades_1s[-1] = (ts_sec, buy_usd, sell_usd)
             elif not self._trades_1s or ts_sec > self._trades_1s[-1][0]:
                 self._trades_1s.append((ts_sec, buy_usd, sell_usd))
             self._prune_trades(ts_sec)
-        if not real_trade and self.last_real_bn_sec > 0 and (ts_sec - self.last_real_bn_sec) > MAX_GAP_FILL_SEC:
+        if not alive and self.last_real_bn_sec > 0 and (ts_sec - self.last_real_bn_sec) > MAX_GAP_FILL_SEC:
             bn_close = None
         if bn_close is None or bn_close <= 0.0:
             if self.last_sec > 0 and (ts_sec - self.last_real_bn_sec) > MAX_GAP_FILL_SEC:
@@ -302,7 +309,7 @@ class Bn1sMicroTracker:
             return
         if self.last_sec > 0 and ts_sec > self.last_sec:
             missing = ts_sec - self.last_sec - 1
-            real_gap = (ts_sec - self.last_real_bn_sec - 1) if (real_trade and self.last_real_bn_sec > 0) else 0
+            real_gap = (ts_sec - self.last_real_bn_sec - 1) if (alive and self.last_real_bn_sec > 0) else 0
             if missing > MAX_GAP_FILL_SEC or real_gap > MAX_GAP_FILL_SEC:
                 self.prices.clear()
             elif missing > 0 and self.prices:
@@ -314,7 +321,7 @@ class Bn1sMicroTracker:
         elif ts_sec >= self.last_sec:
             self.prices.append(float(bn_close))
         self.last_sec = max(self.last_sec, ts_sec)
-        if real_trade:
+        if alive:
             self.last_real_bn_sec = max(self.last_real_bn_sec, ts_sec)
 
     def _prune_trades(self, now_sec: int) -> None:
@@ -362,14 +369,16 @@ class Bn1sMicroTracker:
         for old_w in [w for w in self._twap_240 if w < window_ts - 600]:
             self._twap_240.pop(old_w, None)
 
-    def get_realized_twap_240(self, window_ts: int, ts_sec: int, fallback_spot: Optional[float] = None) -> tuple[Optional[float], float]:
-        """Return `(realized_mean_since_240, elapsed_since_240)` matching offline Recorder definition."""
-        elapsed = ts_sec - window_ts
-        if elapsed < 240:
+    def get_realized_twap_240(
+        self, window_ts: int, ts_sec: float, fallback_spot: Optional[float] = None
+    ) -> tuple[Optional[float], float]:
+        """Return `(realized_mean_since_240, elapsed_since_240)` aligned to float remaining_sec."""
+        elapsed = float(ts_sec) - float(window_ts)
+        if elapsed < 240.0:
             return None, 0.0
         pts = self._twap_240.get(window_ts) or []
         mean_val = (sum(v for _, v in pts) / len(pts)) if pts else fallback_spot
-        return mean_val, float(elapsed - 240)
+        return mean_val, max(0.0, elapsed - 240.0)
 
     def to_persisted_dict(self) -> dict[str, Any]:
         """Serialize contiguous Binance 1s history for warm restart continuity."""

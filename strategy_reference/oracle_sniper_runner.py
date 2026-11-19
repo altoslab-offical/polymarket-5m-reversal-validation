@@ -409,12 +409,12 @@ class OracleSniperRunner:
     def _assemble_inputs(self, sym: str, st: SymbolState, now: float, window_ts: int) -> tuple[MarketInputs, str]:
         cl_spot, cl_twap, sp_age, tw_age, sp_lag, tw_lag = self._read_chainlink_ages(sym)
         now_m = self._mono_ms()
-        st.sync_micro_at(now, cl_spot, window_ts)
-        bn_px = st.micro.prices[-1] if st.micro.prices else st.binance_price
         if st.bn_recv_mono_ms > 0.0:
             bn_age = max(0.0, (now_m - st.bn_recv_mono_ms) / 1000.0)
         else:
             bn_age = max(0.0, now - st.binance_ts) if (st.binance_price is not None and st.binance_ts > 0.0) else 9999.0
+        st.sync_micro_at(now, cl_spot, window_ts, bn_age_sec=bn_age)
+        bn_px = st.micro.prices[-1] if st.micro.prices else st.binance_price
         if self.policy.max_binance_age_sec is None and st.binance_price is None and cl_spot is not None:
             bn_px, bn_age = cl_spot, 0.0
         strike, src = self._strike(sym, st)
@@ -429,7 +429,7 @@ class OracleSniperRunner:
             "book_ms": round(bk_wall - bk_src, 2) if bk_src > 0 else None,
         }
         cvd, flow = st.micro.get_orderflow_metrics(int(now))
-        gap, r240 = st.micro._last_basis_gap_bps, st.micro.get_realized_twap_240(window_ts, int(now), fallback_spot=cl_spot)
+        gap, r240 = st.micro._last_basis_gap_bps, st.micro.get_realized_twap_240(window_ts, now, fallback_spot=cl_spot)
         up_asks, dn_asks = self._levels_or_top(st.sorted_asks("UP"), st.book.up_ask), self._levels_or_top(st.sorted_asks("DOWN"), st.book.down_ask)
         up_bids, dn_bids = self._levels_or_top(st.sorted_bids("UP"), st.book.up_bid), self._levels_or_top(st.sorted_bids("DOWN"), st.book.down_bid)
         ages = {"cl_twap": round(tw_age, 3), "cl_spot": round(sp_age, 3), "bn": round(bn_age, 3), "book": round(bk_age, 3)}
@@ -779,7 +779,7 @@ class OracleSniperRunner:
         if decision is None:
             return
         st = self.hub.states[sym]
-        r240 = st.micro.get_realized_twap_240(pos.window_ts, int(now), fallback_spot=fv.chainlink_price)
+        r240 = st.micro.get_realized_twap_240(pos.window_ts, now, fallback_spot=fv.chainlink_price)
         z_tp = compute_z_twap_proj_diagnostic(fv.strike_price, fv.chainlink_price, 300.0 - elapsed, fv.vol_1s, r240, pos.side)
         if z_tp is not None:
             trade["z_twap_proj"] = round(z_tp, 4)

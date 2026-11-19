@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import replace
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import time
 from types import SimpleNamespace
@@ -14,10 +15,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pandas as pd
 
-from edge_validation.live_recorder_42 import _aggregate_shadow_parity, _sim_one_cfg, analyze_recording, init_db
+from edge_validation.live_recorder_42 import LiveRecorder42, _aggregate_shadow_parity, _sim_one_cfg, analyze_recording, init_db
 from edge_validation.parity_replay import run_parity_replay
 from engine.chainlink_oracle import ChainlinkRTDSFeed
-from engine.oracle_sniper import TWAP_V2_FILTERED_CONFIG, OrderBookTop, taker_fee_per_share
+from engine.oracle_sniper import TWAP_V2_FILTERED_CONFIG, OrderBookTop, estimate_twap_fair_value, taker_fee_per_share
 from engine.oracle_sniper_feeds import SniperMarketHub
 from engine.oracle_sniper_ledger import PAPER_40U_RISK_POLICY, PRODUCTION_RISK_POLICY, SniperLedger
 from engine.oracle_sniper_runner import PAPER_40U_EXEC_POLICY, PRODUCTION_EXEC_POLICY, OracleSniperRunner
@@ -360,8 +361,104 @@ def check_9_live_shadow_parity_and_reports(tmp: Path) -> int:
     return 1
 
 
+def check_10_subsecond_twap_normalization(tmp: Path) -> int:
+    """Verify sub-second remaining_sec normalizes TWAP weights (no phantom -59 sigma) in pure + Runner eval."""
+    for elapsed in (240.0, 240.2, 252.73, 255.99):
+        rem = 300.0 - elapsed
+        fv = estimate_twap_fair_value(100.0, 100.05, rem, 5e-5, realized_240=(100.05, float(int(elapsed) - 240)), cfg=TWAP_V2_FILTERED_CONFIG)
+        assert fv is not None and fv.raw_z_score > 0.0 and fv.p_true_up > 0.5, (elapsed, fv)
+    runner, cl, hub, wall_r, mono_r, w = _make_mono_runner(tmp, "subsec")
+    st = hub.states["BTCUSDT"]
+    for sec in range(w + 200, w + 252):
+        st.micro.ingest_bn_1s(sec, 100.048, 0.0, 0.0, real_trade=True)
+        if sec >= w + 240:
+            st.micro.record_cl_240(w, sec, 100.048)
+    wall_r[0] = float(w) + 252.73
+    mono_r[0] += 52_730.0
+    _pulse_all_feeds(cl, hub, wall_r, mono_r, pause="")
+    src_ms = int((wall_r[0] - 0.25) * 1000.0)
+    hub.apply_book("BTCUSDT", "UP", {"asset_id": "BTC-up", "timestamp": src_ms, "bids": [{"price": "0.76", "size": "100"}], "asks": [{"price": "0.78", "size": "100"}]}, via_ws=True)
+    _, decs = runner.evaluate_second(wall_r[0], w)
+    d = decs["BTCUSDT"]
+    assert d.action == "ENTER" and d.side == "UP" and float(d.z or 0.0) > 0.0, d
+    return 1
+
+
+def check_11_quiet_market_bookticker_vol_survival(tmp: Path) -> int:
+    """Verify @bookTicker preserves 1800s vol history across quiet >5s periods while true disconnect resets."""
+    tr = Bn1sMicroTracker(1800, 20)
+    t0 = 1795020000
+    for i in range(1800):
+        tr.ingest_bn_1s(t0 - 1800 + i, 100.0, 10.0, 10.0, real_trade=True)
+    for dt in range(15):
+        tr.ingest_bn_1s(t0 + dt, 100.0, 0.0, 0.0, real_trade=False, feed_alive=True)
+    cvd_q, _ = tr.get_orderflow_metrics(t0 + 14)
+    assert len(tr.prices) == 1805 and cvd_q == 0.0 and tr._trades_1s[-1][0] == t0 - 1
+    for dt in range(15, 22):
+        tr.ingest_bn_1s(t0 + dt, None, 0.0, 0.0, real_trade=False, feed_alive=False)
+    assert len(tr.prices) == 0
+
+    _runner, _at, cl, w = _make_strict_runner(tmp, "quiet_hub")
+    st = _runner.hub.states["SOLUSDT"]
+    for dt in range(15):
+        st.sync_micro_at(float(w + 200 + dt), cl.prices["SOLUSDT"], w, bn_age_sec=0.2)
+    assert len(st.micro.prices) >= 1800
+    for dt in range(15, 22):
+        st.sync_micro_at(float(w + 200 + dt), cl.prices["SOLUSDT"], w, bn_age_sec=6.0)
+    assert len(st.micro.prices) == 0
+    return 1
+
+
+def check_12_recorder_full_depth_clob_and_monotonic_lag(tmp: Path) -> int:
+    """Verify full-depth CLOB parsing (>10 levels), price_change sweep, ev_ts guard & REST lag immunity."""
+    rec = LiveRecorder42(tmp / "rec_clob.db")
+    try:
+        st = rec.states["BTCUSDT"]
+        st.up_token = "UP-TOK"
+        rec.token_to_meta["UP-TOK"] = ("BTCUSDT", "UP")
+        now_ms = int(time.time() * 1000)
+        asks = [{"price": f"{0.70 + 0.01 * i:.2f}", "size": "10"} for i in range(15)]
+        bids = [{"price": "0.68", "size": "20"}]
+        rec._handle_clob_msg(json.dumps({"event_type": "book", "asset_id": "UP-TOK", "timestamp": now_ms - 500, "bids": bids, "asks": asks}))
+        assert len(st.up_asks_raw) == 15 and len(st.up_asks) == 10 and abs(st.up_asks[0][0] - 0.70) < 1e-9
+        sweeps = [{"asset_id": "UP-TOK", "side": "SELL", "price": f"{0.70 + 0.01 * i:.2f}", "size": "0"} for i in range(11)]
+        rec._handle_clob_msg(json.dumps({"event_type": "price_change", "timestamp": now_ms - 100, "price_changes": sweeps}))
+        assert len(st.up_asks_raw) == 4 and len(st.up_asks) == 4 and abs(st.up_asks[0][0] - 0.81) < 1e-9
+        rec._handle_clob_msg(json.dumps({"event_type": "book", "asset_id": "UP-TOK", "timestamp": now_ms - 1000, "bids": bids, "asks": [{"price": "0.50", "size": "1"}]}))
+        assert abs(st.up_asks[0][0] - 0.81) < 1e-9 and st.up_source_ts_ms == now_ms - 100
+        rec._apply_book("UP-TOK", bids, [{"price": "0.82", "size": "5"}], source_ts_ms=now_ms - 80, via_ws=False)
+        assert st.up_source_ts_ms == now_ms - 100
+    finally:
+        rec.con.close()
+    return 1
+
+
+def check_13_recorder_1hz_binance_bucket_flush(tmp: Path) -> int:
+    """Verify 1Hz flush preserves 100% of sub-second Binance trade vol/count and @bookTicker vol survival."""
+    db_p = tmp / "rec_bn.db"
+    rec = LiveRecorder42(db_p)
+    try:
+        t_sec = int(time.time())
+        for px, qty, is_sell in (("100.0", "1.5", False), ("100.1", "2.5", True), ("100.2", "3.0", False)):
+            rec._on_binance_msg(json.dumps({"stream": "btcusdt@aggTrade", "data": {"p": px, "q": qty, "m": is_sell, "E": t_sec * 1000}}))
+        rec._record_second(t_sec)
+        rec._on_binance_msg(json.dumps({"stream": "btcusdt@bookTicker", "data": {"b": "100.2", "a": "100.2", "E": (t_sec + 1) * 1000}}))
+        rec._record_second(t_sec + 1)
+        rec.con.commit()
+        con = sqlite3.connect(db_p)
+        r0 = con.execute("SELECT bn_vol, bn_buy_vol, bn_sell_vol, bn_trades FROM snapshots_1hz WHERE ts_sec=? AND symbol='BTCUSDT'", (t_sec,)).fetchone()
+        r1 = con.execute("SELECT bn_close, bn_trades FROM snapshots_1hz WHERE ts_sec=? AND symbol='BTCUSDT'", (t_sec + 1,)).fetchone()
+        con.close()
+        assert r0 is not None and abs(r0[0] - 7.0) < 1e-9 and abs(r0[1] - 4.5) < 1e-9 and abs(r0[2] - 2.5) < 1e-9 and r0[3] == 3, r0
+        assert rec.states["BTCUSDT"].bn_n == 0 and r1 == (100.2, 0), r1
+        assert rec.micro["BTCUSDT"].last_real_bn_sec == t_sec + 1 and abs(rec.micro["BTCUSDT"].prices[-1] - 100.2) < 1e-9
+    finally:
+        rec.con.close()
+    return 1
+
+
 def main() -> None:
-    """Execute all 9 verification checks against isolated temporary state."""
+    """Execute all 13 verification checks against isolated temporary state."""
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         tests = (
@@ -374,6 +471,10 @@ def main() -> None:
             check_7_single_slot_aligned,
             check_8_monotonic_ms_age_lag_and_4s_pause,
             check_9_live_shadow_parity_and_reports,
+            check_10_subsecond_twap_normalization,
+            check_11_quiet_market_bookticker_vol_survival,
+            check_12_recorder_full_depth_clob_and_monotonic_lag,
+            check_13_recorder_1hz_binance_bucket_flush,
         )
         passed = sum(fn(tmp) for fn in tests)
     print(json.dumps({"status": "SIGNAL_CORE_AND_PARITY_PASSED", "groups_passed": passed}))

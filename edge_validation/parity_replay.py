@@ -125,7 +125,9 @@ def _feed_bn_and_book(
         if b_vol <= 0.0 and s_vol <= 0.0:
             hub._on_binance_message({"stream": f"{sym.lower()}@aggTrade", "data": {"p": px, "q": "0", "m": False}})
     bn_ms_age = _row_age_ms(row, "bn_age_ms", "bn_age_sec")
-    if has_ages and bn_ms_age is not None and st.binance_price is not None:
+    if has_ages and bn_ms_age is not None and bn_v is not None:
+        st.binance_price = st.binance_price or bn_v
+        st.bn_last_close = st.bn_last_close or bn_v
         st.binance_ts = float(t_sec) - bn_ms_age / 1000.0
         st.bn_recv_mono_ms = float(t_sec) * 1000.0 - bn_ms_age
     _apply_side_books(row, sym, t_sec, has_ages, hub)

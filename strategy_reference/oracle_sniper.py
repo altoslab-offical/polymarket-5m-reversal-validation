@@ -402,7 +402,8 @@ def estimate_twap_fair_value(
     else:
         a = max(0.0, min(59.5, realized_twap_elapsed))
         mean_src = realized_twap_mean if (realized_twap_mean and realized_twap_mean > 0) else chainlink_price
-        mean_twap = (a * mean_src + rem * chainlink_price) / 60.0
+        denom = max(1e-6, a + rem)
+        mean_twap = (a * mean_src + rem * chainlink_price) / denom
         horizon_vol = max(1e-7, (rem / 60.0) * vol * math.sqrt(rem / 3.0))
         raw_z = ((mean_twap - strike_price) / strike_price) / horizon_vol
     gap_bps = dynamic_gap_bps if dynamic_gap_bps is not None else 0.0

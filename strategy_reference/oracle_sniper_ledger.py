@@ -384,8 +384,20 @@ class SniperLedger:
         skips[reason] = int(skips.get(reason, 0)) + 1
 
     # ----- reporting -----
+    @staticmethod
+    def _current_streak(closed: list[dict[str, Any]]) -> tuple[str, int]:
+        if not closed:
+            return "", 0
+        first_won = bool(closed[0].get("won"))
+        cnt = 0
+        for item in closed:
+            if bool(item.get("won")) != first_won:
+                break
+            cnt += 1
+        return ("W" if first_won else "L"), cnt
+
     def stats(self) -> dict[str, Any]:
-        """Aggregate closed-trade statistics."""
+        """Aggregate closed-trade statistics including active win/loss streak."""
         closed = self._closed()
         wins = sum(1 for t in closed if t.get("won"))
         n = len(closed)
@@ -397,29 +409,45 @@ class SniperLedger:
                 "pnl_usd": round(sum(float(t.get("pnl_usd", 0.0)) for t in sc), 4),
             }
         recent = closed[: self.rolling_window]
+        s_type, s_len = self._current_streak(closed)
         return {
             "trades": n, "wins": wins, "losses": n - wins,
             "win_rate_pct": round(wins / n * 100.0, 2) if n else 0.0,
             "wilson_lower_pct": round(wilson_lower_bound(wins, n) * 100.0, 1),
             "net_pnl_usd": round(sum(float(t.get("pnl_usd", 0.0)) for t in closed), 4),
             "rolling_win_rate_pct": round(sum(1 for t in recent if t.get("won")) / len(recent) * 100.0, 1) if recent else None,
+            "streak_type": s_type, "streak_len": s_len,
             "by_symbol": by_sym,
             "daily": dict(self.state["daily"]),
             "skips": dict(self.state["skips"]),
         }
 
-    def performance_lines(self, equity_u: float, cash_u: float, vault_u: float) -> str:
-        """Two-line overview (equity / record) appended to every open-close notification."""
+    def performance_summary(self, equity_u: float, cash_u: float, vault_u: float) -> dict[str, Any]:
+        """Structured equity, record, and streak summary for tactical notification cards."""
         init_u = float(self.state.get("initial_equity_u", 0.0)) or equity_u
         net_u = equity_u - init_u
         pct = net_u / max(init_u, 0.01) * 100.0
         st = self.stats()
-        wr = f"{st['win_rate_pct']:.1f}%" if st["trades"] else "待首單結算"
-        daily = st["daily"]
-        by = st["by_symbol"]
-        sym_txt = "｜".join(f"{s[:3]} {by[s]['wins']}/{by[s]['trades']}" for s in SYMBOL_ORDER if by[s]["trades"])
+        return {
+            "equity_u": equity_u, "cash_u": cash_u, "vault_u": vault_u,
+            "initial_u": init_u, "net_u": net_u, "pct": pct,
+            "wins": st["wins"], "losses": st["losses"], "trades": st["trades"],
+            "win_rate_pct": st["win_rate_pct"],
+            "daily_pnl_usd": float(st["daily"].get("pnl_usd", 0.0)),
+            "streak_type": st["streak_type"], "streak_len": st["streak_len"],
+            "by_symbol": st["by_symbol"],
+        }
+
+    def performance_lines(self, equity_u: float, cash_u: float, vault_u: float) -> str:
+        """Plain two-line overview (equity / record) formatted for tactical status cards."""
+        sm = self.performance_summary(equity_u, cash_u, vault_u)
+        wr = f"{sm['win_rate_pct']:.1f}%" if sm["trades"] else "待首單"
+        by = sm["by_symbol"]
+        sym_txt = " | ".join(f"{s[:3]} {by[s]['wins']}/{by[s]['trades']}" for s in SYMBOL_ORDER if by[s]["trades"])
+        streak = f"{sm['streak_len']} 連{'勝' if sm['streak_type'] == 'W' else '敗'}" if sm["streak_len"] > 0 else "--"
         return (
-            f"• 總覽：權益 ${equity_u:.2f}U（{net_u:+.2f}U / {pct:+.1f}%）｜現金 ${cash_u:.2f}U｜鎖倉 ${vault_u:.0f}U\n"
-            f"• 戰績：{st['wins']}勝/{st['losses']}負（勝率 {wr}｜今日 {float(daily.get('pnl_usd', 0.0)):+.2f}U"
-            f"{'｜' + sym_txt if sym_txt else ''}）"
+            f"▸ 累計戰績：{sm['wins']}W - {sm['losses']}L (勝率 {wr}) | 權益 ${equity_u:.2f}"
+            f"{f' | 鎖倉 ${vault_u:.0f}' if vault_u >= 1.0 else ''}\n"
+            f"▸ 累計損益：{sm['net_u']:+.2f} pUSD ({sm['pct']:+.1f}%) | {streak}"
+            f"{f' | {sym_txt}' if sym_txt else ''}"
         )

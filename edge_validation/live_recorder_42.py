@@ -224,16 +224,19 @@ class CoinState42:
         self.bn_recv_mono_ms: float = 0.0
         self.bn_recv_wall_ms: float = 0.0
         self.bn_source_ts_ms: int = 0
+        self.bn_last_lag_ms: Optional[float] = None
         self.bn_vol = self.bn_buy = self.bn_sell = 0.0
         self.bn_n = 0
         self.up_bids_raw: Dict[float, float] = {}
         self.up_asks_raw: Dict[float, float] = {}
         self.dn_bids_raw: Dict[float, float] = {}
         self.dn_asks_raw: Dict[float, float] = {}
-        self.up_bids: List[Tuple[float, float]] = []
-        self.up_asks: List[Tuple[float, float]] = []
-        self.dn_bids: List[Tuple[float, float]] = []
-        self.dn_asks: List[Tuple[float, float]] = []
+        self._up_bids: List[Tuple[float, float]] = []
+        self._up_asks: List[Tuple[float, float]] = []
+        self._dn_bids: List[Tuple[float, float]] = []
+        self._dn_asks: List[Tuple[float, float]] = []
+        self._up_dirty: bool = False
+        self._dn_dirty: bool = False
         self.up_book_ts: float = 0.0
         self.dn_book_ts: float = 0.0
         self.up_ev_ts_ms: int = 0
@@ -241,9 +244,11 @@ class CoinState42:
         self.up_recv_mono_ms: float = 0.0
         self.up_recv_wall_ms: float = 0.0
         self.up_source_ts_ms: int = 0
+        self.up_last_lag_ms: Optional[float] = None
         self.dn_recv_mono_ms: float = 0.0
         self.dn_recv_wall_ms: float = 0.0
         self.dn_source_ts_ms: int = 0
+        self.dn_last_lag_ms: Optional[float] = None
 
     def reset_window(self, window_ts: int) -> None:
         """Reset market tokens and full-depth orderbooks on window rollover."""
@@ -254,16 +259,18 @@ class CoinState42:
         self.up_asks_raw.clear()
         self.dn_bids_raw.clear()
         self.dn_asks_raw.clear()
-        self.up_bids.clear()
-        self.up_asks.clear()
-        self.dn_bids.clear()
-        self.dn_asks.clear()
+        self._up_bids.clear()
+        self._up_asks.clear()
+        self._dn_bids.clear()
+        self._dn_asks.clear()
+        self._up_dirty = self._dn_dirty = False
         self.up_book_ts = 0.0
         self.dn_book_ts = 0.0
         self.up_ev_ts_ms = self.dn_ev_ts_ms = 0
         self.up_recv_mono_ms = self.up_recv_wall_ms = 0.0
         self.dn_recv_mono_ms = self.dn_recv_wall_ms = 0.0
         self.up_source_ts_ms = self.dn_source_ts_ms = 0
+        self.up_last_lag_ms = self.dn_last_lag_ms = None
 
     def flush_bn_bucket(self) -> Tuple[float, float, float, int]:
         """Atomically read and reset accumulated Binance trades since previous 1Hz snapshot."""
@@ -272,14 +279,51 @@ class CoinState42:
         self.bn_n = 0
         return vals
 
+    def mark_dirty(self, side: str) -> None:
+        """Mark book side dirty so O(1) WS updates defer sorting until read."""
+        if side == "UP":
+            self._up_dirty = True
+        else:
+            self._dn_dirty = True
+
     def refresh_top_levels(self, side: str) -> None:
         """Project full-depth book maps down to sorted top-10 lists for 1Hz snapshot/eval."""
         if side == "UP":
-            self.up_bids = sorted(self.up_bids_raw.items(), key=lambda t: t[0], reverse=True)[:10]
-            self.up_asks = sorted(self.up_asks_raw.items(), key=lambda t: t[0])[:10]
+            self._up_bids = sorted(self.up_bids_raw.items(), key=lambda t: t[0], reverse=True)[:10]
+            self._up_asks = sorted(self.up_asks_raw.items(), key=lambda t: t[0])[:10]
+            self._up_dirty = False
         else:
-            self.dn_bids = sorted(self.dn_bids_raw.items(), key=lambda t: t[0], reverse=True)[:10]
-            self.dn_asks = sorted(self.dn_asks_raw.items(), key=lambda t: t[0])[:10]
+            self._dn_bids = sorted(self.dn_bids_raw.items(), key=lambda t: t[0], reverse=True)[:10]
+            self._dn_asks = sorted(self.dn_asks_raw.items(), key=lambda t: t[0])[:10]
+            self._dn_dirty = False
+
+    @property
+    def up_bids(self) -> List[Tuple[float, float]]:
+        """Lazy top-10 UP bids sorted descending."""
+        if self._up_dirty:
+            self.refresh_top_levels("UP")
+        return self._up_bids
+
+    @property
+    def up_asks(self) -> List[Tuple[float, float]]:
+        """Lazy top-10 UP asks sorted ascending."""
+        if self._up_dirty:
+            self.refresh_top_levels("UP")
+        return self._up_asks
+
+    @property
+    def dn_bids(self) -> List[Tuple[float, float]]:
+        """Lazy top-10 DOWN bids sorted descending."""
+        if self._dn_dirty:
+            self.refresh_top_levels("DOWN")
+        return self._dn_bids
+
+    @property
+    def dn_asks(self) -> List[Tuple[float, float]]:
+        """Lazy top-10 DOWN asks sorted ascending."""
+        if self._dn_dirty:
+            self.refresh_top_levels("DOWN")
+        return self._dn_asks
 
 
 class LiveRecorder42:
@@ -296,6 +340,7 @@ class LiveRecorder42:
         self.prefetched: Dict[Tuple[str, int], dict[str, Any]] = {}
         self._stop = asyncio.Event()
         self._clob_resub = asyncio.Event()
+        self._clob_stale_since: float = 0.0
         self._trade_buf: List[Tuple[int, int, str, str, str, float, float]] = []
 
     async def _discover_market(self, client: httpx.AsyncClient, sym: str, window_ts: int) -> Optional[dict[str, Any]]:
@@ -340,6 +385,7 @@ class LiveRecorder42:
         st.bn_recv_wall_ms = now_r * 1000.0
         if src_ms > 0:
             st.bn_source_ts_ms = src_ms
+            st.bn_last_lag_ms = round(now_r * 1000.0 - float(src_ms), 2)
         if "bookTicker" in stream and "b" in data and "a" in data:
             st.bn_last_ts = now_r
             if st.bn_last_px is None:
@@ -398,6 +444,7 @@ class LiveRecorder42:
                 st.up_ev_ts_ms = max(st.up_ev_ts_ms, src_ms)
             if via_ws and src_ms > 0:
                 st.up_source_ts_ms = src_ms
+                st.up_last_lag_ms = round(now_r * 1000.0 - float(src_ms), 2)
         else:
             st.dn_book_ts = now_r
             st.dn_recv_mono_ms, st.dn_recv_wall_ms = now_m, now_r * 1000.0
@@ -405,6 +452,16 @@ class LiveRecorder42:
                 st.dn_ev_ts_ms = max(st.dn_ev_ts_ms, src_ms)
             if via_ws and src_ms > 0:
                 st.dn_source_ts_ms = src_ms
+                st.dn_last_lag_ms = round(now_r * 1000.0 - float(src_ms), 2)
+
+    def _note_clob_freshness(self, now_r: float, src_ms: int) -> bool:
+        if src_ms > 0 and (now_r * 1000.0 - float(src_ms)) > 2500.0:
+            self._clob_stale_since = self._clob_stale_since or now_r
+            if (now_r - self._clob_stale_since) >= 1.5:
+                self._clob_resub.set()
+            return False
+        self._clob_stale_since = 0.0
+        return True
 
     def _apply_book(
         self, token_id: str, bids_raw: Any, asks_raw: Any, source_ts_ms: int = 0, via_ws: bool = True
@@ -422,13 +479,13 @@ class LiveRecorder42:
             setattr(st, "up_bids_raw" if side == "UP" else "dn_bids_raw", self._parse_book_dict(bids_raw))
         if asks_raw is not None:
             setattr(st, "up_asks_raw" if side == "UP" else "dn_asks_raw", self._parse_book_dict(asks_raw))
-        st.refresh_top_levels(side)
+        st.mark_dirty(side)
         self._stamp_book_recv(st, side, (now_m, now_r, source_ts_ms, via_ws))
 
     def _apply_price_change(self, msg: dict[str, Any]) -> None:
         now_m, now_r = time.monotonic_ns() / 1_000_000.0, time.time()
         top_src = self._parse_src_ms(msg.get("timestamp"))
-        if top_src > 0 and (now_r * 1000.0 - top_src) > 2500.0:
+        if not self._note_clob_freshness(now_r, top_src):
             return
         touched: Dict[Tuple[str, str], int] = {}
         for ch in msg.get("price_changes") or ():
@@ -452,7 +509,7 @@ class LiveRecorder42:
             touched[(sym, side)] = max(touched.get((sym, side), 0), src_ms)
         for (sym, side), src_ms in touched.items():
             st = self.states[sym]
-            st.refresh_top_levels(side)
+            st.mark_dirty(side)
             self._stamp_book_recv(st, side, (now_m, now_r, src_ms, True))
 
     def _handle_clob_msg(self, raw: str) -> None:
@@ -465,7 +522,7 @@ class LiveRecorder42:
             ev_type = str(m.get("event_type") or "")
             if ev_type == "book" and m.get("asset_id"):
                 src_ms = self._parse_src_ms(m.get("timestamp"))
-                if src_ms <= 0 or (time.time() * 1000.0 - src_ms) <= 2500.0:
+                if self._note_clob_freshness(time.time(), src_ms):
                     self._apply_book(str(m["asset_id"]), m.get("bids"), m.get("asks"), src_ms, via_ws=True)
             elif ev_type == "price_change":
                 self._apply_price_change(m)
@@ -482,8 +539,9 @@ class LiveRecorder42:
                 await asyncio.sleep(0.5)
                 continue
             self._clob_resub.clear()
+            self._clob_stale_since = 0.0
             try:
-                async with websockets.connect(CLOB_WS, open_timeout=8.0, ping_interval=15.0, ping_timeout=10.0, max_queue=4096) as ws:
+                async with websockets.connect(CLOB_WS, open_timeout=8.0, ping_interval=15.0, ping_timeout=10.0, max_queue=64) as ws:
                     await ws.send(json.dumps({"assets_ids": assets, "type": "market"}))
                     while not self._stop.is_set() and not self._clob_resub.is_set():
                         self._handle_clob_msg(await asyncio.wait_for(ws.recv(), timeout=12.0))
@@ -573,15 +631,31 @@ class LiveRecorder42:
             await asyncio.sleep(2.0)
 
     @staticmethod
-    def _age_lag_ms(mono_ms: float, wall_ms: float, src_ms: int, now_m: float) -> Tuple[Optional[float], Optional[float], float]:
+    def _age_lag_ms(mono_ms: float, last_lag_ms: Optional[float], now_m: float) -> Tuple[Optional[float], Optional[float], float]:
         if mono_ms <= 0.0:
             return None, None, 9999.0
         a_ms = max(0.0, now_m - mono_ms)
-        l_ms = (wall_ms - float(src_ms)) if src_ms > 0 else None
-        return round(a_ms, 2), (round(l_ms, 2) if l_ms is not None else None), round(a_ms / 1000.0, 3)
+        return round(a_ms, 2), last_lag_ms, round(a_ms / 1000.0, 3)
+
+    def _roll_window_if_needed(self, cur_t: int) -> None:
+        changed = False
+        for sym, st in self.states.items():
+            if st.window_ts == cur_t:
+                continue
+            st.reset_window(cur_t)
+            pre = self.prefetched.pop((sym, cur_t), None)
+            if pre:
+                st.condition_id, st.up_token, st.down_token = pre["condition_id"], pre["up_token"], pre["down_token"]
+                self.token_to_meta[st.up_token], self.token_to_meta[st.down_token] = (sym, "UP"), (sym, "DOWN")
+            changed = True
+        if changed:
+            keep = {tok for st in self.states.values() for tok in (st.up_token, st.down_token) if tok}
+            self.token_to_meta = {k: v for k, v in self.token_to_meta.items() if k in keep}
+            self._clob_resub.set()
 
     def _record_second(self, ts_sec: int) -> None:
         cur_t, elapsed = (ts_sec // 300) * 300, ts_sec % 300
+        self._roll_window_if_needed(cur_t)
         now_m = time.monotonic_ns() / 1_000_000.0
         rtds_ok = bool(getattr(self.chainlink, "connected", True))
         skips_sec: Dict[str, int] = {}
@@ -592,9 +666,9 @@ class LiveRecorder42:
             tw_age = round(tw_ms / 1000.0, 3) if (rtds_ok and tw_ms < 9_000_000.0) else 9999.0
             sp_ms_v = round(sp_ms, 2) if (rtds_ok and sp_ms < 9_000_000.0) else None
             tw_ms_v = round(tw_ms, 2) if (rtds_ok and tw_ms < 9_000_000.0) else None
-            bn_ms_v, bn_lag, bn_age = self._age_lag_ms(st.bn_recv_mono_ms if st.bn_last_px else 0.0, st.bn_recv_wall_ms, st.bn_source_ts_ms, now_m)
-            up_ms_v, up_lag, up_age = self._age_lag_ms(st.up_recv_mono_ms, st.up_recv_wall_ms, st.up_source_ts_ms, now_m)
-            dn_ms_v, dn_lag, dn_age = self._age_lag_ms(st.dn_recv_mono_ms, st.dn_recv_wall_ms, st.dn_source_ts_ms, now_m)
+            bn_ms_v, bn_lag, bn_age = self._age_lag_ms(st.bn_recv_mono_ms if st.bn_last_px else 0.0, st.bn_last_lag_ms, now_m)
+            up_ms_v, up_lag, up_age = self._age_lag_ms(st.up_recv_mono_ms, st.up_last_lag_ms, now_m)
+            dn_ms_v, dn_lag, dn_age = self._age_lag_ms(st.dn_recv_mono_ms, st.dn_last_lag_ms, now_m)
             tw_s = self.chainlink.get_settlement_twap_at(sym, cur_t)
             sp_s = self.chainlink.bucket_opens[sym].get(cur_t, (None, 0))[0]
             self._upsert_window_row(cur_t, elapsed, sym, st, tw_s, sp_s)
@@ -758,6 +832,11 @@ def _row_ages(row: Any, s: str, t_sec: int, state: RecorderStreamState, strike: 
             "book": bk_a,
         }
     lt, pv = state.last_ts[s], state.prev_vals[s]
+    win_ts = int(getattr(row, "window_ts", 0) or (t_sec // 300) * 300)
+    if pv.get("last_win_ts") != win_ts:
+        pv["last_win_ts"] = win_ts
+        lt.pop("up_bk", None)
+        lt.pop("dn_bk", None)
     sp_v = float(row.cl_spot) if pd.notna(row.cl_spot) else None
     tw_v = float(row.cl_twap60) if pd.notna(row.cl_twap60) else None
     bn_v = float(row.bn_close) if pd.notna(row.bn_close) else None
@@ -1299,6 +1378,74 @@ def _append_diagnostics_sections(lines: List[str], report: Dict[str, Any]) -> No
     _append_r1_and_shadow_tables(lines, report)
 
 
+def _summarize_twap_age_buckets(df_t: pd.DataFrame) -> List[Dict[str, Any]]:
+    """Group +1s filled trades into <0.5s, 0.5-1.5s, >1.5s Chainlink TWAP age buckets."""
+    f1 = df_t[df_t["filled_1s"] == True] if len(df_t) else df_t
+    ages = pd.to_numeric(f1["cl_twap_age_sec"], errors="coerce") if len(f1) else pd.Series(dtype=float)
+    specs = (("< 0.5s", ages < 0.5), ("0.5–1.5s", (ages >= 0.5) & (ages <= 1.5)), ("> 1.5s", ages > 1.5))
+    out: List[Dict[str, Any]] = []
+    for label, mask in specs:
+        sub = f1[mask] if len(f1) else f1
+        n = int(len(sub))
+        wr = round(float((sub["pnl_per_share"] > 0).mean()), 4) if n else None
+        p_sl = round(float(sub["pnl_per_share"].mean()), 5) if n else None
+        has_hold = n > 0 and "pnl_hold_to_settle" in sub and sub["pnl_hold_to_settle"].notna().any()
+        p_hold = round(float(sub["pnl_hold_to_settle"].dropna().mean()), 5) if has_hold else None
+        out.append({"bucket": label, "trades": n, "wr": wr, "mean_pnl_1s": p_sl, "mean_pnl_hold": p_hold})
+    return out
+
+
+def _carry_symbol_metrics(rows: pd.DataFrame) -> Tuple[int, int, int, int]:
+    rows_s = rows.sort_values("ts_sec")
+    tot = zero_c = gt5 = streak = max_s = 0
+    for tr_raw, age_raw in zip(rows_s["bn_trades"], rows_s["bn_age_sec"]):
+        tot += 1
+        n_tr = int(tr_raw) if pd.notna(tr_raw) else 0
+        age_v = float(age_raw) if pd.notna(age_raw) else 9999.0
+        if n_tr == 0 and age_v <= 5.0:
+            zero_c += 1
+            streak += 1
+            max_s = max(max_s, streak)
+            if streak > 5:
+                gt5 += 1
+        else:
+            streak = 0
+    return tot, zero_c, gt5, max_s
+
+
+def _compute_carry_forward_stats(df_s: pd.DataFrame, count_start_ts: int) -> Dict[str, Any]:
+    """Measure Binance zero-trade carry-forward ratio (total and >5s extended) in vol_hist."""
+    if len(df_s) == 0 or "bn_age_sec" not in df_s.columns:
+        return {"scope": "none", "rows": []}
+    has_bn = df_s[df_s["bn_age_sec"].notna()]
+    post = has_bn[has_bn["window_ts"] >= count_start_ts] if (len(has_bn) and count_start_ts > 0) else has_bn
+    sub = post if len(post) else has_bn
+    scope = "post_reset" if len(post) else "all_ms"
+    out_rows: List[Dict[str, Any]] = []
+    sum_tot = sum_zero = sum_gt5 = all_max = 0
+    for sym in SYMBOLS:
+        g = sub[sub["symbol"] == sym]
+        tot, zero_c, gt5, max_s = _carry_symbol_metrics(g) if len(g) else (0, 0, 0, 0)
+        sum_tot, sum_zero, sum_gt5, all_max = sum_tot + tot, sum_zero + zero_c, sum_gt5 + gt5, max(all_max, max_s)
+        z_pct = round(zero_c / tot * 100.0, 2) if tot else 0.0
+        out_rows.append({"symbol": sym, "total_sec": tot, "zero_trade_sec": zero_c, "zero_trade_pct": z_pct, "gt5s_sec": gt5, "gt5s_pct": round(gt5 / tot * 100.0, 2) if tot else 0.0, "max_quiet_sec": max_s, "status": "ALERT (>5%)" if (tot > 0 and z_pct > 5.0) else "OK"})
+    all_pct = round(sum_zero / sum_tot * 100.0, 2) if sum_tot else 0.0
+    out_rows.append({"symbol": "ALL", "total_sec": sum_tot, "zero_trade_sec": sum_zero, "zero_trade_pct": all_pct, "gt5s_sec": sum_gt5, "gt5s_pct": round(sum_gt5 / sum_tot * 100.0, 2) if sum_tot else 0.0, "max_quiet_sec": all_max, "status": "ALERT (>5%)" if (sum_tot > 0 and all_pct > 5.0) else "OK"})
+    return {"scope": scope, "rows": out_rows}
+
+
+def _append_twap_age_and_carry_tables(lines: List[str], report: Dict[str, Any]) -> None:
+    ta = report.get("twap_age_pnl") or {}
+    lines += ["", "## Chainlink TWAP Age vs Filled PnL (`+1s`, `v2_filtered`)", "", "| Scope | `cl_twap_age_sec` | Filled Trades | Win Rate | Mean PnL +1s | Mean Hold PnL |", "|---|---|---:|---:|---:|---:|"]
+    for sc_lbl in ("post_reset", "all"):
+        for b in ta.get(sc_lbl) or []:
+            lines.append(f"| `{sc_lbl}` | `{b['bucket']}` | {b['trades']} | {b['wr']} | {b['mean_pnl_1s']} | {b['mean_pnl_hold']} |")
+    cf = report.get("carry_forward") or {}
+    lines += ["", f"## Binance 1s Volatility Carry-Forward Ratio (`feed_alive` Monitor, scope=`{cf.get('scope', 'none')}`)", "", "_Note: `compute_sigma_from_vol_hist` takes `max(sample_var, ewma_var)`; multi-second cumulative variance stays unbiased under zero-return carry-forward while `sample_var` floor prevents quiet-regime EWMA under-estimation._", "", "| Symbol | Total Sec | Zero-Trade Carry (`bn_trades=0`) | Extended `>5s` Carry | Max Quiet Streak | Status (`<=5%`) |", "|---|---:|---:|---:|---:|---|"]
+    for r in cf.get("rows") or []:
+        lines.append(f"| `{r['symbol']}` | {r['total_sec']} | {r['zero_trade_sec']} (**{r['zero_trade_pct']}%**) | {r['gt5s_sec']} ({r['gt5s_pct']}%) | {r['max_quiet_sec']}s | **{r['status']}** |")
+
+
 def _append_r1_and_shadow_tables(lines: List[str], report: Dict[str, Any]) -> None:
     lines += ["", "## Depth vs Price Miss Ratio (`+1s` FAK) & Dual-Track Stop-Loss vs Hold-to-Settle", "", "| Scope / Model | Missed Total | `MISSED_DEPTH` | `MISSED_PRICE` | `pnl_with_sl` (Mean/sh) | `pnl_hold_to_settle` (Mean/sh) | SL Triggered (`wrong`) |", "|---|---:|---:|---:|---:|---:|---:|"]
     for lbl, st in (report.get("all_combined") or {}).items():
@@ -1307,6 +1454,7 @@ def _append_r1_and_shadow_tables(lines: List[str], report: Dict[str, Any]) -> No
             f"{st.get('missed_price', 0)} ({st.get('missed_price_pct', 0.0)}%) | {st.get('mean_pnl_1s')} | "
             f"{st.get('mean_pnl_hold')} | {st.get('sl_triggered', 0)} ({st.get('sl_was_wrong', 0)}) |"
         )
+    _append_twap_age_and_carry_tables(lines, report)
     sh = report.get("live_shadow_parity") or {}
     lines += ["", f"## Live Shadow Parity (`PAPER_40U` Runner vs 4.2 Recorder, overlap={sh.get('overlap_coin_windows', 0)}, overall={sh.get('parity_rate')})", "", "| UTC Day | Overlap Coin-Win | Recorder ENTER | Runner ENTER | Union | Matched | Parity | Gate (`>=99%`) |", "|---|---:|---:|---:|---:|---:|---:|---|"]
     for d in sh.get("by_day") or []:
@@ -1417,12 +1565,14 @@ def analyze_recording(
     v2_skips: Dict[str, int] = {}
     v2_ages: Dict[str, List[float]] = {}
     v2_warm_secs: set[int] = set()
+    v2_df_t = pd.DataFrame()
+    v2_df_reset = pd.DataFrame()
     for lbl, cfg in models.items():
         df_t, skips_m, ages_m, warm_s = _sim_one_cfg(cfg, fee_map, settled_ts, snap_by_wt_sym, w_meta)
         df_t.to_csv(out_dir / f"phase42_trades_1s_{lbl}.csv", index=False)
-        if lbl == "v2_filtered":
-            v2_skips, v2_ages, v2_warm_secs = skips_m, ages_m, warm_s
         df_reset = df_t[df_t["window_ts"] >= count_start_ts] if (len(df_t) and count_start_ts > 0) else df_t
+        if lbl == "v2_filtered":
+            v2_skips, v2_ages, v2_warm_secs, v2_df_t, v2_df_reset = skips_m, ages_m, warm_s, df_t, df_reset
         pre_summaries[lbl] = _summarize_model_trades(df_reset[df_reset["window_ts"] < primary_ts] if len(df_reset) else df_reset)
         post_summaries[lbl] = _summarize_model_trades(df_reset[df_reset["window_ts"] >= primary_ts] if len(df_reset) else df_reset)
         combined[lbl] = _summarize_model_trades(df_t)
@@ -1452,6 +1602,8 @@ def analyze_recording(
         "freshness_ms": _compute_ms_freshness(df_s, count_start_ts, v2_ages),
         "warmup_diag": {"all": _count_warmup_episodes(v2_warm_secs), "post_reset": _count_warmup_episodes({t for t in v2_warm_secs if t >= count_start_ts})},
         "live_shadow_parity": shadow_parity,
+        "twap_age_pnl": {"post_reset": _summarize_twap_age_buckets(v2_df_reset), "all": _summarize_twap_age_buckets(v2_df_t)},
+        "carry_forward": _compute_carry_forward_stats(df_s, count_start_ts),
     }
     if daily_report:
         report["daily_report_path"] = str(_write_daily_report_md(report, out_dir))

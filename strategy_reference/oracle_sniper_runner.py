@@ -32,7 +32,7 @@ from engine.oracle_sniper import (
 )
 from engine.oracle_sniper_feeds import SYMBOLS, SniperMarketHub, SymbolState
 from engine.oracle_sniper_ledger import SniperLedger
-from engine.oracle_sniper_notify import alert_message, entry_message, exit_message
+from engine.oracle_sniper_notify import alert_message, entry_message, exit_message, status_message
 from engine.signal_core import (
     DEFAULT_MAX_AGES,
     MarketInputs,
@@ -421,12 +421,11 @@ class OracleSniperRunner:
         up_age = self._side_book_age_sec(st, "UP", now, now_m)
         dn_age = self._side_book_age_sec(st, "DOWN", now, now_m)
         bk_age = directional_book_age(cl_spot, strike, up_age, dn_age)
-        bk_src = st.up_source_ts_ms if (cl_spot is None or strike is None or cl_spot >= strike) else st.dn_source_ts_ms
-        bk_wall = st.up_recv_wall_ms if (cl_spot is None or strike is None or cl_spot >= strike) else st.dn_recv_wall_ms
+        bk_lag = st.up_last_lag_ms if (cl_spot is None or strike is None or cl_spot >= strike) else st.dn_last_lag_ms
         self._last_lags[sym] = {
             "cl_twap_ms": tw_lag, "cl_spot_ms": sp_lag,
-            "bn_ms": round(st.bn_recv_wall_ms - st.bn_source_ts_ms, 2) if st.bn_source_ts_ms > 0 else None,
-            "book_ms": round(bk_wall - bk_src, 2) if bk_src > 0 else None,
+            "bn_ms": st.bn_last_lag_ms,
+            "book_ms": bk_lag,
         }
         cvd, flow = st.micro.get_orderflow_metrics(int(now))
         gap, r240 = st.micro._last_basis_gap_bps, st.micro.get_realized_twap_240(window_ts, now, fallback_spot=cl_spot)
@@ -555,6 +554,10 @@ class OracleSniperRunner:
     def _perf_lines(self) -> str:
         total, cash, vault = self._equity()
         return self.ledger.performance_lines(total, cash, vault)
+
+    def _perf_summary(self) -> dict[str, Any]:
+        total, cash, vault = self._equity()
+        return self.ledger.performance_summary(total, cash, vault)
 
     # ------------------------------------------------------------------ entry
     def _config_parity_ok(self) -> bool:
@@ -721,7 +724,7 @@ class OracleSniperRunner:
             return
         self._spawn(self._notify(alert_message(
             [f"{intent['symbol']} 下單結果無法確認（餘額查詢持續失敗），已暫停新開單；請至 Polymarket 確認後用 /resume 恢復"],
-            self._perf_lines()), "SNIPER_ALERT", "SYSTEM"))
+            self._perf_lines(), paper_mode=bool(self.policy.paper_simulation), summary=self._perf_summary()), "SNIPER_ALERT", "SYSTEM"))
 
     def _register_entry(
         self, cand: Candidate, window_ts: int, now: float, n_cands: int, fill: dict[str, Any], token: str, limit_px: float
@@ -733,9 +736,10 @@ class OracleSniperRunner:
         cost_ps = price + taker_fee_per_share(price, fee_r)
         cost_usd = round(float(fill.get("usd") or shares * price) + shares * taker_fee_per_share(price, fee_r), 4)
         self._positions[cand.symbol] = OpenPosition(cand.symbol, cand.side, window_ts, shares, price, cost_ps, cand.p_true, cand.z)
+        seq = len(self.ledger.state.get("trades", [])) + len(self.ledger.state.get("settling", [])) + len(self._positions)
         ages = fill.get("ages") if isinstance(fill.get("ages"), dict) else (self._last_ages.get(cand.symbol) or {})
         trade = {
-            "id": f"{window_ts}-{cand.symbol}-{int(now * 1000)}", "symbol": cand.symbol, "side": cand.side, "window_ts": window_ts,
+            "id": f"{window_ts}-{cand.symbol}-{int(now * 1000)}", "seq": seq, "symbol": cand.symbol, "side": cand.side, "window_ts": window_ts,
             "slug": st.slug, "token_id": token, "condition_id": st.condition_id, "shares": shares,
             "shares_open": shares, "entry_price": price, "sim_ask": cand.ask, "cost_per_share": cost_ps,
             "cost_usd": cost_usd, "fee_rate": fee_r, "entry_ts": now, "entry_elapsed": cand.elapsed_sec,
@@ -752,7 +756,7 @@ class OracleSniperRunner:
         self._traded_coin_windows.add((cand.symbol, window_ts))
         self._exit_attempts[cand.symbol] = 0
         self.ledger.open_trade(trade)
-        self._spawn(self._notify(entry_message(trade, self._perf_lines()), "SNIPER_ENTRY", cand.symbol))
+        self._spawn(self._notify(entry_message(trade, self._perf_lines(), summary=self._perf_summary()), "SNIPER_ENTRY", cand.symbol))
         if not self.policy.paper_simulation:
             self._spawn(self.auto_trader.sync_live_wallet_balance())
 
@@ -806,7 +810,7 @@ class OracleSniperRunner:
         self._apply_sale(sym, decision.reason, {"shares": float(trade["shares_open"]), "avg_price": decision.bid}, now)
         self._spawn(self._notify(alert_message(
             [f"{trade['symbol']} 賣出回應遺失但餘額已為 0，已依 ${decision.bid:.2f} 對帳結案（以錢包為準，請核對）"],
-            self._perf_lines()), "SNIPER_ALERT", "SYSTEM"))
+            self._perf_lines(), paper_mode=bool(self.policy.paper_simulation), summary=self._perf_summary()), "SNIPER_ALERT", "SYSTEM"))
 
     def _apply_sale(self, sym: str, reason: str, sell: dict[str, Any], now: float) -> None:
         pos, trade = self._positions.get(sym), self._trades.get(sym)
@@ -925,16 +929,16 @@ class OracleSniperRunner:
             self._trades.pop(sym, None)
         alerts = self.ledger.close_trade(trade, info)
         closed = self.ledger.state["trades"][0]
-        self._spawn(self._notify(exit_message(closed, self._perf_lines()), "SNIPER_EXIT", str(closed["symbol"])))
+        self._spawn(self._notify(exit_message(closed, self._perf_lines(), summary=self._perf_summary()), "SNIPER_EXIT", str(closed["symbol"])))
         if alerts:
-            self._spawn(self._notify(alert_message(alerts, self._perf_lines()), "SNIPER_ALERT", "SYSTEM"))
+            self._spawn(self._notify(alert_message(alerts, self._perf_lines(), paper_mode=bool(self.policy.paper_simulation), summary=self._perf_summary()), "SNIPER_ALERT", "SYSTEM"))
         if not self.policy.paper_simulation:
             self._spawn(self.auto_trader.sync_live_wallet_balance(include_portfolio=True))
 
     async def _notify(self, text: str, event_type: str, symbol: str) -> None:
         await self.notifier.dispatch_signal({
             "symbol": symbol, "event_type": event_type, "direction": "LONG_BOUNCE", "price": 0.0,
-            "message": text, "source": "oracle_sniper",
+            "message": text, "parse_mode": "HTML", "source": "oracle_sniper",
         })
 
     def _seed_traded_windows(self) -> None:
@@ -979,27 +983,24 @@ class OracleSniperRunner:
         self.ledger.set_enabled(enabled)
 
     def telegram_text(self) -> str:
-        """Compact Telegram status block (state, positions, per-coin live model view, performance)."""
+        """Compact tactical status block (state, positions, per-coin live model view, performance)."""
         guard = self.ledger.guard_reason()
         state = "🟢 運行中" if guard is None else f"⏸ 暫停（{guard}）"
         if self._positions:
-            pos_txt = "｜".join(f"{p.symbol[:3]} {p.side} {p.shares:.2f}股 @ ${p.entry_price:.3f}" for p in self._positions.values())
+            pos_txt = " | ".join(f"{p.symbol[:3]} {p.side} {p.shares:.2f} sh @ ${p.entry_price:.3f}" for p in self._positions.values())
         else:
             pos_txt = "空倉（等待 150–255s 狙擊窗口）"
         init_u = int(round(float(self.policy.paper_initial_equity_u)))
-        mode_hdr = f"🧪 模擬盤 ${init_u}U" if self.policy.paper_simulation else "實盤"
-        lines = [f"🎯 新策略｜Chainlink TWAP V2・{mode_hdr}｜{state}", f"• 持倉（{len(self._positions)}/{self.policy.max_concurrent_positions}）：{pos_txt}"]
+        mode_hdr = f"PAPER ${init_u}U" if self.policy.paper_simulation else "LIVE 實盤"
+        coin_lines: list[str] = []
         for sym in SYMBOLS:
             d = self.diag.get(sym, {})
             if d.get("status") == "OK":
                 up, dn = d["up"], d["down"]
-                lines.append(
-                    f"• {sym[:3]} Z={d['z']:+.2f} P(UP)={d['p_up'] * 100:.0f}% 買價 漲{up[1] or '--'}/跌{dn[1] or '--'}"
-                )
+                coin_lines.append(f"{sym[:3]} | Z {d['z']:+.2f} | P(UP) {d['p_up'] * 100:.0f}% | 漲 {up[1] or '--'} / 跌 {dn[1] or '--'}")
             else:
-                lines.append(f"• {sym[:3]} {d.get('status', '等待資料')} ({d.get('vol_samples', 0)}/1800s)")
-        lines.append(self._perf_lines())
-        return "\n".join(lines)
+                coin_lines.append(f"{sym[:3]} | {d.get('status', '等待資料')} ({d.get('vol_samples', 0)}/1800s)")
+        return status_message(mode_hdr, state, pos_txt, coin_lines, self._perf_lines())
 
     def status(self) -> dict[str, Any]:
         """Snapshot for APIs, Telegram and patrol reports."""

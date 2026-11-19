@@ -122,6 +122,7 @@ class SymbolState:
     bn_recv_mono_ms: float = 0.0
     bn_recv_wall_ms: float = 0.0
     bn_source_ts_ms: int = 0
+    bn_last_lag_ms: Optional[float] = None
     bn_last_close: Optional[float] = None
     bn_cur_sec: int = 0
     bn_cur_buy_usd: float = 0.0
@@ -148,9 +149,11 @@ class SymbolState:
     up_recv_mono_ms: float = 0.0
     up_recv_wall_ms: float = 0.0
     up_source_ts_ms: int = 0
+    up_last_lag_ms: Optional[float] = None
     dn_recv_mono_ms: float = 0.0
     dn_recv_wall_ms: float = 0.0
     dn_source_ts_ms: int = 0
+    dn_last_lag_ms: Optional[float] = None
     last_ws_book_local_ts: float = 0.0
     up_local_ts: float = 0.0
     down_local_ts: float = 0.0
@@ -158,22 +161,27 @@ class SymbolState:
     prefetch_ts: float = 0.0
 
     def record_bn_recv(self, mono_ms: float, wall_ms: float, source_ts_ms: int = 0) -> None:
-        """Record monotonic receive timestamp and optional source timestamp for Binance."""
+        """Record monotonic receive timestamp and per-message upstream lag when source_ts_ms > 0."""
         self.bn_recv_mono_ms = mono_ms
         self.bn_recv_wall_ms = wall_ms
         if source_ts_ms > 0:
             self.bn_source_ts_ms = int(source_ts_ms)
+            self.bn_last_lag_ms = round(wall_ms - float(source_ts_ms), 2)
 
-    def record_book_recv(self, side: str, mono_ms: float, wall_ms: float, source_ts_ms: int = 0) -> None:
-        """Record monotonic receive timestamp and optional CLOB source timestamp for a book side."""
+    def record_book_recv(
+        self, side: str, mono_ms: float, wall_ms: float, source_ts_ms: int = 0, via_ws: bool = True
+    ) -> None:
+        """Record monotonic receive timestamp and WS upstream lag (ignored on REST fallbacks)."""
         if side == "UP":
             self.up_recv_mono_ms, self.up_recv_wall_ms = mono_ms, wall_ms
-            if source_ts_ms > 0:
+            if via_ws and source_ts_ms > 0:
                 self.up_source_ts_ms = int(source_ts_ms)
+                self.up_last_lag_ms = round(wall_ms - float(source_ts_ms), 2)
         else:
             self.dn_recv_mono_ms, self.dn_recv_wall_ms = mono_ms, wall_ms
-            if source_ts_ms > 0:
+            if via_ws and source_ts_ms > 0:
                 self.dn_source_ts_ms = int(source_ts_ms)
+                self.dn_last_lag_ms = round(wall_ms - float(source_ts_ms), 2)
 
     def ingest_binance_trade(self, now: float, price: float, qty: float, is_buyer_maker: bool) -> None:
         """Record Binance aggTrade exclusively (1s close + taker USD volume) for parity with Recorder."""
@@ -256,9 +264,11 @@ class SymbolState:
         self.up_recv_mono_ms = 0.0
         self.up_recv_wall_ms = 0.0
         self.up_source_ts_ms = 0
+        self.up_last_lag_ms = None
         self.dn_recv_mono_ms = 0.0
         self.dn_recv_wall_ms = 0.0
         self.dn_source_ts_ms = 0
+        self.dn_last_lag_ms = None
         self.last_ws_book_local_ts = 0.0
         self.up_local_ts = 0.0
         self.down_local_ts = 0.0
@@ -477,7 +487,7 @@ class SniperMarketHub:
         local = self._clock()
         m_ms, w_ms = self.mono_ms(), local * 1000.0
         src_ms = int(round(ev_ts * 1000.0)) if ev_ts > 0.0 else 0
-        st.record_book_recv(side, m_ms, w_ms, src_ms)
+        st.record_book_recv(side, m_ms, w_ms, src_ms, via_ws=via_ws)
         if side == "UP":
             st.book.up_bid, st.book.up_ask = bid, ask
             st.up_book_ts, st.up_local_ts = max(st.up_book_ts, ev_ts), local
@@ -504,10 +514,8 @@ class SniperMarketHub:
             st.up_bids_raw, st.up_asks_raw = bids_map, asks_map
         else:
             st.down_bids_raw, st.down_asks_raw = bids_map, asks_map
-        bids = sorted(bids_map.items(), key=lambda t: t[0], reverse=True)
-        asks = sorted(asks_map.items(), key=lambda t: t[0])
-        bid = bids[0][0] if bids else None
-        ask = asks[0][0] if asks else None
+        bid = max(bids_map) if bids_map else None
+        ask = min(asks_map) if asks_map else None
         if bid is not None and ask is not None and bid >= ask:
             bid, ask = None, None
         self._set_side_book(st, side, bid, ask, ev_ts, via_ws=via_ws)
@@ -553,10 +561,8 @@ class SniperMarketHub:
             asks_map = st.up_asks_raw if side == "UP" else st.down_asks_raw
             if not bids_map and not asks_map:
                 continue
-            bids = sorted(bids_map.items(), key=lambda t: t[0], reverse=True)
-            asks = sorted(asks_map.items(), key=lambda t: t[0])
-            bid = bids[0][0] if bids else None
-            ask = asks[0][0] if asks else None
+            bid = max(bids_map) if bids_map else None
+            ask = min(asks_map) if asks_map else None
             if bid is not None and ask is not None and bid >= ask:
                 bid, ask = None, None
             self._set_side_book(st, side, bid, ask, ev_ts, via_ws=via_ws)
@@ -569,7 +575,9 @@ class SniperMarketHub:
                 continue
             subscribed_window = (int(self._clock()) // 300) * 300
             try:
-                async with websockets.connect(POLY_CLOB_WS_URL, ping_interval=15, ping_timeout=10, open_timeout=8) as ws:
+                async with websockets.connect(
+                    POLY_CLOB_WS_URL, ping_interval=15, ping_timeout=10, open_timeout=8, max_queue=64
+                ) as ws:
                     await ws.send(json.dumps({"assets_ids": list(tokens), "type": "market"}))
                     self.stats["clob_ws"] = True
                     await self._clob_ws_pump(ws, tokens, subscribed_window)
@@ -581,8 +589,18 @@ class SniperMarketHub:
                 self.stats["clob_error"] = f"{type(exc).__name__}: {exc}"
                 await asyncio.sleep(1.5)
 
+    def _check_clob_ev_fresh(self, ev_type: str, ev: dict[str, Any], stale_since: float) -> tuple[bool, float]:
+        if ev_type not in ("book", "price_change"):
+            return True, stale_since
+        now = self._clock()
+        ev_ts = parse_book_ts_sec(ev)
+        if ev_ts > 0.0 and (now - ev_ts) > 2.5:
+            return False, stale_since or now
+        return True, 0.0
+
     async def _clob_ws_pump(self, ws: Any, tokens: dict[str, tuple[str, str]], subscribed_window: int) -> None:
         last_msg = self._clock()
+        stale_since = 0.0
         while not self._stop.is_set() and (int(self._clock()) // 300) * 300 == subscribed_window:
             if self._clock() - last_msg >= 12.0 or len(self._token_map()) != len(tokens):
                 return
@@ -600,11 +618,15 @@ class SniperMarketHub:
             for ev in payload if isinstance(payload, list) else [payload]:
                 if not isinstance(ev, dict):
                     continue
-                ev_type = ev.get("event_type")
+                ev_type = str(ev.get("event_type") or "")
+                fresh, stale_since = self._check_clob_ev_fresh(ev_type, ev, stale_since)
+                if not fresh:
+                    if (self._clock() - stale_since) >= 1.5:
+                        return
+                    continue
                 if ev_type == "book":
-                    ev_ts = parse_book_ts_sec(ev)
                     mapped = tokens.get(str(ev.get("asset_id")))
-                    if mapped and not (ev_ts > 0.0 and (self._clock() - ev_ts) > 2.5):
+                    if mapped:
                         self.apply_book(mapped[0], mapped[1], ev, via_ws=True)
                 elif ev_type == "price_change":
                     self.apply_price_change(ev, tokens, via_ws=True)

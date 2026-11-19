@@ -1,7 +1,7 @@
 # Path A (Recorder) vs Path B (Runner) Full Per-Second & ENTER Parity Report
 
-- Database rows replayed: `195813` across `65271` 1Hz ticks
-- Per-second full-decision parity (`action`, `reason`, `|dz|<=0.02`, `|dask|<=0.001`): `195566` / `195813` (**`99.8739%`** | gate `>= 99.5%`: **PASS**)
+- Database rows replayed: `201732` across `67244` 1Hz ticks
+- Per-second full-decision parity (`action`, `reason`, `|dz|<=0.02`, `|dask|<=0.001`): `201527` / `201732` (**`99.8984%`** | gate `>= 99.5%`: **PASS**)
 - Per-second `ENTER` union: `155` / `155` (**`100.00%`**)
 - Coin-window signal union (`ENTER`): `38` / `38` (**`100.00%`** | sample gate `>= 100`: **PENDING (38/100)**)
 - Single-slot window union (`ENTER`): `32` / `32` (**`100.00%`**)
@@ -11,16 +11,16 @@
 
 | Decision Group (`Action:Reason`) | Rows | Matched | Agreement |
 |---|---:|---:|---:|
-| `SKIP:OUTSIDE_ENTRY_WINDOW` | 88293 | 88160 | 99.8494% |
-| `SKIP:WARMUP` | 53859 | 53859 | 100.0000% |
-| `SKIP:Z_LOW` | 23246 | 23246 | 100.0000% |
-| `SKIP:FLOW_BLOCKED` | 10623 | 10593 | 99.7176% |
-| `SKIP:ASK_OUT_OF_BAND` | 8014 | 8014 | 100.0000% |
-| `SKIP:NO_BOOK` | 6691 | 6650 | 99.3872% |
+| `SKIP:OUTSIDE_ENTRY_WINDOW` | 88484 | 88352 | 99.8508% |
+| `SKIP:WARMUP` | 59259 | 59259 | 100.0000% |
+| `SKIP:Z_LOW` | 23312 | 23312 | 100.0000% |
+| `SKIP:FLOW_BLOCKED` | 10715 | 10685 | 99.7200% |
+| `SKIP:ASK_OUT_OF_BAND` | 8102 | 8102 | 100.0000% |
+| `SKIP:NO_BOOK` | 6772 | 6731 | 99.3946% |
 | `SKIP:STALE_BN` | 1931 | 1931 | 100.0000% |
 | `SKIP:NO_STRIKE` | 1564 | 1562 | 99.8721% |
 | `SKIP:STALE_CL_TWAP` | 1135 | 1135 | 100.0000% |
-| `SKIP:STALE_BOOK` | 220 | 179 | 81.3636% |
+| `SKIP:STALE_BOOK` | 221 | 221 | 100.0000% |
 | `ENTER:OK` | 155 | 155 | 100.0000% |
 | `SKIP:DIVERGENCE_HIGH` | 48 | 48 | 100.0000% |
 | `SKIP:STALE_CL_SPOT` | 32 | 32 | 100.0000% |
@@ -28,23 +28,23 @@
 
 ## Discrepancies
 
-- `sec` `1795009500` `BTCUSDT`: recorder=`{'action': 'SKIP', 'reason': 'OUTSIDE_ENTRY_WINDOW', 'z': 0.22607634411573652, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'STALE_BOOK', 'z': None, 'ask': None}`
-- `sec` `1795025403` `SOLUSDT`: recorder=`{'action': 'SKIP', 'reason': 'STALE_BOOK', 'z': None, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'OUTSIDE_ENTRY_WINDOW', 'z': 0.19396393875381437, 'ask': None}`
-- `sec` `1795028401` `SOLUSDT`: recorder=`{'action': 'SKIP', 'reason': 'STALE_BOOK', 'z': None, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'NO_STRIKE', 'z': None, 'ask': None}`
-- `sec` `1795029302` `SOLUSDT`: recorder=`{'action': 'SKIP', 'reason': 'STALE_BOOK', 'z': None, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'OUTSIDE_ENTRY_WINDOW', 'z': 0.3099937812142712, 'ask': None}`
-- `sec` `1795030201` `SOLUSDT`: recorder=`{'action': 'SKIP', 'reason': 'STALE_BOOK', 'z': None, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'NO_STRIKE', 'z': None, 'ask': None}`
-- `sec` `1795030501` `ETHUSDT`: recorder=`{'action': 'SKIP', 'reason': 'STALE_BOOK', 'z': None, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'NO_STRIKE', 'z': None, 'ask': None}`
-- `sec` `1795031403` `ETHUSDT`: recorder=`{'action': 'SKIP', 'reason': 'STALE_BOOK', 'z': None, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'OUTSIDE_ENTRY_WINDOW', 'z': 0.22883356388214604, 'ask': None}`
-- `sec` `1795031701` `ETHUSDT`: recorder=`{'action': 'SKIP', 'reason': 'STALE_BOOK', 'z': None, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'NO_STRIKE', 'z': None, 'ask': None}`
-- `sec` `1795032602` `SOLUSDT`: recorder=`{'action': 'SKIP', 'reason': 'STALE_BOOK', 'z': None, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'NO_STRIKE', 'z': None, 'ask': None}`
-- `sec` `1795032903` `BTCUSDT`: recorder=`{'action': 'SKIP', 'reason': 'STALE_BOOK', 'z': None, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'OUTSIDE_ENTRY_WINDOW', 'z': 0.2238873108147815, 'ask': None}`
-- `sec` `1795032904` `SOLUSDT`: recorder=`{'action': 'SKIP', 'reason': 'STALE_BOOK', 'z': None, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'OUTSIDE_ENTRY_WINDOW', 'z': 0.39943551606787875, 'ask': None}`
-- `sec` `1795033502` `ETHUSDT`: recorder=`{'action': 'SKIP', 'reason': 'STALE_BOOK', 'z': None, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'OUTSIDE_ENTRY_WINDOW', 'z': 0.13057721442451056, 'ask': None}`
-- `sec` `1795034104` `ETHUSDT`: recorder=`{'action': 'SKIP', 'reason': 'STALE_BOOK', 'z': None, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'OUTSIDE_ENTRY_WINDOW', 'z': 0.007621118064793129, 'ask': None}`
-- `sec` `1795037402` `SOLUSDT`: recorder=`{'action': 'SKIP', 'reason': 'STALE_BOOK', 'z': None, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'OUTSIDE_ENTRY_WINDOW', 'z': 0.10723977411885531, 'ask': None}`
-- `sec` `1795037702` `BTCUSDT`: recorder=`{'action': 'SKIP', 'reason': 'STALE_BOOK', 'z': None, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'OUTSIDE_ENTRY_WINDOW', 'z': 0.41543141443523823, 'ask': None}`
-- `sec` `1795037703` `SOLUSDT`: recorder=`{'action': 'SKIP', 'reason': 'STALE_BOOK', 'z': None, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'OUTSIDE_ENTRY_WINDOW', 'z': 0.11773985767979257, 'ask': None}`
-- `sec` `1795038002` `SOLUSDT`: recorder=`{'action': 'SKIP', 'reason': 'STALE_BOOK', 'z': None, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'NO_STRIKE', 'z': None, 'ask': None}`
-- `sec` `1795038603` `SOLUSDT`: recorder=`{'action': 'SKIP', 'reason': 'STALE_BOOK', 'z': None, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'OUTSIDE_ENTRY_WINDOW', 'z': 0.21813963375656895, 'ask': None}`
-- `sec` `1795040401` `ETHUSDT`: recorder=`{'action': 'SKIP', 'reason': 'STALE_BOOK', 'z': None, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'NO_STRIKE', 'z': None, 'ask': None}`
-- `sec` `1795041001` `BTCUSDT`: recorder=`{'action': 'SKIP', 'reason': 'STALE_BOOK', 'z': None, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'NO_STRIKE', 'z': None, 'ask': None}`
+- `sec` `1795044008` `BTCUSDT`: recorder=`{'action': 'SKIP', 'reason': 'NO_STRIKE', 'z': None, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'OUTSIDE_ENTRY_WINDOW', 'z': 0.0027530303874281755, 'ask': None}`
+- `sec` `1795044008` `ETHUSDT`: recorder=`{'action': 'SKIP', 'reason': 'NO_STRIKE', 'z': None, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'OUTSIDE_ENTRY_WINDOW', 'z': 0.021947557596192328, 'ask': None}`
+- `sec` `1795044223` `BTCUSDT`: recorder=`{'action': 'SKIP', 'reason': 'NO_BOOK', 'z': 8.88242430715186, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'NO_BOOK', 'z': 8.902520650439447, 'ask': None}`
+- `sec` `1795044225` `BTCUSDT`: recorder=`{'action': 'SKIP', 'reason': 'FLOW_BLOCKED', 'z': 9.161893077061213, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'FLOW_BLOCKED', 'z': 9.182964079819788, 'ask': None}`
+- `sec` `1795044226` `BTCUSDT`: recorder=`{'action': 'SKIP', 'reason': 'NO_BOOK', 'z': 9.909193168630985, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'NO_BOOK', 'z': 9.931982851378345, 'ask': None}`
+- `sec` `1795044227` `BTCUSDT`: recorder=`{'action': 'SKIP', 'reason': 'NO_BOOK', 'z': 9.999607362076672, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'NO_BOOK', 'z': 10.023034703973181, 'ask': None}`
+- `sec` `1795044228` `BTCUSDT`: recorder=`{'action': 'SKIP', 'reason': 'NO_BOOK', 'z': 10.110383099181757, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'NO_BOOK', 'z': 10.1341732930341, 'ask': None}`
+- `sec` `1795044229` `BTCUSDT`: recorder=`{'action': 'SKIP', 'reason': 'NO_BOOK', 'z': 10.285946926432898, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'NO_BOOK', 'z': 10.310117905768047, 'ask': None}`
+- `sec` `1795044230` `BTCUSDT`: recorder=`{'action': 'SKIP', 'reason': 'NO_BOOK', 'z': 10.471804982691333, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'NO_BOOK', 'z': 10.496375647601317, 'ask': None}`
+- `sec` `1795044231` `BTCUSDT`: recorder=`{'action': 'SKIP', 'reason': 'FLOW_BLOCKED', 'z': 10.627913321236463, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'FLOW_BLOCKED', 'z': 10.652903827977674, 'ask': None}`
+- `sec` `1795044232` `BTCUSDT`: recorder=`{'action': 'SKIP', 'reason': 'FLOW_BLOCKED', 'z': 10.815253422077728, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'FLOW_BLOCKED', 'z': 10.840686261794872, 'ask': None}`
+- `sec` `1795044233` `BTCUSDT`: recorder=`{'action': 'SKIP', 'reason': 'FLOW_BLOCKED', 'z': 11.01371065069235, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'FLOW_BLOCKED', 'z': 11.039610176735657, 'ask': None}`
+- `sec` `1795044233` `SOLUSDT`: recorder=`{'action': 'SKIP', 'reason': 'NO_BOOK', 'z': 6.91205739671084, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'NO_BOOK', 'z': 6.9321617317491615, 'ask': None}`
+- `sec` `1795044234` `BTCUSDT`: recorder=`{'action': 'SKIP', 'reason': 'FLOW_BLOCKED', 'z': 11.224006674451287, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'FLOW_BLOCKED', 'z': 11.250411032049461, 'ask': None}`
+- `sec` `1795044234` `SOLUSDT`: recorder=`{'action': 'SKIP', 'reason': 'NO_BOOK', 'z': 6.934400528119775, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'NO_BOOK', 'z': 6.9550994484154565, 'ask': None}`
+- `sec` `1795044235` `BTCUSDT`: recorder=`{'action': 'SKIP', 'reason': 'FLOW_BLOCKED', 'z': 11.449318377474103, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'FLOW_BLOCKED', 'z': 11.47625277848282, 'ask': None}`
+- `sec` `1795044235` `SOLUSDT`: recorder=`{'action': 'SKIP', 'reason': 'NO_BOOK', 'z': 7.071728721590169, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'NO_BOOK', 'z': 7.092837561289765, 'ask': None}`
+- `sec` `1795044236` `BTCUSDT`: recorder=`{'action': 'SKIP', 'reason': 'FLOW_BLOCKED', 'z': 11.760402739870068, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'FLOW_BLOCKED', 'z': 11.7878932023821, 'ask': None}`
+- `sec` `1795044236` `SOLUSDT`: recorder=`{'action': 'SKIP', 'reason': 'NO_BOOK', 'z': 7.174749489476351, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'NO_BOOK', 'z': 7.196293108505357, 'ask': None}`
+- `sec` `1795044237` `BTCUSDT`: recorder=`{'action': 'SKIP', 'reason': 'FLOW_BLOCKED', 'z': 12.088226692951176, 'ask': None}` vs runner=`{'action': 'SKIP', 'reason': 'FLOW_BLOCKED', 'z': 12.116359871628188, 'ask': None}`

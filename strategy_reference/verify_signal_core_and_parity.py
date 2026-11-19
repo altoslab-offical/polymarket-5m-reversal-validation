@@ -11,12 +11,12 @@ import tempfile
 import time
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pandas as pd
 
 from edge_validation.live_recorder_42 import LiveRecorder42, _aggregate_shadow_parity, _sim_one_cfg, analyze_recording, init_db
-from edge_validation.parity_replay import run_parity_replay
+from edge_validation.parity_replay import _make_replay_runner, run_parity_replay
 from engine.chainlink_oracle import ChainlinkRTDSFeed
 from engine.oracle_sniper import TWAP_V2_FILTERED_CONFIG, OrderBookTop, estimate_twap_fair_value, taker_fee_per_share
 from engine.oracle_sniper_feeds import SniperMarketHub
@@ -457,8 +457,89 @@ def check_13_recorder_1hz_binance_bucket_flush(tmp: Path) -> int:
     return 1
 
 
+def check_14_no_cross_stream_lag_contamination(tmp: Path) -> int:
+    """Verify @bookTicker (no E/T) and REST books never overwrite or inflate WS upstream lag_ms."""
+    rec = LiveRecorder42(tmp / "rec_lag.db")
+    try:
+        t0 = 1795050000.0
+        with patch("edge_validation.live_recorder_42.time.time", return_value=t0):
+            rec._on_binance_msg(json.dumps({"stream": "btcusdt@aggTrade", "data": {"p": "100.0", "q": "1.0", "m": False, "E": int((t0 - 0.06) * 1000)}}))
+        lag0 = rec.states["BTCUSDT"].bn_last_lag_ms
+        with patch("edge_validation.live_recorder_42.time.time", return_value=t0 + 4.5):
+            rec._on_binance_msg(json.dumps({"stream": "btcusdt@bookTicker", "data": {"b": "100.0", "a": "100.1"}}))
+        assert lag0 is not None and abs(lag0 - 60.0) < 1.0 and rec.states["BTCUSDT"].bn_last_lag_ms == lag0
+
+        st = rec.states["BTCUSDT"]
+        st.up_token = "UP-TOK"
+        rec.token_to_meta["UP-TOK"] = ("BTCUSDT", "UP")
+        with patch("edge_validation.live_recorder_42.time.time", return_value=t0):
+            rec._apply_book("UP-TOK", [{"price": "0.6", "size": "5"}], [{"price": "0.7", "size": "5"}], source_ts_ms=int((t0 - 0.05) * 1000), via_ws=True)
+        ws_lag = st.up_last_lag_ms
+        with patch("edge_validation.live_recorder_42.time.time", return_value=t0 + 3.0):
+            rec._apply_book("UP-TOK", [{"price": "0.6", "size": "5"}], [{"price": "0.71", "size": "5"}], source_ts_ms=int((t0 - 0.02) * 1000), via_ws=False)
+        assert ws_lag is not None and abs(ws_lag - 50.0) < 1.0 and st.up_last_lag_ms == ws_lag
+    finally:
+        rec.con.close()
+
+    runner, _cl, hub, wall_r, mono_r, _w = _make_mono_runner(tmp, "hub_lag")
+    hub._on_binance_message({"stream": "btcusdt@aggTrade", "data": {"p": "100.0", "q": "0.5", "m": False, "E": int((wall_r[0] - 0.08) * 1000)}})
+    wall_r[0] += 4.5
+    mono_r[0] += 4500.0
+    hub._on_binance_message({"stream": "btcusdt@bookTicker", "data": {"b": "100.0", "a": "100.1"}})
+    assert abs((hub.states["BTCUSDT"].bn_last_lag_ms or 0.0) - 80.0) < 1.0
+    return 1
+
+
+def check_15_clob_sustained_stale_forces_resub_and_roll_sync(tmp: Path) -> int:
+    """Verify lazy CLOB sort, >2.5s sustained stale WS reconnect trigger, and elapsed=0 window reset."""
+    rec = LiveRecorder42(tmp / "rec_roll.db")
+    try:
+        w0 = 1795050000
+        st = rec.states["BTCUSDT"]
+        st.window_ts = w0
+        st.up_token = "UP-OLD"
+        rec.token_to_meta["UP-OLD"] = ("BTCUSDT", "UP")
+        with patch("edge_validation.live_recorder_42.time.time", return_value=float(w0 + 100)):
+            rec._handle_clob_msg(json.dumps({"event_type": "book", "asset_id": "UP-OLD", "timestamp": (w0 + 99) * 1000, "bids": [{"price": "0.60", "size": "5"}], "asks": [{"price": "0.72", "size": "5"}, {"price": "0.70", "size": "5"}]}))
+            assert st._up_dirty is True and abs(st.up_asks[0][0] - 0.70) < 1e-9 and st._up_dirty is False
+            rec._handle_clob_msg(json.dumps({"event_type": "price_change", "timestamp": (w0 + 96) * 1000, "price_changes": []}))
+            assert not rec._clob_resub.is_set()
+        with patch("edge_validation.live_recorder_42.time.time", return_value=float(w0 + 101.6)):
+            rec._handle_clob_msg(json.dumps({"event_type": "price_change", "timestamp": (w0 + 96) * 1000, "price_changes": []}))
+        assert rec._clob_resub.is_set()
+        rec._record_second(w0 + 300)
+        assert st.window_ts == w0 + 300 and st.up_asks == [] and st.up_recv_mono_ms == 0.0 and "UP-OLD" not in rec.token_to_meta
+    finally:
+        rec.con.close()
+    return 1
+
+
+def check_16_daily_report_twap_buckets_and_carry_forward(tmp: Path) -> int:
+    """Verify parity_replay shadow isolation plus Chainlink age PnL & carry-forward daily tables."""
+    _cl, _hub, replay_runner = _make_replay_runner(tmp, [1795020000.0])
+    assert replay_runner.policy.live_shadow_log_path is None
+    db_p = tmp / "rep16.db"
+    con = init_db(db_p)
+    w = 1795020000
+    con.execute("INSERT INTO windows_42 (window_ts,symbol,slug,twap_strike,twap_close,resolved_outcome) VALUES (?,?,?,?,?,?)", (w, "BTCUSDT", f"btc-updown-5m-{w}", 100.0, 100.05, "UP"))
+    for i in range(7):
+        con.execute("INSERT INTO snapshots_1hz (ts_sec,window_ts,symbol,elapsed_sec,cl_spot,cl_twap60,bn_close,bn_trades,bn_age_sec) VALUES (?,?,?,?,?,?,?,?,?)", (w + i, w, "BTCUSDT", i, 100.0, 100.0, 100.0, 0, 0.2))
+    con.commit()
+    con.close()
+    fr_p = tmp / "frozen16.json"
+    fr_data = json.loads((Path(__file__).resolve().parent / "edge_validation" / "frozen_config.json").read_text(encoding="utf-8"))
+    fr_data["count_start_window_ts"] = w
+    fr_p.write_text(json.dumps(fr_data), encoding="utf-8")
+    rep = analyze_recording(db_path=db_p, frozen_path=fr_p, out_dir=tmp, daily_report=True, shadow_log_path=tmp / "missing.jsonl")
+    assert rep["carry_forward"]["rows"][0]["zero_trade_pct"] == 100.0 and rep["carry_forward"]["rows"][0]["gt5s_sec"] == 2
+    md = (tmp / "phase42_daily_report.md").read_text(encoding="utf-8")
+    assert "Chainlink TWAP Age vs Filled PnL" in md and "< 0.5s" in md and "0.5–1.5s" in md and "> 1.5s" in md
+    assert "Binance 1s Volatility Carry-Forward Ratio" in md and "ALERT (>5%)" in md
+    return 1
+
+
 def main() -> None:
-    """Execute all 13 verification checks against isolated temporary state."""
+    """Execute all 16 verification checks against isolated temporary state."""
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         tests = (
@@ -475,6 +556,9 @@ def main() -> None:
             check_11_quiet_market_bookticker_vol_survival,
             check_12_recorder_full_depth_clob_and_monotonic_lag,
             check_13_recorder_1hz_binance_bucket_flush,
+            check_14_no_cross_stream_lag_contamination,
+            check_15_clob_sustained_stale_forces_resub_and_roll_sync,
+            check_16_daily_report_twap_buckets_and_carry_forward,
         )
         passed = sum(fn(tmp) for fn in tests)
     print(json.dumps({"status": "SIGNAL_CORE_AND_PARITY_PASSED", "groups_passed": passed}))

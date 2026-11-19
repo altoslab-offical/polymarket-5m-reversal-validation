@@ -1,70 +1,161 @@
-"""Telegram / desktop message builders for the Chainlink sniper (pure string formatting)."""
+"""Telegram / desktop message builders for the Chainlink sniper (tactical terminal cards)."""
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+import html
+import re
 from typing import Any
 
-SIDE_ZH = {"UP": "買漲 UP", "DOWN": "買跌 DOWN"}
-TAG = "新策略·實盤"
-PAPER_TAG = "TWAP V2·🧪 模擬盤 $43U"
+RULE = "━━━━━━━━━━━━━━━━━━━━"
+TZ_TAIPEI = timezone(timedelta(hours=8))
+SIDE_META = {"UP": ("LONG", "買漲"), "DOWN": ("SHORT", "買跌")}
+_HTML_TAG_RE = re.compile(r"</?(?:b|code|i|u|s)>")
 
 
-def _coin(symbol: str) -> str:
-    return symbol.replace("USDT", "")
+def strip_html_tags(text: str) -> str:
+    """Strip Telegram HTML formatting tags for plain-text desktop/Discord channels."""
+    return html.unescape(_HTML_TAG_RE.sub("", text))
 
 
-def _tag_for(obj: dict[str, Any]) -> str:
-    if not obj.get("paper_mode"):
-        return TAG
-    init_u = int(round(float(obj.get("paper_initial_u") or 43)))
-    return f"TWAP V2·🧪 模擬盤 ${init_u}U"
+def _esc(val: Any) -> str:
+    return html.escape(str(val), quote=False)
 
 
-def entry_message(trade: dict[str, Any], perf_lines: str) -> str:
-    """Message sent when a sniper order is filled."""
-    sym = _coin(str(trade["symbol"]))
-    left = max(0.0, 300.0 - float(trade["entry_elapsed"]))
+def _fmt_px(px: float) -> str:
+    return f"${px:.4f}" if abs(px * 1000.0 - round(px * 1000.0)) >= 0.05 else f"${px:.3f}"
+
+
+def _window_range(window_ts: Any) -> str:
+    ts = int(window_ts or 0)
+    if ts <= 0:
+        return "--:--~--:--"
+    start = datetime.fromtimestamp(ts, tz=TZ_TAIPEI)
+    end = start + timedelta(minutes=5)
+    return f"{start.strftime('%H:%M')}~{end.strftime('%H:%M')}"
+
+
+def _short_oid(trade: dict[str, Any]) -> str:
+    if trade.get("paper_mode"):
+        return str(trade.get("fill_status") or "PAPER-SIM")
+    oid = str(trade.get("order_id") or "").strip()
+    return oid[:18] if oid else "--"
+
+
+def _streak_label(summary: dict[str, Any]) -> str:
+    s_len = int(summary.get("streak_len") or 0)
+    s_type = str(summary.get("streak_type") or "")
+    if s_len <= 0:
+        return "--"
+    if s_type == "W":
+        return f"{s_len} 連勝"
+    return f"{s_len} 連敗" if s_type == "L" else "--"
+
+
+def _footer_html(perf_lines: str, summary: dict[str, Any] | None, unit: str = "pUSD") -> str:
+    if not summary:
+        return _esc(perf_lines) if perf_lines else ""
+    wins = int(summary.get("wins") or 0)
+    losses = int(summary.get("losses") or 0)
+    trades = int(summary.get("trades") or 0)
+    wr = f"{float(summary.get('win_rate_pct') or 0.0):.1f}%" if trades > 0 else "待首單"
+    eq = float(summary.get("equity_u") or 0.0)
+    vault = float(summary.get("vault_u") or 0.0)
+    net = float(summary.get("net_u") or 0.0)
+    pct = float(summary.get("pct") or 0.0)
+    daily = float(summary.get("daily_pnl_usd") or 0.0)
+    vault_seg = f" | 鎖倉 <code>${vault:.0f}</code>" if vault >= 1.0 else ""
+    daily_seg = f" | 今日 <code>{daily:+.2f}</code>" if abs(daily) >= 0.005 else ""
     return (
-        f"🎯 狙擊開單 {sym} {SIDE_ZH.get(str(trade['side']), trade['side'])}（{_tag_for(trade)}）\n"
-        f"• 進場：第 {float(trade['entry_elapsed']):.0f}s（距結算 {left:.0f}s）｜{float(trade['shares']):.2f} 股 @ "
-        f"${float(trade['entry_price']):.3f}（含費成本 ${float(trade['cost_usd']):.2f}U）\n"
-        f"• 依據：Z={float(trade['z']):.2f}｜模型勝率 {float(trade['p_true']) * 100:.1f}%｜"
-        f"淨EV +{float(trade['net_ev']) * 100:.1f}¢｜同刻 {int(trade.get('candidates', 1))} 幣觸發取最優\n"
-        f"{perf_lines}"
+        f"▸ 累計戰績：<code>{wins}W - {losses}L</code> (勝率 <code>{wr}</code>) | 權益 <code>${eq:.2f}</code>{vault_seg}\n"
+        f"▸ 累計損益：<b>{net:+.2f} {unit}</b> (<code>{pct:+.1f}%</code>) | <code>{_streak_label(summary)}</code>{daily_seg}"
     )
 
 
-def exit_message(trade: dict[str, Any], perf_lines: str) -> str:
-    """Message sent when a sniper position is closed (take-profit, stop or expiry settlement)."""
-    sym = _coin(str(trade["symbol"]))
+def _exit_meta(reason: str, won: bool, is_paper: bool) -> tuple[str, str, str]:
+    if reason == "EARLY_TAKE_PROFIT":
+        code = "PAPER HIT" if is_paper else "TARGET HIT"
+        title = "模擬止盈" if is_paper else "獲利止盈"
+        return code, title, ("WIN [提前止盈]" if won else "EXIT [提前出場]")
+    if reason == "EMERGENCY_STOP_LOSS":
+        return ("PAPER STOP" if is_paper else "STOP TRIGGERED"), ("模擬止損" if is_paper else "結構止損"), "STOP [緊急止損]"
+    if won:
+        return ("PAPER WIN" if is_paper else "TARGET HIT"), ("模擬結算勝" if is_paper else "到期結算勝"), "WIN [到期結算]"
+    return ("PAPER LOSS" if is_paper else "STOPPED OUT"), ("模擬結算負" if is_paper else "結算未過線"), "LOSS [到期結算]"
+
+
+def entry_message(trade: dict[str, Any], perf_lines: str, summary: dict[str, Any] | None = None) -> str:
+    """Build tactical Telegram HTML notification card for an executed sniper entry."""
+    sym = _esc(str(trade["symbol"]).replace("USDT", ""))
+    side = str(trade["side"])
+    dir_en, side_zh = SIDE_META.get(side, (side, side))
+    is_paper = bool(trade.get("paper_mode"))
+    seq = int(trade.get("seq") or 0)
+    seq_tag = f" #{seq}" if seq > 0 else ""
+    init_u = int(round(float(trade.get("paper_initial_u") or 40)))
+    hdr = f"[PAPER SNIPE // 🧪 模擬盤 ${init_u}U 進場{seq_tag}]" if is_paper else f"[SNIPE EXECUTED // 實盤進場{seq_tag}]"
+    elapsed = float(trade["entry_elapsed"])
+    left = max(0.0, 300.0 - elapsed)
+    shares = float(trade["shares"])
+    entry_px = float(trade["entry_price"])
+    cost_usd = float(trade["cost_usd"])
+    cost_ps = float(trade.get("cost_per_share") or (cost_usd / max(shares, 1e-6)))
+    cands = int(trade.get("candidates", 1))
+    cand_note = f" (同刻 {cands} 幣取優)" if cands > 1 else ""
+    return (
+        f"<b>{_esc(hdr)}</b>\n{RULE}\n"
+        f"▸ 狙擊方向：<b>{sym}</b> · <b>{_esc(dir_en)}</b> [{_esc(side)} {_esc(side_zh)}]\n"
+        f"▸ 目標盤口：<code>{_window_range(trade.get('window_ts'))}</code> (進場秒數 <code>{elapsed:.0f}s</code> · 剩 <code>{left:.0f}s</code>)\n"
+        f"▸ 成交均價：<code>${entry_px:.3f}</code> (含費成本 <code>${cost_ps:.4f}</code>)\n"
+        f"▸ 部位規模：<code>{shares:.2f} sh</code> (投入 <code>${cost_usd:.2f}</code>)\n"
+        f"▸ 模型指標：<code>P_true {float(trade['p_true']) * 100:.1f}%</code> | "
+        f"<code>Z {float(trade['z']):+.2f}</code> | <code>EV +{float(trade['net_ev']) * 100:.1f}¢</code>{cand_note}\n"
+        f"▸ 訂單單號：<code>{_esc(_short_oid(trade))}</code>\n"
+        f"{RULE}\n{_footer_html(perf_lines, summary)}"
+    )
+
+
+def exit_message(trade: dict[str, Any], perf_lines: str, summary: dict[str, Any] | None = None) -> str:
+    """Build tactical Telegram HTML notification card when a sniper trade closes."""
+    sym = _esc(str(trade["symbol"]).replace("USDT", ""))
+    side = _esc(trade["side"])
     pnl = float(trade["pnl_usd"])
-    reason = str(trade.get("exit_reason", ""))
-    icon = "✅" if pnl > 0 else "❌"
-    title = {
-        "EARLY_TAKE_PROFIT": "提前停利",
-        "EMERGENCY_STOP_LOSS": "結構止損",
-    }.get(reason, "到期結算勝出" if pnl > 0 else "到期結算未過線")
-    prov = "（預言機暫定結果）" if trade.get("provisional") else ""
-    detail = _exit_detail(trade)
-    hold = float(trade.get("exit_ts", 0.0)) - float(trade.get("entry_ts", 0.0))
+    won = bool(trade["won"]) if "won" in trade else pnl > 0.0
+    reason = str(trade.get("exit_reason") or "")
+    is_paper = bool(trade.get("paper_mode"))
+    seq = int(trade.get("seq") or 0)
+    seq_tag = f" #{seq}" if seq > 0 else ""
+    code_en, zh_title, res_tag = _exit_meta(reason, won, is_paper)
+    prov = " <i>(預言機暫定)</i>" if trade.get("provisional") else ""
+    entry_px = float(trade["entry_price"])
+    exit_px = float(trade["exit_price"]) if (reason in ("EARLY_TAKE_PROFIT", "EMERGENCY_STOP_LOSS") and trade.get("exit_price")) else (1.0 if won else 0.0)
+    cost_usd = max(float(trade.get("cost_usd") or 0.0), 1e-6)
+    roi_pct = (pnl / cost_usd) * 100.0
+    hold = max(0.0, float(trade.get("exit_ts") or 0.0) - float(trade.get("entry_ts") or 0.0))
+    oracle_line = ""
+    if reason not in ("EARLY_TAKE_PROFIT", "EMERGENCY_STOP_LOSS") and trade.get("strike") and trade.get("final_price"):
+        oracle_line = f"\n▸ 預言機價：<code>${float(trade['strike']):,.2f}</code> → <code>${float(trade['final_price']):,.2f}</code>"
     return (
-        f"{icon} 關單{title} {sym} {SIDE_ZH.get(str(trade['side']), trade['side'])}｜{pnl:+.2f}U{prov}（{_tag_for(trade)}）\n"
-        f"• {detail}｜持有 {max(0.0, hold):.0f}s｜成本 ${float(trade['cost_usd']):.2f}U\n"
-        f"{perf_lines}"
+        f"<b>[{code_en} // {zh_title}{seq_tag}] {pnl:+.2f} pUSD</b>{prov}\n{RULE}\n"
+        f"▸ 結算結果：<b>{res_tag}</b> | 淨利 <b>{pnl:+.2f} pUSD</b> (<code>{roi_pct:+.1f}%</code>)\n"
+        f"▸ 交易部位：<b>{sym}</b> · <b>{side}</b> (盤口 <code>{_window_range(trade.get('window_ts'))}</code>)\n"
+        f"▸ 進出場價：<code>${entry_px:.3f}</code> → <code>{_fmt_px(exit_px)}</code> (持有 <code>{hold:.0f}s</code>)"
+        f"{oracle_line}\n{RULE}\n{_footer_html(perf_lines, summary)}"
     )
 
 
-def _exit_detail(trade: dict[str, Any]) -> str:
-    reason = str(trade.get("exit_reason", ""))
-    if reason in ("EARLY_TAKE_PROFIT", "EMERGENCY_STOP_LOSS"):
-        return f"賣出 {float(trade.get('exit_shares', trade['shares'])):.2f} 股 @ ${float(trade.get('exit_price', 0.0)):.3f}"
-    strike = trade.get("strike")
-    final = trade.get("final_price")
-    if strike and final:
-        return f"結算：${float(strike):,.2f} ➔ ${float(final):,.2f}"
-    return f"結算：{reason.replace('SETTLED_', '')}"
+def alert_message(
+    alerts: list[str], perf_lines: str, paper_mode: bool = False, summary: dict[str, Any] | None = None
+) -> str:
+    """Build tactical Telegram HTML risk-guard notification card."""
+    hdr = "[PAPER GUARD // 模擬風控]" if paper_mode else "[RISK GUARD // 風控觸發]"
+    body = "\n".join(f"▸ {_esc(a)}" for a in alerts)
+    return f"<b>{hdr}</b>\n{RULE}\n{body}\n{RULE}\n{_footer_html(perf_lines, summary)}"
 
 
-def alert_message(alerts: list[str], perf_lines: str) -> str:
-    """Risk-guard notification."""
-    body = "\n".join(f"• {a}" for a in alerts)
-    return f"🛡 風控提醒（{TAG}）\n{body}\n{perf_lines}"
+def status_message(mode_hdr: str, state_label: str, pos_line: str, coin_lines: list[str], perf_lines: str) -> str:
+    """Build clean plain-Unicode tactical `/sniper` status summary (safe without HTML parse_mode)."""
+    coins_blk = "\n".join(f"▸ {line}" for line in coin_lines)
+    return (
+        f"[SNIPER STATUS // {mode_hdr} · {state_label}]\n{RULE}\n"
+        f"▸ 持倉狀態：{pos_line}\n{coins_blk}\n{RULE}\n{perf_lines}"
+    )

@@ -68,7 +68,7 @@ def _make_replay_runner(tmp_dir: pathlib.Path, clock_ref: List[float]) -> Tuple[
     cl.connected = True
     hub = SniperMarketHub(at, TWAP_V2_FILTERED_CONFIG, clock=clock_fn)
     led = SniperLedger(tmp_dir / "replay_ledger.json", policy=PAPER_40U_RISK_POLICY)
-    pol = replace(PAPER_40U_EXEC_POLICY, vol_cache_path=None, clock=clock_fn)
+    pol = replace(PAPER_40U_EXEC_POLICY, vol_cache_path=None, live_shadow_log_path=None, clock=clock_fn)
     runner = OracleSniperRunner(at, cl, MagicMock(), cfg=TWAP_V2_FILTERED_CONFIG, ledger=led, hub=hub, policy=pol)
     return cl, hub, runner
 
@@ -145,12 +145,24 @@ def _apply_side_books(row: Any, sym: str, t_sec: int, has_ages: bool, hub: Snipe
         if has_ages and up_ms_age is not None:
             st.up_local_ts = float(t_sec) - up_ms_age / 1000.0
             st.up_recv_mono_ms = float(t_sec) * 1000.0 - up_ms_age
+    elif has_ages and float(getattr(row, "up_book_age_sec", 9999.0) or 0.0) >= 9000.0:
+        st.up_recv_mono_ms = 0.0
+        st.up_local_ts = 0.0
+        st.up_bids_raw.clear()
+        st.up_asks_raw.clear()
+        st.book.up_bid = st.book.up_ask = None
     if dn_b or dn_a:
         hub.apply_book(sym, "DOWN", {"asset_id": st.down_token, "timestamp": t_sec * 1000, "bids": [{"price": str(p), "size": str(q)} for p, q in dn_b], "asks": [{"price": str(p), "size": str(q)} for p, q in dn_a]}, via_ws=True)
         dn_ms_age = _row_age_ms(row, "down_book_age_ms", "down_book_age_sec")
         if has_ages and dn_ms_age is not None:
             st.down_local_ts = float(t_sec) - dn_ms_age / 1000.0
             st.dn_recv_mono_ms = float(t_sec) * 1000.0 - dn_ms_age
+    elif has_ages and float(getattr(row, "down_book_age_sec", 9999.0) or 0.0) >= 9000.0:
+        st.dn_recv_mono_ms = 0.0
+        st.down_local_ts = 0.0
+        st.down_bids_raw.clear()
+        st.down_asks_raw.clear()
+        st.book.down_bid = st.book.down_ask = None
 
 
 def _to_point(dec: Optional[SignalDecision], ts: int) -> Optional[EnterPoint]:

@@ -90,7 +90,7 @@ def _ingest_rest_rows(out: KlineMap, rows: List[Any]) -> None:
 
 
 def fetch_rest_1s_range(
-    sym: str, start_sec: int, end_sec: int, max_chunks: int = 20
+    sym: str, start_sec: int, end_sec: int, max_chunks: int = 90
 ) -> Optional[KlineMap]:
     """Fetch up to `max_chunks * 1000` recent 1s klines from public Binance REST API."""
     out: KlineMap = {}
@@ -205,24 +205,25 @@ def _compare_symbol_day(
 def _select_audit_scope(df_s: pd.DataFrame, count_start_ts: int) -> Tuple[pd.DataFrame, str]:
     has_bn = df_s[df_s["bn_age_sec"].notna() & df_s["bn_close"].notna() & (df_s["bn_close"] > 0)].copy()
     if len(has_bn) == 0:
-        return has_bn, "none"
-    post = has_bn[has_bn["window_ts"] >= count_start_ts] if count_start_ts > 0 else has_bn
-    if len(post) > 0:
-        return post.copy(), "post_reset"
+        return has_bn, "post_reset" if count_start_ts > 0 else "none"
+    if count_start_ts > 0:
+        return has_bn[has_bn["window_ts"] >= count_start_ts].copy(), "post_reset"
     max_ts = int(has_bn["ts_sec"].max())
-    recent = has_bn[has_bn["ts_sec"] >= max_ts - 86400]
-    return recent.copy(), "all_ms_recent"
+    return has_bn[has_bn["ts_sec"] >= max_ts - 86400].copy(), "all_ms_recent"
 
 
 def audit_recorder_vs_binance_1s(
     df_s: pd.DataFrame, count_start_ts: int, kline_loader: Optional[KlineLoader] = None
 ) -> Dict[str, Any]:
     """Compare recorded 1Hz Binance closes & zero-trade seconds against official 1s klines (`ts_sec - 1`)."""
+    base = {"align_shift_sec": -1, "close_tol_bps": CLOSE_MATCH_BPS_TOL, "close_gate_pct": CLOSE_MATCH_GATE_PCT, "zero_gate_pp": ZERO_DIFF_GATE_PP}
     if len(df_s) == 0 or "bn_age_sec" not in df_s.columns:
-        return {"scope": "none", "align_shift_sec": -1, "close_tol_bps": CLOSE_MATCH_BPS_TOL, "close_gate_pct": CLOSE_MATCH_GATE_PCT, "zero_gate_pp": ZERO_DIFF_GATE_PP, "rows": [], "overall_close_pass": None, "overall_pass": None}
+        pending = [_format_audit_row(("PENDING", "ALL", "PENDING"), [], (0, 0, 0, 0, 0))]
+        return {**base, "scope": "post_reset" if count_start_ts > 0 else "none", "rows": pending, "overall_close_pass": None, "overall_pass": None}
     sub, scope = _select_audit_scope(df_s, count_start_ts)
     if len(sub) == 0:
-        return {"scope": scope, "align_shift_sec": -1, "close_tol_bps": CLOSE_MATCH_BPS_TOL, "close_gate_pct": CLOSE_MATCH_GATE_PCT, "zero_gate_pp": ZERO_DIFF_GATE_PP, "rows": [], "overall_close_pass": None, "overall_pass": None}
+        pending = [_format_audit_row(("PENDING", "ALL", "PENDING"), [], (0, 0, 0, 0, 0))]
+        return {**base, "scope": scope, "rows": pending, "overall_close_pass": None, "overall_pass": None}
     sub["kline_ts"] = sub["ts_sec"].astype(int) - 1
     sub["utc_day"] = pd.to_datetime(sub["kline_ts"], unit="s", utc=True).dt.strftime("%Y-%m-%d")
     loader = kline_loader or default_kline_loader

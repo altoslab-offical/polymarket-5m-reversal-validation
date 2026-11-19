@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pandas as pd
 
-from edge_validation.binance_1s_audit import normalize_open_ts_sec, parse_binance_1s_csv_bytes
+from edge_validation.binance_1s_audit import audit_recorder_vs_binance_1s, normalize_open_ts_sec, parse_binance_1s_csv_bytes
 from edge_validation.live_recorder_42 import LiveRecorder42, _aggregate_shadow_parity, _sim_one_cfg, analyze_recording, init_db
 from edge_validation.parity_replay import _make_replay_runner, run_parity_replay
 from engine.chainlink_oracle import ChainlinkRTDSFeed
@@ -558,6 +558,12 @@ def check_16_daily_report_twap_buckets_and_carry_forward(tmp: Path) -> int:
     md = (tmp / "phase42_daily_report.md").read_text(encoding="utf-8")
     assert "Chainlink TWAP Age vs Filled PnL" in md and "< 0.5s" in md and "0.5–1.5s" in md and "> 1.5s" in md
     assert "Binance 1s Kline Integrity & Zero-Trade Parity" in md and "FAIL_CLOSE" in md and "ALERT_ZERO" in md and "ALERT (>5%)" not in md
+
+    con_r = sqlite3.connect(db_p)
+    df_s_raw = pd.read_sql_query("SELECT ts_sec, window_ts, symbol, bn_close, bn_trades, bn_age_sec FROM snapshots_1hz", con_r)
+    con_r.close()
+    pend = audit_recorder_vs_binance_1s(df_s_raw, w + 300, kline_loader=_mock_klines)
+    assert pend["scope"] == "post_reset" and pend["overall_pass"] is None and pend["rows"][0]["status"] == "PENDING"
     return 1
 
 

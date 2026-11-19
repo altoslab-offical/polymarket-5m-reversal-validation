@@ -1,10 +1,10 @@
 # Section 4.2 Daily Monitoring Report (Read-Only, Pre-Registered 3 Configs, Bonferroni 98.3% CI)
 
-- Generated UTC: `2026-11-19T03:09:26Z`
-- Re-freeze count start boundary: `window_ts >= 1795057800`
+- Generated UTC: `2026-11-19T03:32:34Z`
+- Re-freeze count start boundary: `window_ts >= 1795059300`
 - Primary evaluation window boundary: `>= 2026-11-21T00:00:00Z` (`window_ts >= 1795219200`)
-- Windows recorded / settled: `681` / `677` | R1 TWAP parity (all): `0.997` (`654/656`) | post-reset: `None` (`0/0`)
-- Reset note: `Pre-Nov21 hardening: O(1) lazy CLOB sort + max_queue=64 + stale-WS auto-reconnect, per-message lag_ms (no @bookTicker/REST cross-stream subtraction), elapsed=0 rollover parity (STALE_BOOK 100%), parity_replay shadow-log isolation, daily TWAP-age PnL & carry-forward monitor, tactical TG cards; zero strategy param changes`
+- Windows recorded / settled: `690` / `685` | R1 TWAP parity (all): `0.997` (`662/664`) | post-reset: `None` (`0/0`)
+- Reset note: `Final pre-Nov21 adjustment: official Binance 1s kline close-parity (>=99%) & zero-trade delta (+-5pp) daily audit (strict post_reset scope, full 24h REST fallback); zero strategy param changes`
 - Cumulative ENTER parity (`parity_replay`): `38` / `38` (**`100.00%`** | sample gate `>= 100`: **PENDING (38/100)**)
 
 ## Primary Gate (`post_nov21`) — Gate Pending Until `filled_1s >= 300`
@@ -26,26 +26,26 @@
 
 | Feed | Metric | Samples (Disc) | P50 (ms) | P90 (ms) | P99 (ms) | Max (ms) |
 |---|---|---:|---:|---:|---:|---:|
-| `cl_twap` | age (`mono_ns`) | 32982 (45) | 534.51 | 1102.26 | 2828.62 | 24437.31 |
-| `cl_spot` | age (`mono_ns`) | 32982 (45) | 536.7 | 1104.98 | 2726.24 | 24427.18 |
-| `bn` | age (`mono_ns`) | 33027 (0) | 45.45 | 311.7 | 811.23 | 2737.86 |
-| `book` | age (`mono_ns`) | 33020 (7) | 9.91 | 124.02 | 2140.54 | 5186.25 |
-| `cl_twap` | lag (`recv_wall - src`) | 33015 (0) | 1343.63 | 1774.76 | 2234.05 | 2895.18 |
-| `cl_spot` | lag (`recv_wall - src`) | 33015 (0) | 1298.19 | 1741.8 | 2210.19 | 2916.64 |
-| `bn` | lag (`recv_wall - src`) | 33026 (0) | 381.38 | 2034.09 | 5020.84 | 11992.4 |
-| `book` | lag (`recv_wall - src`) | 33010 (0) | 87.74 | 5329.49 | 18699.05 | 30950.15 |
+| `cl_twap` | age (`mono_ns`) | 33936 (45) | 536.61 | 1097.7 | 2447.08 | 24437.31 |
+| `cl_spot` | age (`mono_ns`) | 33936 (45) | 541.11 | 1099.26 | 2459.02 | 24427.18 |
+| `bn` | age (`mono_ns`) | 33981 (0) | 45.11 | 309.67 | 811.16 | 2737.86 |
+| `book` | age (`mono_ns`) | 33974 (7) | 9.83 | 125.02 | 2184.35 | 5186.25 |
+| `cl_twap` | lag (`recv_wall - src`) | 33969 (0) | 1347.39 | 1776.08 | 2240.77 | 2895.18 |
+| `cl_spot` | lag (`recv_wall - src`) | 33969 (0) | 1300.77 | 1745.04 | 2217.29 | 2916.64 |
+| `bn` | lag (`recv_wall - src`) | 33980 (0) | 353.89 | 2003.15 | 4984.96 | 11992.4 |
+| `book` | lag (`recv_wall - src`) | 33964 (0) | 89.86 | 5185.68 | 18627.4 | 30950.15 |
 
 ## Warmup & Restart Uptime
 
-- All recorded history: `30724s` (**`8.53h`**) warmup across `6` warmup/restart episodes.
-- Post-reset (`>= 1795057800`): `0s` (**`0.0h`**) warmup across `0` episodes.
+- All recorded history: `31341s` (**`8.71h`**) warmup across `7` warmup/restart episodes.
+- Post-reset (`>= 1795059300`): `0s` (**`0.0h`**) warmup across `0` episodes.
 
 ## Signal Skip Breakdown (`v2_filtered` Window 150–255s)
 
 | Reason | Count |
 |---|---:|
 | `Z_LOW` | 22218 |
-| `WARMUP` | 19870 |
+| `WARMUP` | 20506 |
 | `FLOW_BLOCKED` | 9883 |
 | `ASK_OUT_OF_BAND` | 7641 |
 | `NO_BOOK` | 6396 |
@@ -76,23 +76,20 @@
 | `all` | `0.5–1.5s` | 2 | 1.0 | 0.19023 | 0.19023 |
 | `all` | `> 1.5s` | 0 | None | None | None |
 
-## Binance 1s Volatility Carry-Forward Ratio (`feed_alive` Monitor, scope=`all_ms`)
+## Binance 1s Kline Integrity & Zero-Trade Parity (scope=`post_reset`, align=`ts_sec-1`)
 
-_Note: `compute_sigma_from_vol_hist` takes `max(sample_var, ewma_var)`; multi-second cumulative variance stays unbiased under zero-return carry-forward while `sample_var` floor prevents quiet-regime EWMA under-estimation._
+_Replaces the revoked `>5%` zero-trade carry-forward alert (natural zero-trade 1s seconds ~14–44% match historical 1s klines). Official gates: Close `<=2bps` parity `>= 99.0%` (`FAIL_CLOSE` below) and `|Rec Zero - Kline Zero| <= 5.0 pp` (`ALERT_ZERO` above)._
 
-| Symbol | Total Sec | Zero-Trade Carry (`bn_trades=0`) | Extended `>5s` Carry | Max Quiet Streak | Status (`<=5%`) |
-|---|---:|---:|---:|---:|---|
-| `BTCUSDT` | 36328 | 14866 (**40.92%**) | 2545 (7.01%) | 61s | **ALERT (>5%)** |
-| `ETHUSDT` | 36328 | 19373 (**53.33%**) | 4170 (11.48%) | 89s | **ALERT (>5%)** |
-| `SOLUSDT` | 36328 | 23755 (**65.39%**) | 6742 (18.56%) | 91s | **ALERT (>5%)** |
-| `ALL` | 108984 | 57994 (**53.21%**) | 13457 (12.35%) | 91s | **ALERT (>5%)** |
+| UTC Day | Symbol | Source | Matched Sec | Close `<=2bps` (`>=99%`) | Exact % | P99 / Max (bps) | Rec Zero % | Kline Zero % | Delta (`±5pp`) | Max Quiet | Status |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `PENDING` | `ALL` | `PENDING` | 0 | **n/a** | n/a | n/a / n/a | n/a | n/a | n/a | 0s | **PENDING** |
 
 ## Live Shadow Parity (`PAPER_40U` Runner vs 4.2 Recorder, overlap=0, overall=None)
 
 | UTC Day | Overlap Coin-Win | Recorder ENTER | Runner ENTER | Union | Matched | Parity | Gate (`>=99%`) |
 |---|---:|---:|---:|---:|---:|---:|---|
 
-## R1 TWAP Parity Mismatches (All: 654/656=0.997 | Post-reset: 0/0=None)
+## R1 TWAP Parity Mismatches (All: 662/664=0.997 | Post-reset: 0/0=None)
 
 | Window TS | Symbol | Slug | Program `twap_strike` | Program `twap_close` | Gamma `priceToBeat` | Gamma `finalPrice` | Gamma Outcome | Pred |
 |---:|---|---|---:|---:|---:|---:|---|---|

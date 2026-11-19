@@ -1,0 +1,12 @@
+data/
+.venv/
+__pycache__/
+*.py[cod]
+*.db
+*.sqlite
+*.log
+.env
+.pytest_cache/
+backups/
+antigravity_brain_backup/
+edge_validation/cache/

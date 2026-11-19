@@ -1,0 +1,3038 @@
+<!DOCTYPE html>
+<html lang="zh-TW" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>⚡ 5m 超買超賣反彈 & 馬丁格爾量化通知系統</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Chart.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              50: '#f0fdf4',
+              100: '#dcfce7',
+              500: '#22c55e',
+              600: '#16a34a',
+              700: '#15803d',
+              900: '#14532d',
+            },
+            dark: {
+              950: '#070a12',
+              900: '#0d1322',
+              850: '#12192e',
+              800: '#1a233e',
+              750: '#202b4a',
+              700: '#263354',
+              600: '#384872',
+            }
+          },
+          fontFamily: {
+            mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Monaco', 'Consolas', 'monospace']
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    /* Custom scrollbar */
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #0d1322;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #263354;
+      border-radius: 3px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #384872;
+    }
+    .glow-green {
+      box-shadow: 0 0 18px -2px rgba(34, 197, 94, 0.35);
+    }
+    .glow-cyan {
+      box-shadow: 0 0 18px -2px rgba(6, 182, 212, 0.35);
+    }
+    .glow-amber {
+      box-shadow: 0 0 18px -2px rgba(245, 158, 11, 0.35);
+    }
+    .glow-red {
+      box-shadow: 0 0 18px -2px rgba(244, 63, 94, 0.35);
+    }
+    @keyframes pulse-slow {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.85; transform: scale(0.99); }
+    }
+    .animate-pulse-slow {
+      animation: pulse-slow 2.5s infinite;
+    }
+  </style>
+</head>
+<body class="bg-dark-950 text-slate-100 min-h-screen flex flex-col font-sans antialiased selection:bg-emerald-500 selection:text-white">
+
+  <!-- Top Sticky Header -->
+  <header class="sticky top-0 z-40 bg-dark-900/90 backdrop-blur-md border-b border-dark-800 px-4 lg:px-8 py-3.5 shadow-lg shadow-black/50">
+    <div class="max-w-[1720px] mx-auto flex flex-col md:flex-row items-center justify-between gap-3">
+      
+      <!-- Title & Branding -->
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-emerald-600 via-teal-500 to-cyan-400 flex items-center justify-center shadow-lg shadow-emerald-500/20 text-white font-black text-xl">
+          ⚡
+        </div>
+        <div>
+          <h1 class="text-lg md:text-xl font-bold bg-gradient-to-r from-emerald-400 via-teal-300 to-cyan-200 bg-clip-text text-transparent flex items-center gap-2">
+            Polymarket 5m CLOB 四引擎全自動量化系統 (V5 高效複利版)
+            <span id="system-mode-tag" class="text-xs px-2.5 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-bold animate-pulse">🎯 V5 信心監控暖機中 (88.0% / 95% 自動轉正)</span>
+          </h1>
+          <p class="text-xs text-slate-400">
+            V5 四引擎高頻狙擊 (日均 12.8 單) + 智慧 2+1 延遲三碼馬丁 • 兩年 98.99% / 近3.5日 33單 100% 勝率 • 中位數 2.65 天達標 $200U、6.95 天達標 $1,000U
+          </p>
+        </div>
+      </div>
+
+      <!-- Live status & Actions -->
+      <div class="flex flex-wrap items-center gap-2.5">
+        <!-- Live status badge -->
+        <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-dark-850 border border-dark-700 text-xs">
+          <span class="relative flex h-2.5 w-2.5">
+            <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75"></span>
+            <span class="relative inline-flex rounded-full h-2.5 w-2.5 bg-cyan-500"></span>
+          </span>
+          <span class="text-slate-300">系統狀態: <strong class="text-cyan-400 font-semibold" id="sys-status-text">模擬追蹤中 (3s)</strong></span>
+        </div>
+
+        <!-- Clock -->
+        <div class="hidden sm:flex items-center px-3 py-1.5 rounded-lg bg-dark-850 border border-dark-700 text-xs font-mono text-slate-300" id="utc-clock">
+          --:--:-- UTC
+        </div>
+
+        <!-- Two-Day Review Button -->
+        <button id="btn-review" onclick="triggerTwoDayReview()" class="px-3.5 py-1.5 rounded-lg bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-md shadow-cyan-600/20 transition-all active:scale-95">
+          <span>📊 2天 Review 報告</span>
+          <span class="hidden md:inline text-[10px] opacity-85">(每 48h 自動評估)</span>
+        </button>
+
+        <!-- Real Wallet Safe Badge Button -->
+        <button id="btn-sync-wallet" onclick="syncLiveWalletNow()" class="px-3.5 py-1.5 rounded-lg bg-emerald-950/60 hover:bg-emerald-900/60 text-emerald-300 border border-emerald-500/40 font-bold text-xs flex items-center gap-1.5 shadow-md shadow-emerald-600/10 transition-all active:scale-95">
+          <span>🛡️ 真實錢包保護中</span>
+          <span id="btn-wallet-amount" class="text-white font-mono font-black">($89.75 pUSD)</span>
+        </button>
+      </div>
+
+    </div>
+  </header>
+
+  <!-- Main Content Container -->
+  <main class="flex-1 max-w-[1720px] w-full mx-auto p-4 lg:p-8 space-y-8">
+
+    <!-- TOP RESONANCE BANNER: 三幣共振・極限衰竭狙擊 (Trinity Resonance Sniper V2) -->
+    <div id="resonance-banner" class="rounded-2xl bg-gradient-to-r from-dark-900 via-dark-850 to-dark-900 border border-dark-750 p-4 shadow-xl flex flex-col lg:flex-row items-center justify-between gap-4">
+      <div class="flex items-center gap-3">
+        <div class="w-9 h-9 rounded-xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center text-cyan-400 text-lg">
+          🌐
+        </div>
+        <div>
+          <div class="flex items-center gap-2">
+            <span class="text-xs font-bold text-white tracking-wide">V5 四引擎宏觀共振・高頻極限衰竭狙擊 (Quad-Engine High-Efficiency Sniper)</span>
+            <span class="text-[10px] px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-semibold">Engine A 4連K + Engine B 3連K爆量 + Engine C 2連K巨浪 + Engine D RSI(2)極值</span>
+          </div>
+          <p class="text-[11px] text-slate-400 mt-0.5">
+            跨幣種高效率掃單：每 4 秒同步監控 BTC / ETH / SOL 5m K 線與 Chainlink 60s TWAP 預言機，日均 12.81 次高勝率序列（約每 1.8 小時一單，近 3.47 日 33 單 100% 全勝）。
+          </p>
+        </div>
+      </div>
+
+      <!-- Live Resonance Matrix -->
+      <div class="flex flex-wrap items-center gap-3 text-xs font-mono">
+        <div class="px-3 py-1.5 rounded-xl bg-dark-900 border border-dark-800 flex items-center gap-2">
+          <span class="text-slate-400 font-sans text-[11px]">全市場均 RSI(6):</span>
+          <span class="font-bold text-slate-200" id="res-mean-rsi">--</span>
+        </div>
+
+        <div class="px-3 py-1.5 rounded-xl bg-dark-900 border border-dark-800 flex items-center gap-2">
+          <span class="text-slate-400 font-sans text-[11px]">同步連跌幣數:</span>
+          <span class="font-bold text-rose-400" id="res-sync-down">0 / 3</span>
+        </div>
+
+        <div class="px-3 py-1.5 rounded-xl bg-dark-900 border border-dark-800 flex items-center gap-2">
+          <span class="text-slate-400 font-sans text-[11px]">同步連漲幣數:</span>
+          <span class="font-bold text-emerald-400" id="res-sync-up">0 / 3</span>
+        </div>
+
+        <!-- Resonance Active Status Badge -->
+        <div id="res-status-badge" class="px-3 py-1.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 font-sans font-bold flex items-center gap-1.5">
+          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
+          <span>🟢 宏觀共振待機中 (常態震盪)</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- CONFIDENCE MONITOR & AUTO-GRADUATION ENGINE PANEL (V5 HIGH-EFFICIENCY EDITION) -->
+    <section id="confidence-monitor-panel" class="rounded-2xl bg-gradient-to-br from-dark-900 via-dark-850 to-dark-900 border border-cyan-500/40 p-5 shadow-2xl space-y-4 relative overflow-hidden">
+      <div class="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-dark-800 pb-4">
+        <div class="flex items-start sm:items-center gap-3.5">
+          <div class="w-12 h-12 rounded-2xl bg-gradient-to-br from-cyan-500/20 to-emerald-500/20 border border-cyan-400/40 flex items-center justify-center text-2xl shadow-lg shadow-cyan-500/10">
+            🎯
+          </div>
+          <div>
+            <div class="flex flex-wrap items-center gap-2">
+              <h2 class="text-base md:text-lg font-black text-white tracking-wide">
+                V5 高效複利版・五維實盤信心監控與自動轉正引擎 (Confidence Monitor)
+              </h2>
+              <span id="conf-stage-badge" class="text-[11px] px-2.5 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 font-mono font-bold">
+                🔥 實況 11 連勝中 • 再贏 3 輪自動切換真金
+              </span>
+            </div>
+            <p id="conf-summary-text" class="text-xs text-slate-300 mt-1">
+              V5 高效複利版結合【四引擎高頻狙擊 (日均12.8單)】+【智慧 2+1 延遲三碼馬丁 (兩年98.99%勝率)】+【微步複利階梯】！信心達 ≥ 95.0% 自動切換真金實盤。
+            </p>
+          </div>
+        </div>
+
+        <!-- Score Gauge & Action Controls -->
+        <div class="flex flex-wrap items-center gap-3">
+          <div class="px-4 py-2 rounded-xl bg-dark-900 border border-cyan-500/40 text-right font-mono">
+            <div class="text-[10px] text-slate-400 font-sans">綜合實盤信心指數 (門檻 95%)</div>
+            <div class="flex items-baseline gap-1.5 justify-end">
+              <span id="conf-score-number" class="text-2xl md:text-3xl font-black text-cyan-400">88.0%</span>
+              <span class="text-xs text-slate-400">/ 100%</span>
+            </div>
+          </div>
+
+          <div class="flex flex-col gap-1.5">
+            <label class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-dark-900 border border-dark-750 text-xs cursor-pointer hover:border-cyan-500/40 transition">
+              <input type="checkbox" id="conf-auto-graduate-cb" checked onchange="toggleAutoGraduate(this.checked)" class="rounded bg-dark-800 border-dark-600 text-emerald-500 focus:ring-0">
+              <span class="text-slate-200 font-semibold">達 95% 自動切換真金實盤</span>
+            </label>
+            <button id="btn-graduate-now" onclick="graduateToRealMoneyNow()" class="px-3.5 py-1.5 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs flex items-center justify-center gap-1.5 shadow-md shadow-emerald-600/20 transition active:scale-95">
+              <span>🚀 立即啟動真金實盤 ($2.81U 起步)</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Overall Confidence Progress Bar -->
+      <div class="space-y-1.5">
+        <div class="flex items-center justify-between text-[11px] font-mono">
+          <span class="text-cyan-300 font-sans font-semibold">📊 實盤轉正信心進度條 (0% ➔ 95% 自動解鎖真金實盤 ➔ 100% 滿載)</span>
+          <span id="conf-progress-label" class="text-emerald-400 font-bold">目前 88.0%（距離 95% 自動轉正僅差 +7.0%，約 2~3 輪勝場）</span>
+        </div>
+        <div class="w-full bg-dark-950 h-3 rounded-full overflow-hidden border border-dark-750 relative">
+          <div class="absolute top-0 bottom-0 left-[95%] w-0.5 bg-amber-400 z-10" title="95% 自動轉正門檻"></div>
+          <div id="conf-score-bar" class="h-full bg-gradient-to-r from-cyan-500 via-teal-400 to-emerald-400 transition-all duration-700" style="width: 88.0%"></div>
+        </div>
+      </div>
+
+      <!-- 5 Pillars Breakdown Grid -->
+      <div id="conf-pillars-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+        <!-- Populated dynamically by renderConfidenceMonitor() -->
+      </div>
+
+      <!-- V5 High-Efficiency Highlights Strip -->
+      <div class="pt-2 border-t border-dark-800 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+        <div class="flex flex-wrap items-center gap-2">
+          <span class="font-bold text-emerald-400">⚡ V5 高效複利版四大引擎升級：</span>
+          <span class="px-2 py-0.5 rounded bg-dark-900 border border-dark-750 text-slate-300">① 四引擎高頻狙擊 (日均 12.8 單，近3.5日 33單 100%全勝)</span>
+          <span class="px-2 py-0.5 rounded bg-dark-900 border border-dark-750 text-slate-300">② 智慧 2+1 延遲三碼馬丁 (1x/2.1x/4.41x・兩年 98.99% 勝率)</span>
+          <span class="px-2 py-0.5 rounded bg-dark-900 border border-dark-750 text-slate-300">③ 微步高周轉複利階梯 (中位數 2.65天破200U、6.95天破1000U)</span>
+          <span class="px-2 py-0.5 rounded bg-dark-900 border border-dark-750 text-slate-300">④ 首碼 0.16% 防接刀 + 30m EMA20 斜率防暴盾</span>
+        </div>
+        <span class="font-mono text-cyan-300 font-bold">兩年 3 碼勝率 98.99% (2碼 94.94%) | 近3.5天V5回放 33勝0敗 (+$163.48U)</span>
+      </div>
+    </section>
+
+    <!-- ⚔️ MULTI-STRATEGY PARALLEL ARENA & MULTI-LANE RADAR -->
+    <section class="space-y-4">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+        <div class="flex items-center gap-2.5">
+          <span class="text-2xl">⚔️</span>
+          <div>
+            <h2 class="text-lg md:text-xl font-bold bg-gradient-to-r from-amber-400 via-orange-300 to-yellow-300 bg-clip-text text-transparent">
+              Polymarket 5m 多策略平行競技場 (Multi-Strategy Parallel Arena)
+            </h2>
+            <p class="text-xs text-slate-400">
+              四大旗艦策略各配獨立 $80.00U 模擬帳本 • 實盤盤口同步競賽 • 首位達成 $200.00U 且 CAS 評分最優者自動升級真金實盤
+            </p>
+          </div>
+        </div>
+        <div class="flex items-center gap-2">
+          <span id="watchdog-live-badge" class="text-xs px-2.5 py-1 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-mono font-semibold flex items-center gap-1.5 shadow-sm">
+            <span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
+            🟢 60s 守護中・純 Python 零 Token・三幣獨立防死鎖
+          </span>
+        </div>
+      </div>
+
+      <!-- 4 Strategy Arena Cards Grid -->
+      <div id="arena-cards-grid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+        <!-- Rendered dynamically by renderArenaLeaderboard() -->
+      </div>
+
+      <!-- 三幣非對稱通道雷達 (CAP Multi-Lane Radar) -->
+      <div class="bg-dark-900/90 rounded-2xl border border-dark-800 p-4 space-y-3 shadow-xl">
+        <div class="flex flex-wrap items-center justify-between gap-2 border-b border-dark-800 pb-2.5">
+          <div class="flex items-center gap-2">
+            <span class="text-base">📡</span>
+            <span class="text-xs font-bold text-white uppercase tracking-wider">三幣非對稱通道雷達 (Multi-Lane Asymmetric Radar)</span>
+            <span class="text-[10px] px-2 py-0.5 rounded bg-dark-800 text-slate-400 font-mono border border-dark-750">
+              CAP 風控規則: 首碼併發 ≤ 2 幣 | 救援鎖定單幣排他 | 90m Time-Stop 自動認賠釋放
+            </span>
+          </div>
+          <div id="lane-timeout-info" class="text-[11px] font-mono text-cyan-400">
+            通道健康狀態: 正常運行中 (3s 輪詢)
+          </div>
+        </div>
+
+        <div id="lanes-container" class="grid grid-cols-1 md:grid-cols-3 gap-3.5">
+          <!-- Rendered dynamically by renderMultiLanes() -->
+        </div>
+      </div>
+    </section>
+
+    <!-- HERO SECTION: 🚀 Polymarket 模擬金實測驗證艙 ($105U ➔ $200U ➔ $1,000U) -->
+    <section class="space-y-4">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+        <div class="flex items-center gap-2.5">
+          <span class="text-2xl">🚀</span>
+          <div>
+            <h2 class="text-lg md:text-xl font-bold bg-gradient-to-r from-emerald-400 via-teal-300 to-cyan-300 bg-clip-text text-transparent">
+              Polymarket 模擬金實測驗證艙 ($105U ➔ $200U ➔ $1,000U)
+            </h2>
+            <p class="text-xs text-slate-400">
+              Polymarket 5m CLOB V2 雙段式護利模式 • 實時追蹤真實盤口與 Chainlink 60s TWAP 預言機 • 零真金消耗驗證實際勝率
+            </p>
+          </div>
+        </div>
+
+        <!-- Quick Info Tag -->
+        <div class="flex items-center gap-2">
+          <span class="text-xs px-2.5 py-1 rounded-lg bg-cyan-500/15 border border-cyan-500/30 text-cyan-300 font-mono font-semibold">
+            V6.5 動態護城河保本馬丁 • 24個月 100% 零破產 • 雙軌真實撮合零幽靈單
+          </span>
+        </div>
+      </div>
+
+      <!-- Hero Grid: Left = Simulated Account | Right = Master Strategy 2-Year Validation -->
+      <div class="grid grid-cols-1 xl:grid-cols-12 gap-6">
+
+        <!-- LEFT COLUMN: Simulated Account (5 cols) -->
+        <div class="xl:col-span-5 bg-dark-900/95 rounded-2xl border border-dark-800 p-5 space-y-4.5 shadow-2xl relative overflow-hidden">
+          
+          <!-- Top Header -->
+          <div class="flex items-center justify-between border-b border-dark-800 pb-3">
+            <div class="flex items-center gap-2">
+              <span class="w-2.5 h-2.5 rounded-full bg-cyan-400 shadow-sm shadow-cyan-400 animate-pulse"></span>
+              <h3 class="text-sm font-bold text-white">Polymarket 模擬金實測帳戶 (Simulated Account)</h3>
+              <span id="acct-mode-badge" class="text-[10px] px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-mono font-bold">🧪 模擬金模式 (DRY RUN)</span>
+            </div>
+            <button onclick="triggerTwoDayReview()" class="text-xs text-cyan-400 hover:text-cyan-300 transition font-semibold flex items-center gap-1">
+              <span>📊</span> 2天 Review
+            </button>
+          </div>
+
+          <!-- Big Total Equity Display -->
+          <div class="p-4 rounded-2xl bg-gradient-to-br from-dark-850 via-dark-850 to-dark-900 border border-dark-750 relative overflow-hidden">
+            <div class="flex items-baseline justify-between">
+              <div>
+                <div class="text-[11px] text-slate-400 font-medium">Polymarket 實盤總權益 (Live Total Equity)</div>
+                <div class="text-3xl lg:text-4xl font-black font-mono text-cyan-400 mt-1 tracking-tight flex items-baseline gap-2">
+                  $<span id="paper-total-equity">90.12</span>
+                  <span class="text-sm font-bold text-slate-400 font-sans">pUSD</span>
+                </div>
+              </div>
+              <div class="text-right">
+                <div class="text-[11px] text-slate-400 font-medium" id="paper-milestone-label">下一鎖倉門檻 ($220U) 進度</div>
+                <div class="text-2xl font-black font-mono text-emerald-400 mt-1" id="paper-progress-pct">40.96%</div>
+              </div>
+            </div>
+
+            <!-- Target 200000u Progress Bar -->
+            <div class="mt-3 space-y-1">
+              <div class="flex justify-between text-[10px] text-slate-400 font-mono">
+                <span id="paper-init-label">實盤起點: $85.66 U</span>
+                <span id="paper-vault-banner">滿 $220U 鎖 $115U ➔ $1,000U 鎖 $500U ➔ 終極目標 $200,000 U (20萬U)</span>
+              </div>
+              <div class="w-full bg-dark-800 h-2 rounded-full overflow-hidden">
+                <div id="paper-progress-bar" class="h-full bg-gradient-to-r from-cyan-500 via-teal-400 to-emerald-400 transition-all duration-500" style="width: 41%"></div>
+              </div>
+            </div>
+
+            <!-- Equity Breakdown Sub-badges -->
+            <div class="grid grid-cols-3 gap-2 mt-3 pt-3 border-t border-dark-800 text-center font-mono">
+              <div class="p-1.5 rounded-lg bg-dark-900/60 border border-dark-800">
+                <div class="text-[9px] text-slate-400 font-sans">⚔️ 可支配作戰本金</div>
+                <div class="text-xs text-cyan-300 font-bold mt-0.5" id="paper-active-equity">$90.12 U</div>
+              </div>
+              <div class="p-1.5 rounded-lg bg-dark-900/60 border border-dark-800">
+                <div class="text-[9px] text-slate-400 font-sans">🔒 永久鎖死保底金</div>
+                <div class="text-xs text-emerald-400 font-bold mt-0.5" id="paper-vault-equity">$0.00 U (待滿$220鎖$115)</div>
+              </div>
+              <div class="p-1.5 rounded-lg bg-dark-900/60 border border-dark-800">
+                <div class="text-[9px] text-slate-400 font-sans">歷史峰值淨值</div>
+                <div class="text-xs text-slate-300 font-bold mt-0.5" id="paper-peak-equity">$80.00 U</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Next Signal Bet Sizing Box -->
+          <div class="p-3.5 rounded-xl bg-dark-850/80 border border-dark-750 space-y-2.5">
+            <div class="flex items-center justify-between text-[11px]">
+              <span class="font-bold text-white flex items-center gap-1.5">
+                <span>🎯</span> V6.5 動態護城河保本馬丁 (3碼護城/4碼利潤解鎖) &amp; Polymarket 5m 份數
+              </span>
+              <span class="text-[10px] text-cyan-300 font-semibold font-mono" id="paper-watermark-tag">Lv.1A 動態護城河三碼保本階</span>
+            </div>
+
+            <div class="grid grid-cols-2 lg:grid-cols-4 gap-2 font-mono">
+              <div class="p-2 rounded-lg bg-dark-900 border border-dark-800 flex flex-col justify-between space-y-1">
+                <div class="flex items-center justify-between">
+                  <span class="text-[9px] text-slate-400 font-sans">第 1 碼 (1.0x)</span>
+                  <span class="text-[8px] px-1 py-0.5 rounded bg-emerald-500/10 text-emerald-400 font-bold font-sans">68.1%</span>
+                </div>
+                <div class="text-sm font-bold text-emerald-400" id="paper-next-s1">$2.55 U</div>
+                <div class="text-[9px] text-slate-300 font-sans">
+                  <strong class="text-cyan-300 font-mono font-bold" id="paper-next-s1-shares">5.0</strong> 份 @ 51¢
+                </div>
+              </div>
+
+              <div class="p-2 rounded-lg bg-dark-900 border border-dark-800 flex flex-col justify-between space-y-1">
+                <div class="flex items-center justify-between">
+                  <span class="text-[9px] text-slate-400 font-sans">第 2 碼 (2.20x)</span>
+                  <span class="text-[8px] px-1 py-0.5 rounded bg-amber-500/10 text-amber-400 font-bold font-sans">91.1%</span>
+                </div>
+                <div class="text-sm font-bold text-amber-400" id="paper-next-s2">$5.61 U</div>
+                <div class="text-[9px] text-slate-300 font-sans">
+                  <strong class="text-cyan-300 font-mono font-bold" id="paper-next-s2-shares">11.0</strong> 份 (共振)
+                </div>
+              </div>
+
+              <div class="p-2 rounded-lg bg-dark-900 border border-dark-800 flex flex-col justify-between space-y-1">
+                <div class="flex items-center justify-between">
+                  <span class="text-[9px] text-slate-400 font-sans">第 3 碼 (4.84x)</span>
+                  <span class="text-[8px] px-1 py-0.5 rounded bg-cyan-500/15 text-cyan-300 font-bold font-sans">97.3%</span>
+                </div>
+                <div class="text-sm font-bold text-cyan-300" id="paper-next-s3">$12.34 U</div>
+                <div class="text-[9px] text-slate-300 font-sans">
+                  <strong class="text-cyan-300 font-mono font-bold" id="paper-next-s3-shares">24.2</strong> 份 (共振)
+                </div>
+              </div>
+
+              <div class="p-2 rounded-lg bg-dark-900 border border-cyan-500/40 flex flex-col justify-between space-y-1">
+                <div class="flex items-center justify-between">
+                  <span class="text-[9px] text-cyan-300 font-sans font-semibold">第 4 碼 (11.20x)</span>
+                  <span class="text-[8px] px-1 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold font-sans">99.15%</span>
+                </div>
+                <div class="text-sm font-bold text-emerald-300" id="paper-next-s4">$28.56 U</div>
+                <div class="text-[9px] text-slate-300 font-sans">
+                  <strong class="text-cyan-300 font-mono font-bold" id="paper-next-s4-shares">56.0</strong> 份 (鎖利)
+                </div>
+              </div>
+            </div>
+
+            <!-- Two-Day Review Status & Countdown Banner -->
+            <div id="two-day-review-banner" class="p-2.5 rounded-xl bg-gradient-to-r from-cyan-950/60 to-dark-850 border border-cyan-500/40 flex items-center justify-between text-[11px] font-mono">
+              <div class="flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full bg-cyan-400 animate-ping"></span>
+                <span class="text-cyan-300 font-bold">⏱️ 2天定期 Review 倒數：</span>
+                <span id="review-countdown-display" class="font-bold text-white text-xs">48:00:00</span>
+              </div>
+              <button onclick="triggerTwoDayReview()" class="px-2.5 py-1 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-200 border border-cyan-500/40 text-[10px] font-bold transition active:scale-95">
+                📊 立即評估
+              </button>
+            </div>
+
+            <!-- Live Capital Ladder & Pending Step-2 Status Box -->
+            <div class="p-2.5 rounded-lg bg-dark-900/90 border border-dark-800 text-[10px] space-y-1">
+              <div class="flex items-center justify-between text-slate-300 font-medium">
+                <span>🏆 100¢ 到期結算: <strong class="text-emerald-400 font-mono">+96.1%</strong></span>
+                <span>🛡️ 85¢ / 90¢ 盤中反彈護利: <strong class="text-cyan-400 font-mono">+66.7% ~ +76.5%</strong></span>
+              </div>
+              <div id="paper-live-ladder-note" class="text-[10px] text-cyan-300 font-medium leading-snug pt-1 border-t border-dark-800/80">
+                📌 模擬金階梯：讀取中...
+              </div>
+            </div>
+          </div>
+
+          <!-- Live Sequence Execution Counter -->
+          <div class="flex items-center justify-between px-1 text-xs">
+            <span class="font-bold text-white flex items-center gap-1.5">
+              <span>📜</span> Polymarket 模擬金實測交割明細 (Simulated Trade Log)
+            </span>
+            <div class="flex items-center gap-2 font-mono text-[10px]">
+              <span class="text-cyan-400" id="paper-seq-count-label">已執行: 0 輪</span>
+              <span class="text-slate-600">|</span>
+              <span class="text-emerald-400 font-bold" id="paper-winrate-stat">模擬勝率: --%</span>
+            </div>
+          </div>
+
+          <!-- Trade Log Table -->
+          <div class="space-y-2 pt-1 border-t border-dark-800">
+            <div class="overflow-x-auto max-h-[240px]">
+              <table class="w-full text-left text-xs border-collapse">
+                <thead class="sticky top-0 bg-dark-900 border-b border-dark-800 text-[10px] text-slate-400 font-medium">
+                  <tr>
+                    <th class="py-1.5 px-2">#</th>
+                    <th class="py-1.5 px-2">幣種/方向</th>
+                    <th class="py-1.5 px-2">RSI/連K</th>
+                    <th class="py-1.5 px-2">實盤注金</th>
+                    <th class="py-1.5 px-2">交割方式</th>
+                    <th class="py-1.5 px-2 text-right">實盤損益</th>
+                    <th class="py-1.5 px-2 text-right">帳戶淨值</th>
+                  </tr>
+                </thead>
+                <tbody id="paper-trade-log-body" class="divide-y divide-dark-800/60 font-mono text-[10px]">
+                  <tr><td colspan="7" class="py-4 text-center text-slate-500 font-sans">等待實盤序列交割結算...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- RIGHT COLUMN: Master Strategy 2-Year Out-of-Sample & 24-Month Validation (7 cols) -->
+        <div class="xl:col-span-7 bg-dark-900/95 rounded-2xl border border-dark-800 p-5 space-y-4 shadow-2xl flex flex-col justify-between">
+          
+          <!-- Top Header -->
+          <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-dark-800 pb-3">
+            <div>
+              <h3 class="text-sm font-bold text-white flex items-center gap-2">
+                <span>🛡️</span> 雙引擎大師策略實證數據 (2024-10 ~ 2026-10 &amp; Chainlink 官方預言機)
+              </h3>
+              <p class="text-[11px] text-slate-400 mt-0.5">
+                Engine A (4+連K衰竭) + Engine B (3連K爆量長影線高潮) • 2026 Polymarket 60s TWAP 預言機實測
+              </p>
+            </div>
+            <div class="text-[10px] px-2.5 py-1 rounded-lg bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-mono font-bold">
+              日均 14.32 次狙擊訊號 • 2碼勝率 93.96%
+            </div>
+          </div>
+
+          <!-- Dual-Stage vs Strict Expiration Comparison Box -->
+          <div class="p-3 rounded-xl bg-dark-850/90 border border-cyan-500/30 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs">
+            <div class="space-y-0.5">
+              <div class="text-[11px] font-bold text-white flex items-center gap-1.5">
+                <span>🌟</span> CLOB 雙段式 vs 純到期不盯盤勝率對比
+              </div>
+              <p class="text-[10px] text-slate-400">
+                +0.10% 盤中反彈啟動 72¢ 護利，將 2 碼勝率從純到期的 78.55% 提升至 91.47%！
+              </p>
+            </div>
+            <div class="flex items-center gap-3 font-mono text-center">
+              <div class="px-2.5 py-1 rounded-lg bg-dark-900 border border-dark-750">
+                <div class="text-[9px] text-slate-400 font-sans">CLOB 雙段式 2 碼</div>
+                <div class="text-sm font-black text-emerald-400 mt-0.5" id="ms-clob-wr">91.47%</div>
+              </div>
+              <div class="px-2.5 py-1 rounded-lg bg-dark-900 border border-dark-750">
+                <div class="text-[9px] text-slate-400 font-sans">純到期 2 碼</div>
+                <div class="text-sm font-bold text-slate-300 mt-0.5" id="ms-strict-wr">78.55%</div>
+              </div>
+              <div class="px-2.5 py-1 rounded-lg bg-dark-900 border border-dark-750">
+                <div class="text-[9px] text-slate-400 font-sans">純到期 3 碼</div>
+                <div class="text-sm font-bold text-cyan-300 mt-0.5" id="ms-strict-wr3">89.34%</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 4 Core Metric KPI Cards -->
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            
+            <!-- 2-Step Win Rate -->
+            <div class="p-3 rounded-xl bg-dark-850 border border-dark-750">
+              <div class="text-[10px] text-slate-400 font-medium">雙段 2 碼勝率</div>
+              <div class="text-2xl font-black font-mono text-emerald-400 mt-1" id="ms-kpi-winrate">91.47%</div>
+              <div class="text-[10px] text-slate-500 mt-0.5">
+                首碼直贏: <strong class="text-slate-300 font-mono" id="ms-kpi-s1-wr">73.30%</strong>
+              </div>
+            </div>
+
+            <!-- Out-of-Sample Stability -->
+            <div class="p-3 rounded-xl bg-dark-850 border border-dark-750">
+              <div class="text-[10px] text-slate-400 font-medium">樣本內外穩定度</div>
+              <div class="text-xl font-black font-mono text-cyan-300 mt-1" id="ms-kpi-oos">92.8% vs 91.5%</div>
+              <div class="text-[10px] text-slate-500 mt-0.5">
+                單月最低: <strong class="text-slate-300 font-mono" id="ms-kpi-min-wr">82.80%</strong>
+              </div>
+            </div>
+
+            <!-- 24-Month Challenge Win Rate -->
+            <div class="p-3 rounded-xl bg-dark-850 border border-dark-750">
+              <div class="text-[10px] text-slate-400 font-medium">24 個月獲利機率</div>
+              <div class="text-2xl font-black font-mono text-emerald-400 mt-1">100%</div>
+              <div class="text-[10px] text-slate-500 mt-0.5">
+                20/24 個月破 1000U (<strong class="text-emerald-400 font-mono">83.3%</strong>)
+              </div>
+            </div>
+
+            <!-- Monte Carlo 2000 Runs -->
+            <div class="p-3 rounded-xl bg-dark-850 border border-dark-750">
+              <div class="text-[10px] text-slate-400 font-medium">月底中位數結算</div>
+              <div class="text-2xl font-black font-mono text-amber-400 mt-1" id="ms-kpi-median-u">$3,299 U</div>
+              <div class="text-[10px] text-slate-500 mt-0.5">
+                最差單月仍有: <strong class="text-slate-300 font-mono" id="ms-kpi-worst-u">$29.78 U</strong>
+              </div>
+            </div>
+
+          </div>
+
+          <!-- 24 Months Breakdown Table -->
+          <div class="space-y-2 flex-1">
+            <div class="flex items-center justify-between">
+              <h4 class="text-xs font-bold text-white flex items-center gap-1.5">
+                <span>📅</span> 24 個月滾倉實測逐月報告 (2024-10 至 2026-09)
+              </h4>
+              <span class="text-[10px] text-slate-400 font-mono">10U 起跑 • 30 天結算</span>
+            </div>
+
+            <div class="overflow-x-auto max-h-[280px]">
+              <table class="w-full text-left text-xs border-collapse">
+                <thead class="sticky top-0 bg-dark-900 border-b border-dark-800 text-[10px] text-slate-400 font-medium">
+                  <tr>
+                    <th class="py-2 px-2.5">月份</th>
+                    <th class="py-2 px-2">訊號數</th>
+                    <th class="py-2 px-2">首碼勝</th>
+                    <th class="py-2 px-2">二碼勝</th>
+                    <th class="py-2 px-2">停損</th>
+                    <th class="py-2 px-2">勝率</th>
+                    <th class="py-2 px-2">期末權益</th>
+                    <th class="py-2 px-2">倍數</th>
+                    <th class="py-2 px-2">達標 1000U</th>
+                  </tr>
+                </thead>
+                <tbody id="ms-monthly-body" class="divide-y divide-dark-800/60 font-mono text-[11px]">
+                  <tr><td colspan="9" class="py-6 text-center text-slate-500 font-sans">載入 24 個月報告中...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Monte Carlo Summary Line -->
+          <div class="p-3 rounded-xl bg-dark-850/60 border border-dark-800 flex flex-wrap items-center justify-between gap-2 text-xs">
+            <span class="text-slate-400">🎲 蒙地卡羅 2,000 次隨機排列壓力測試:</span>
+            <div class="flex flex-wrap items-center gap-3 text-[11px] font-mono">
+              <span>獲利機率: <strong class="text-emerald-400">100%</strong></span>
+              <span>破 100U: <strong class="text-emerald-400">99.25%</strong></span>
+              <span>破 500U: <strong class="text-cyan-400">88.95%</strong></span>
+              <span>破 1000U: <strong class="text-amber-400">73.10%</strong></span>
+            </div>
+          </div>
+
+        </div>
+
+      </div>
+    </section>
+
+    <!-- SECTION 0.5: 免費 VPN 地區解鎖檢測 & Polymarket CLOB API 全自動下單中心 -->
+    <section class="space-y-4 border-t border-dark-800 pt-6">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+        <div class="flex items-center gap-2.5">
+          <span class="text-2xl">🤖</span>
+          <div>
+            <div class="flex items-center gap-2">
+              <h2 class="text-lg font-extrabold text-white tracking-wide">免費 VPN 解鎖檢測 ＆ Polymarket CLOB API 全自動下單中心</h2>
+              <span id="clob-mode-badge" class="text-[11px] px-2.5 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 font-bold">
+                🛡️ 模擬簽章模式 (DRY-RUN)
+              </span>
+            </div>
+            <p class="text-xs text-slate-400">
+              已為您的 Mac 安裝 <strong class="text-emerald-400">ProtonVPN (免費無限流量)</strong> 與 <strong class="text-cyan-400">TunnelBear (免費自選國家)</strong> • 自動解析每 5 分鐘 <code class="text-cyan-300">updown-5m</code> Token ID • 貼上私鑰自動推導 L2 API 金鑰並全自動掛單
+            </p>
+          </div>
+        </div>
+        <div class="flex items-center gap-2">
+          <button onclick="checkPolymarketGeoblock()" class="px-3 py-1.5 rounded-xl bg-dark-800 hover:bg-dark-750 text-cyan-300 border border-cyan-500/30 text-xs font-bold transition active:scale-95">
+            🔄 立即檢測 VPN / IP 狀態
+          </button>
+          <button onclick="syncLiveWalletNow()" class="px-3 py-1.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white text-xs font-bold shadow-lg shadow-emerald-600/20 transition active:scale-95">
+            💰 立即同步實盤錢包餘額
+          </button>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-5">
+        <!-- Left 5 Cols: Free VPN Status & One-Click App Launcher -->
+        <div class="lg:col-span-5 bg-dark-900/95 rounded-2xl border border-dark-800 p-5 space-y-4 shadow-xl">
+          <div class="flex items-center justify-between border-b border-dark-800 pb-3">
+            <h3 class="text-sm font-bold text-white flex items-center gap-2">
+              <span>🌐</span> 台灣地區解鎖與免費 VPN 控制台
+            </h3>
+            <span id="geo-status-pill" class="text-[11px] px-2.5 py-0.5 rounded-full bg-rose-500/20 text-rose-300 border border-rose-500/40 font-mono font-bold">
+              檢測中...
+            </span>
+          </div>
+
+          <!-- Current IP & Geoblock Card -->
+          <div id="geo-card-box" class="p-3.5 rounded-xl bg-dark-850 border border-rose-500/30 space-y-2">
+            <div class="flex items-center justify-between text-xs">
+              <span class="text-slate-400">目前出口 IP / 國家代碼：</span>
+              <span id="geo-ip-country" class="font-mono font-bold text-white">-- / --</span>
+            </div>
+            <div class="flex items-center justify-between text-xs">
+              <span class="text-slate-400">Polymarket API 下單權限：</span>
+              <span id="geo-api-allowed" class="font-mono font-bold text-rose-400">檢測中...</span>
+            </div>
+            <p id="geo-advice-text" class="text-[11px] text-slate-300 leading-relaxed pt-1 border-t border-dark-800">
+              正在檢查 https://polymarket.com/api/geoblock ...
+            </p>
+          </div>
+
+          <!-- Installed Free VPN Apps One-Click Launch -->
+          <div class="space-y-2.5">
+            <div class="text-xs font-bold text-slate-200 flex items-center justify-between">
+              <span>🚀 已安裝在您 Mac `/Applications` 的免費 VPN：</span>
+              <span class="text-[10px] text-emerald-400">點擊直接啟動 App</span>
+            </div>
+
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              <div class="p-3 rounded-xl bg-dark-850 border border-dark-750 flex flex-col justify-between space-y-2">
+                <div>
+                  <div class="text-xs font-bold text-emerald-400 flex items-center justify-between">
+                    <span>🛡️ ProtonVPN</span>
+                    <span class="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300">免費無限流量</span>
+                  </div>
+                  <p class="text-[10px] text-slate-400 mt-1 leading-snug">
+                    推薦節點：<strong class="text-white">羅馬尼亞 (RO)</strong> 網頁+API全通；<strong class="text-cyan-300">日本 (JP) / 荷蘭 (NL)</strong> API 可直接下單！
+                  </p>
+                </div>
+                <button onclick="launchVpnApp('protonvpn')" class="w-full py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 text-[11px] font-bold transition">
+                  🖥️ 在 Mac 打開 ProtonVPN
+                </button>
+              </div>
+
+              <div class="p-3 rounded-xl bg-dark-850 border border-dark-750 flex flex-col justify-between space-y-2">
+                <div>
+                  <div class="text-xs font-bold text-cyan-400 flex items-center justify-between">
+                    <span>🐻 TunnelBear</span>
+                    <span class="text-[9px] px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300">自選 45 國節點</span>
+                  </div>
+                  <p class="text-[10px] text-slate-400 mt-1 leading-snug">
+                    推薦節點：手動點選 <strong class="text-white">香港 (HK)、瑞士 (CH)、挪威 (NO)、羅馬尼亞 (RO)</strong>，網頁開戶與 API 100% 解鎖！
+                  </p>
+                </div>
+                <button onclick="launchVpnApp('tunnelbear')" class="w-full py-1.5 rounded-lg bg-cyan-600/20 hover:bg-cyan-600/30 text-cyan-300 border border-cyan-500/30 text-[11px] font-bold transition">
+                  🖥️ 在 Mac 打開 TunnelBear
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Official Geoblock Country Reference -->
+          <div class="p-3 rounded-xl bg-dark-850/70 border border-dark-800 text-[10px] space-y-1">
+            <div class="font-bold text-slate-300">📌 Polymarket 官方地區白名單（依 `/api-reference/geoblock` 實測）：</div>
+            <div class="text-emerald-400">✅ <strong>網頁＋API 完全開放</strong>：香港 (HK)、羅馬尼亞 (RO)、瑞士 (CH)、挪威 (NO)、瑞典 (SE)、西班牙 (ES)、加拿大 (多數省)</div>
+            <div class="text-cyan-300">🟢 <strong>API 下單開放（僅鎖網頁）</strong>：日本 (JP)、荷蘭 (NL)、韓國 (KR)、愛爾蘭 (IE - 官方最低延遲節點)</div>
+            <div class="text-rose-400">⛔ <strong>嚴格封鎖（勿連）</strong>：台灣 (TW)、美國 (US)、英國 (GB)、新加坡 (SG)、德國 (DE)、法國 (FR)、波蘭 (PL)、澳洲 (AU)</div>
+          </div>
+        </div>
+
+        <!-- Right 7 Cols: Polymarket CLOB API Credentials & Auto-Order Execution -->
+        <div class="lg:col-span-7 bg-dark-900/95 rounded-2xl border border-dark-800 p-5 space-y-4 shadow-xl flex flex-col justify-between">
+          <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-dark-800 pb-3">
+            <div>
+              <h3 class="text-sm font-bold text-white flex items-center gap-2">
+                <span>🔑</span> Polymarket CLOB V2 正式實盤錢包與自動下單配置
+              </h3>
+              <p class="text-[11px] text-slate-400">
+                支援 Email/Google Magic 代理錢包與 MetaMask/Phantom 錢包 • 100% 實盤成交驗證 (`LIVE_MATCHED`) 才發送推播
+              </p>
+            </div>
+            <div class="flex items-center gap-2">
+              <button onclick="derivePolymarketCreds()" class="px-2.5 py-1.5 rounded-lg bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-300 border border-cyan-500/30 text-xs font-bold transition">
+                🔐 自動推導 L2 API 金鑰
+              </button>
+              <button onclick="savePolymarketClobConfig()" class="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold shadow-md shadow-emerald-600/20 transition">
+                💾 儲存並啟用實盤配置
+              </button>
+            </div>
+          </div>
+
+          <!-- Form Grid -->
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+            <div class="p-3 rounded-xl bg-dark-850 border border-dark-750 flex items-center justify-between">
+              <div>
+                <div class="font-bold text-white">啟用策略自動追蹤 (Auto-Trade)</div>
+                <div class="text-[10px] text-slate-400">雙引擎訊號觸發時自動掛單 &amp; 72¢ 反彈護利</div>
+              </div>
+              <input type="checkbox" id="clob-enabled" checked class="w-5 h-5 rounded accent-cyan-500 cursor-pointer">
+            </div>
+
+            <div class="p-3 rounded-xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-between">
+              <div>
+                <div class="font-bold text-cyan-300">模擬金模式 (DRY RUN • 零真金風險)</div>
+                <div class="text-[10px] text-slate-300">鎖定真實盤口追蹤，零動用 Polymarket 真實資產</div>
+              </div>
+              <input type="checkbox" id="clob-dry-run" checked class="w-5 h-5 rounded accent-cyan-500 cursor-pointer">
+            </div>
+
+            <div>
+              <label class="block text-slate-400 text-[11px] mb-1">Polygon 錢包私鑰 (Private Key `0x...`)</label>
+              <input type="password" id="clob-private-key" placeholder="貼上 0x 開頭私鑰，系統將自動推導 L2 API Key" class="w-full bg-dark-850 border border-dark-700 rounded-lg px-2.5 py-1.5 text-white font-mono focus:border-emerald-500 focus:outline-none">
+            </div>
+
+            <div>
+              <label class="block text-slate-400 text-[11px] mb-1">Polymarket 代理錢包地址 (Funder Proxy Address)</label>
+              <input type="text" id="clob-funder-address" placeholder="0x... (Polymarket 右上角個人檔案顯示的存款地址)" class="w-full bg-dark-850 border border-dark-700 rounded-lg px-2.5 py-1.5 text-white font-mono focus:border-emerald-500 focus:outline-none">
+            </div>
+
+            <div>
+              <label class="block text-slate-400 text-[11px] mb-1">錢包簽章類型 (Signature Type)</label>
+              <select id="clob-sig-type" class="w-full bg-dark-850 border border-dark-700 rounded-lg px-2.5 py-1.5 text-white font-mono focus:border-emerald-500 focus:outline-none">
+                <option value="1">1 - Email / Google 登入代理錢包 (Magic Link)</option>
+                <option value="2">2 - MetaMask / Phantom / Rabby 瀏覽器代理錢包</option>
+                <option value="0">0 - 原生 EOA 錢包直連</option>
+              </select>
+            </div>
+
+            <div>
+              <label class="block text-slate-400 text-[11px] mb-1">高可用代理通道 (HA Proxy URL)</label>
+              <input type="text" id="clob-proxy-url" placeholder="例如 socks5://127.0.0.1:10809" class="w-full bg-dark-850 border border-dark-700 rounded-lg px-2.5 py-1.5 text-white font-mono focus:border-emerald-500 focus:outline-none">
+            </div>
+
+            <div class="grid grid-cols-2 gap-2">
+              <div>
+                <label class="block text-slate-400 text-[10px] mb-0.5">進場基準限價 ($)</label>
+                <input type="number" step="0.01" id="clob-entry-price" value="0.51" class="w-full bg-dark-850 border border-dark-700 rounded-lg px-2 py-1.5 text-emerald-400 font-mono font-bold">
+              </div>
+              <div>
+                <label class="block text-slate-400 text-[10px] mb-0.5">+0.10% 反彈護利賣價 ($)</label>
+                <input type="number" step="0.01" id="clob-bounce-price" value="0.72" class="w-full bg-dark-850 border border-dark-700 rounded-lg px-2 py-1.5 text-cyan-400 font-mono font-bold">
+              </div>
+            </div>
+
+            <div class="p-2.5 rounded-xl bg-dark-850/80 border border-dark-800 flex flex-col justify-center font-mono text-[11px]">
+              <div class="flex items-center justify-between">
+                <span class="text-slate-400 font-sans">簽章地址 (Signer):</span>
+                <span id="clob-signer-addr" class="text-slate-200">尚未綁定</span>
+              </div>
+              <div class="flex items-center justify-between mt-1">
+                <span class="text-slate-400 font-sans">L2 API 憑證狀態:</span>
+                <span id="clob-creds-status" class="text-amber-400">待推導</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Live 5m Token IDs & Recent CLOB Orders Log -->
+          <div class="space-y-2 pt-2 border-t border-dark-800">
+            <div class="flex items-center justify-between text-xs">
+              <span class="font-bold text-white">⚡ 當期 5m 實盤 Token ID 與 Polymarket 真實委託紀錄</span>
+              <span id="clob-live-slugs" class="text-[10px] text-cyan-400 font-mono">正在同步當期 5m 合約...</span>
+            </div>
+            <div class="overflow-x-auto max-h-[140px]">
+              <table class="w-full text-left text-[11px] border-collapse">
+                <thead class="sticky top-0 bg-dark-900 border-b border-dark-800 text-[10px] text-slate-400">
+                  <tr>
+                    <th class="py-1 px-2">時間</th>
+                    <th class="py-1 px-2">5m 合約</th>
+                    <th class="py-1 px-2">動作/方向</th>
+                    <th class="py-1 px-2">份數 @ 限價</th>
+                    <th class="py-1 px-2">模式</th>
+                    <th class="py-1 px-2">成交狀態 / Order ID</th>
+                  </tr>
+                </thead>
+                <tbody id="clob-orders-tbody" class="divide-y divide-dark-800/60 font-mono text-[10px]">
+                  <tr><td colspan="6" class="py-3 text-center text-slate-500 font-sans">等待雙引擎實盤訊號觸發自動下單...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTION 1: 即時 5m 監控面板 (Live 3-Coin Monitor Cards) -->
+    <section class="space-y-4 border-t border-dark-800 pt-6">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+        <div class="flex items-center gap-2">
+          <span class="text-xl">📡</span>
+          <h2 class="text-lg font-bold text-white tracking-wide">即時 5m 監控面板 (Live Scanner)</h2>
+          <span class="text-xs px-2 py-0.5 rounded bg-dark-800 text-slate-400 border border-dark-700">自動輪詢 (每 3 秒)</span>
+        </div>
+        <div class="text-xs text-slate-400 flex items-center gap-3">
+          <span>收線預警閾值: <strong class="text-amber-400" id="header-pre-warning">20 秒</strong></span>
+          <span class="text-slate-600">•</span>
+          <span id="last-update-time">最後更新: 讀取中...</span>
+        </div>
+      </div>
+
+      <!-- 3 Coin Cards Grid -->
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-5" id="live-cards-container">
+        <!-- Populated dynamically by renderLiveCards() -->
+        <div class="p-6 rounded-2xl bg-dark-900 border border-dark-800 text-center text-slate-400 animate-pulse">載入即時監控數據中...</div>
+        <div class="p-6 rounded-2xl bg-dark-900 border border-dark-800 text-center text-slate-400 animate-pulse">載入即時監控數據中...</div>
+        <div class="p-6 rounded-2xl bg-dark-900 border border-dark-800 text-center text-slate-400 animate-pulse">載入即時監控數據中...</div>
+      </div>
+    </section>
+
+    <!-- SECTION 2: 互動式回測與馬丁格爾實驗室 (2-Year Backtest & Martingale Lab) -->
+    <section class="space-y-6">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-t border-dark-800 pt-6">
+        <div class="flex items-center gap-2">
+          <span class="text-xl">🧪</span>
+          <div>
+            <h2 class="text-lg font-bold text-white tracking-wide">近兩年 (210,240 根 5m K線) 互動式回測與馬丁格爾實驗室</h2>
+            <p class="text-xs text-slate-400">大數據無縫回測 • 毫秒級運算 • 最佳化參數一鍵套用至即時掃描引擎</p>
+          </div>
+        </div>
+
+        <!-- Presets quick buttons bar -->
+        <div class="flex flex-wrap items-center gap-2">
+          <span class="text-xs text-slate-400 font-medium">快速黃金預設:</span>
+          <button onclick="applyPreset('golden_3step')" class="px-2.5 py-1 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 text-xs font-semibold transition active:scale-95 flex items-center gap-1">
+            <span>🔥</span> 黃金 3 碼馬丁 (>90%~96%)
+          </button>
+          <button onclick="applyPreset('ironclad_4step')" class="px-2.5 py-1 rounded-lg bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-xs font-semibold transition active:scale-95 flex items-center gap-1">
+            <span>🛡️</span> 兩年零爆倉鐵壁 4 碼 (100%)
+          </button>
+          <button onclick="applyPreset('target_bounce')" class="px-2.5 py-1 rounded-lg bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 text-xs font-semibold transition active:scale-95 flex items-center gap-1">
+            <span>🎯</span> 單發反彈達標 (Target Bounce)
+          </button>
+        </div>
+      </div>
+
+      <!-- Controls & KPI Layout -->
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        
+        <!-- Left Column: Strategy Form Controls (5 cols) -->
+        <div class="lg:col-span-5 bg-dark-900/90 rounded-2xl border border-dark-800 p-5 space-y-4 shadow-xl">
+          <div class="flex items-center justify-between border-b border-dark-800 pb-3">
+            <h3 class="text-sm font-bold text-white flex items-center gap-2">
+              <span class="w-2 h-2 rounded-full bg-emerald-400"></span> 策略參數自訂控制台
+            </h3>
+            <span class="text-[11px] text-slate-400">即時計算延遲 &lt; 50ms</span>
+          </div>
+
+          <form id="backtest-form" onsubmit="event.preventDefault(); runBacktest(false);" class="space-y-4 text-xs">
+            
+            <!-- Symbol & Direction -->
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <label class="block text-slate-400 mb-1 font-medium">回測幣種 (Symbol)</label>
+                <select id="param-symbol" class="w-full bg-dark-850 border border-dark-700 rounded-lg px-2.5 py-2 text-white font-mono font-bold focus:border-emerald-500 focus:outline-none">
+                  <option value="BTCUSDT">BTCUSDT (比特幣)</option>
+                  <option value="ETHUSDT">ETHUSDT (以太坊)</option>
+                  <option value="SOLUSDT">SOLUSDT (索拉納)</option>
+                </select>
+              </div>
+
+              <div>
+                <label class="block text-slate-400 mb-1 font-medium">交易方向 (Direction)</label>
+                <select id="param-direction" class="w-full bg-dark-850 border border-dark-700 rounded-lg px-2.5 py-2 text-white focus:border-emerald-500 focus:outline-none">
+                  <option value="both">多空雙向 (反彈 + 回調)</option>
+                  <option value="long_only">僅做超賣反彈 (做多)</option>
+                  <option value="short_only">僅做超買回調 (做空)</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- RSI Controls -->
+            <div class="p-3 rounded-xl bg-dark-850/60 border border-dark-800 space-y-2.5">
+              <div class="text-[11px] font-semibold text-slate-300 flex items-center justify-between">
+                <span>RSI 超買超賣濾網設定</span>
+                <span class="text-emerald-400 font-mono" id="rsi-val-preview">RSI(6) &le; 15 / &ge; 85</span>
+              </div>
+              <div class="grid grid-cols-3 gap-2">
+                <div>
+                  <label class="block text-slate-400 text-[10px] mb-0.5">RSI 週期</label>
+                  <select id="param-rsi-period" class="w-full bg-dark-900 border border-dark-700 rounded-lg px-2 py-1.5 text-white font-mono focus:border-emerald-500 focus:outline-none">
+                    <option value="2">2 (極速震盪)</option>
+                    <option value="6" selected>6 (推薦標準)</option>
+                    <option value="14">14 (傳統慢速)</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="block text-slate-400 text-[10px] mb-0.5">超賣門檻 (&le; 多)</label>
+                  <input type="number" step="0.5" id="param-oversold-rsi" value="15.0" class="w-full bg-dark-900 border border-dark-700 rounded-lg px-2 py-1.5 text-white font-mono focus:border-emerald-500 focus:outline-none">
+                </div>
+                <div>
+                  <label class="block text-slate-400 text-[10px] mb-0.5">超買門檻 (&ge; 空)</label>
+                  <input type="number" step="0.5" id="param-overbought-rsi" value="85.0" class="w-full bg-dark-900 border border-dark-700 rounded-lg px-2 py-1.5 text-white font-mono focus:border-emerald-500 focus:outline-none">
+                </div>
+              </div>
+            </div>
+
+            <!-- Consecutive Streak & Move Filter -->
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <label class="block text-slate-400 mb-1 font-medium">最少連續 K 線 (Streak)</label>
+                <div class="flex items-center gap-2">
+                  <input type="number" min="1" max="10" id="param-min-streak" value="4" class="w-full bg-dark-850 border border-dark-700 rounded-lg px-2.5 py-2 text-white font-mono focus:border-emerald-500 focus:outline-none">
+                  <span class="text-slate-400 text-xs">根</span>
+                </div>
+              </div>
+
+              <div>
+                <label class="block text-slate-400 mb-1 font-medium">連續段最小累計幅度</label>
+                <div class="flex items-center gap-2">
+                  <input type="number" step="0.05" id="param-min-streak-ret" value="0.30" class="w-full bg-dark-850 border border-dark-700 rounded-lg px-2.5 py-2 text-white font-mono focus:border-emerald-500 focus:outline-none">
+                  <span class="text-slate-400 text-xs">%</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Secondary Filters: BB & Vol & Wick -->
+            <div class="grid grid-cols-3 gap-2">
+              <div>
+                <label class="block text-slate-400 text-[10px] mb-0.5">布林外側濾網</label>
+                <select id="param-use-bb" class="w-full bg-dark-850 border border-dark-700 rounded-lg px-2 py-1.5 text-white focus:border-emerald-500 focus:outline-none">
+                  <option value="false">關閉 (無)</option>
+                  <option value="true">啟用 (%B外側)</option>
+                </select>
+              </div>
+              <div>
+                <label class="block text-slate-400 text-[10px] mb-0.5">爆量倍數 (&times; 20MA)</label>
+                <input type="number" step="0.1" id="param-min-vol" value="0.0" class="w-full bg-dark-850 border border-dark-700 rounded-lg px-2 py-1.5 text-white font-mono focus:border-emerald-500 focus:outline-none">
+              </div>
+              <div>
+                <label class="block text-slate-400 text-[10px] mb-0.5">反轉影線比 (&ge; ratio)</label>
+                <input type="number" step="0.05" id="param-min-wick" value="0.0" class="w-full bg-dark-850 border border-dark-700 rounded-lg px-2 py-1.5 text-white font-mono focus:border-emerald-500 focus:outline-none">
+              </div>
+            </div>
+
+            <!-- Win Mode & Martingale Architecture -->
+            <div class="p-3 rounded-xl bg-dark-850/60 border border-dark-800 space-y-2.5">
+              <div class="text-[11px] font-semibold text-slate-300">獲勝模式與馬丁格爾資金注碼設定</div>
+              
+              <div class="grid grid-cols-2 gap-2">
+                <div>
+                  <label class="block text-slate-400 text-[10px] mb-0.5">判定模式 (Win Mode)</label>
+                  <select id="param-win-mode" class="w-full bg-dark-900 border border-dark-700 rounded-lg px-2 py-1.5 text-white focus:border-emerald-500 focus:outline-none">
+                    <option value="candle_color">K 線顏色反轉 (收紅/收綠)</option>
+                    <option value="target_bounce">盤中反彈達標 (Target %)</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="block text-slate-400 text-[10px] mb-0.5">盤中反彈目標 (Bounce %)</label>
+                  <input type="number" step="0.01" id="param-target-bounce-pct" value="0.15" class="w-full bg-dark-900 border border-dark-700 rounded-lg px-2 py-1.5 text-white font-mono focus:border-emerald-500 focus:outline-none">
+                </div>
+              </div>
+
+              <div class="grid grid-cols-4 gap-2 pt-1">
+                <div>
+                  <label class="block text-slate-400 text-[10px] mb-0.5">馬丁碼數</label>
+                  <select id="param-max-steps" class="w-full bg-dark-900 border border-dark-700 rounded-lg px-2 py-1.5 text-white font-mono font-bold focus:border-emerald-500 focus:outline-none">
+                    <option value="1">1 碼 (單發)</option>
+                    <option value="2">2 碼</option>
+                    <option value="3" selected>3 碼 (推薦)</option>
+                    <option value="4">4 碼 (鐵壁)</option>
+                    <option value="5">5 碼</option>
+                    <option value="6">6 碼 (極限)</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="block text-slate-400 text-[10px] mb-0.5">倍投乘數</label>
+                  <input type="number" step="0.05" id="param-martingale-mult" value="2.1" class="w-full bg-dark-900 border border-dark-700 rounded-lg px-2 py-1.5 text-white font-mono focus:border-emerald-500 focus:outline-none">
+                </div>
+                <div>
+                  <label class="block text-slate-400 text-[10px] mb-0.5">預測淨賠率</label>
+                  <input type="number" step="0.01" id="param-payout-ratio" value="0.95" class="w-full bg-dark-900 border border-dark-700 rounded-lg px-2 py-1.5 text-white font-mono focus:border-emerald-500 focus:outline-none">
+                </div>
+                <div>
+                  <label class="block text-slate-400 text-[10px] mb-0.5">首碼注金 ($)</label>
+                  <input type="number" step="1" id="param-base-stake" value="10.0" class="w-full bg-dark-900 border border-dark-700 rounded-lg px-2 py-1.5 text-white font-mono focus:border-emerald-500 focus:outline-none">
+                </div>
+              </div>
+            </div>
+
+            <!-- Two Action Buttons -->
+            <div class="grid grid-cols-2 gap-3 pt-2">
+              <button type="button" onclick="runBacktest(false)" class="w-full py-2.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs shadow-lg shadow-emerald-600/25 transition active:scale-95 flex items-center justify-center gap-1.5">
+                <span>🚀 執行兩年回測</span>
+              </button>
+              
+              <button type="button" onclick="runBacktest(true)" class="w-full py-2.5 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white font-bold text-xs shadow-lg shadow-cyan-600/25 transition active:scale-95 flex items-center justify-center gap-1.5">
+                <span>✅ 套用至即時通知</span>
+              </button>
+            </div>
+
+          </form>
+        </div>
+
+        <!-- Right Column: Backtest Results KPI & Analysis (7 cols) -->
+        <div class="lg:col-span-7 space-y-4">
+          
+          <!-- KPI Cards Grid -->
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-3.5">
+            
+            <!-- Win Rate KPI (Prominent Green) -->
+            <div class="p-4 rounded-2xl bg-dark-900/90 border border-dark-800 relative overflow-hidden group">
+              <div class="absolute -right-4 -bottom-4 w-16 h-16 bg-emerald-500/10 rounded-full blur-xl group-hover:bg-emerald-500/20 transition"></div>
+              <div class="text-[11px] text-slate-400 font-medium">序列總勝率</div>
+              <div class="mt-1 flex items-baseline gap-1.5">
+                <span class="text-2xl font-black font-mono text-emerald-400" id="kpi-win-rate">--%</span>
+                <span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold" id="kpi-win-tag">高勝率</span>
+              </div>
+              <div class="text-[10px] text-slate-500 mt-1">首碼直贏率: <strong class="text-slate-300 font-mono" id="kpi-first-shot-wr">--%</strong></div>
+            </div>
+
+            <!-- Net Profit KPI -->
+            <div class="p-4 rounded-2xl bg-dark-900/90 border border-dark-800">
+              <div class="text-[11px] text-slate-400 font-medium">兩年總淨利</div>
+              <div class="mt-1 text-2xl font-black font-mono text-cyan-400" id="kpi-net-profit">$0.00</div>
+              <div class="text-[10px] text-slate-500 mt-1">盈虧比 (PF): <strong class="text-slate-300 font-mono" id="kpi-pf">--</strong></div>
+            </div>
+
+            <!-- Sequences Count KPI -->
+            <div class="p-4 rounded-2xl bg-dark-900/90 border border-dark-800">
+              <div class="text-[11px] text-slate-400 font-medium">觸發 / 止盈 / 爆倉</div>
+              <div class="mt-1 text-xl font-bold font-mono text-slate-200" id="kpi-sequences">-- / -- / --</div>
+              <div class="text-[10px] text-slate-500 mt-1">止盈: <span class="text-emerald-400" id="kpi-won-cnt">--</span> | 爆倉: <span class="text-rose-400" id="kpi-bust-cnt">--</span></div>
+            </div>
+
+            <!-- Table Bankroll & Extreme Steps KPI -->
+            <div class="p-4 rounded-2xl bg-dark-900/90 border border-dark-800">
+              <div class="text-[11px] text-slate-400 font-medium">單輪桌底本金</div>
+              <div class="mt-1 text-2xl font-black font-mono text-amber-400" id="kpi-bankroll">$75.10</div>
+              <div class="text-[10px] text-slate-500 mt-1">極端需幾碼: <strong class="text-rose-400 font-mono" id="kpi-max-steps">-- 碼</strong></div>
+            </div>
+
+          </div>
+
+          <!-- Martingale Steps Breakdown Table -->
+          <div class="bg-dark-900/90 rounded-2xl border border-dark-800 p-4.5 space-y-3">
+            <div class="flex items-center justify-between">
+              <h4 class="text-xs font-bold text-white flex items-center gap-1.5">
+                <span>📊</span> 馬丁格爾 1~6 碼累計勝率與注金階梯分解表
+              </h4>
+              <span class="text-[10px] text-slate-400 font-mono">注碼乘數: 2.1x • 95% 賠率保護</span>
+            </div>
+
+            <div class="overflow-x-auto">
+              <table class="w-full text-left text-xs border-collapse">
+                <thead>
+                  <tr class="border-b border-dark-800 text-[11px] text-slate-400 font-medium">
+                    <th class="py-2 px-2.5">碼數階梯</th>
+                    <th class="py-2 px-2.5">當碼下注</th>
+                    <th class="py-2 px-2.5">累計所需桌底</th>
+                    <th class="py-2 px-2.5">該碼勝出次數</th>
+                    <th class="py-2 px-2.5">該碼佔比</th>
+                    <th class="py-2 px-2.5">累計序列勝率</th>
+                    <th class="py-2 px-2.5">兩年爆倉次數</th>
+                  </tr>
+                </thead>
+                <tbody id="martingale-breakdown-body" class="divide-y divide-dark-800/60 font-mono text-[11px]">
+                  <tr><td colspan="7" class="py-4 text-center text-slate-500 font-sans">執行回測以顯示階梯分解</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Equity Curve Canvas -->
+          <div class="bg-dark-900/90 rounded-2xl border border-dark-800 p-4.5 space-y-2">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-2">
+                <span class="text-sm">📈</span>
+                <h4 class="text-xs font-bold text-white">兩年連續資產淨值曲線 (Equity Curve)</h4>
+              </div>
+              <div class="text-[10px] text-slate-400" id="equity-curve-info">
+                最大回撤: <span class="text-rose-400 font-mono" id="kpi-drawdown">--</span>
+              </div>
+            </div>
+            <div class="h-56 w-full relative">
+              <canvas id="equity-chart"></canvas>
+            </div>
+          </div>
+
+        </div>
+
+      </div>
+
+      <!-- Raw Streak Empirical Distribution & Recent Trades (2 Columns Bottom) -->
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        
+        <!-- Left: Empirical Streak Distribution Table (6 cols) -->
+        <div class="lg:col-span-6 bg-dark-900/90 rounded-2xl border border-dark-800 p-5 space-y-4">
+          <div class="flex items-center justify-between border-b border-dark-800 pb-3">
+            <div>
+              <h3 class="text-sm font-bold text-white flex items-center gap-2">
+                <span>🎲</span> 近兩年無條件連跌 / 連漲機率分佈表
+              </h3>
+              <p class="text-[11px] text-slate-400">大數法則實證統計：連續根數越長，後續 1~4 碼反彈/回調勝率幾何級上升</p>
+            </div>
+            <!-- Tabs -->
+            <div class="flex rounded-lg bg-dark-850 p-1 border border-dark-700 text-xs">
+              <button id="tab-streak-down" onclick="switchStreakTab('down')" class="px-2.5 py-1 rounded-md bg-rose-500/20 text-rose-300 font-semibold transition">連跌 (多頭反彈)</button>
+              <button id="tab-streak-up" onclick="switchStreakTab('up')" class="px-2.5 py-1 rounded-md text-slate-400 hover:text-white transition">連漲 (空頭回調)</button>
+            </div>
+          </div>
+
+          <div class="overflow-x-auto max-h-[380px]">
+            <table class="w-full text-left text-xs border-collapse">
+              <thead class="sticky top-0 bg-dark-900 border-b border-dark-800 text-[11px] text-slate-400 font-medium">
+                <tr>
+                  <th class="py-2 px-2.5">連跌/漲根數</th>
+                  <th class="py-2 px-2.5">兩年出現次數</th>
+                  <th class="py-2 px-2.5">下 1 根直贏</th>
+                  <th class="py-2 px-2.5">2 碼馬丁</th>
+                  <th class="py-2 px-2.5">3 碼馬丁</th>
+                  <th class="py-2 px-2.5">4 碼馬丁</th>
+                </tr>
+              </thead>
+              <tbody id="raw-streak-body" class="divide-y divide-dark-800/60 font-mono text-[11px]">
+                <tr><td colspan="6" class="py-6 text-center text-slate-500 font-sans">載入分佈統計中...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Right: Recent 50 Trades Table (6 cols) -->
+        <div class="lg:col-span-6 bg-dark-900/90 rounded-2xl border border-dark-800 p-5 space-y-4">
+          <div class="flex items-center justify-between border-b border-dark-800 pb-3">
+            <div>
+              <h3 class="text-sm font-bold text-white flex items-center gap-2">
+                <span>📜</span> 最近 50 筆回測訊號結算明細
+              </h3>
+              <p class="text-[11px] text-slate-400">嚴格無重疊序列驗證 • 實際進場價、出場價與損益細項</p>
+            </div>
+            <span class="text-xs px-2 py-0.5 rounded bg-dark-800 text-slate-400 border border-dark-700 font-mono" id="trades-count-badge">50 筆</span>
+          </div>
+
+          <div class="overflow-x-auto max-h-[380px]">
+            <table class="w-full text-left text-xs border-collapse">
+              <thead class="sticky top-0 bg-dark-900 border-b border-dark-800 text-[11px] text-slate-400 font-medium">
+                <tr>
+                  <th class="py-2 px-2">序號</th>
+                  <th class="py-2 px-2">時間 (UTC)</th>
+                  <th class="py-2 px-2">方向</th>
+                  <th class="py-2 px-2">進場價格</th>
+                  <th class="py-2 px-2">RSI / 連線</th>
+                  <th class="py-2 px-2">結算結果</th>
+                  <th class="py-2 px-2 text-right">損益 ($)</th>
+                </tr>
+              </thead>
+              <tbody id="recent-trades-body" class="divide-y divide-dark-800/60 font-mono text-[11px]">
+                <tr><td colspan="7" class="py-6 text-center text-slate-500 font-sans">執行回測後顯示最近訊號明細</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+      </div>
+
+    </section>
+
+    <!-- SECTION 3: 多管道即時通知設定與訊號紀錄 (Notify Config & Live Signal Feed) -->
+    <section class="space-y-6 border-t border-dark-800 pt-6">
+      <div class="flex items-center gap-2">
+        <span class="text-xl">🔔</span>
+        <div>
+          <h2 class="text-lg font-bold text-white tracking-wide">多管道即時通知設定與訊號紀錄</h2>
+          <p class="text-xs text-slate-400">支援 macOS 原生桌面橫幅/音效 • Telegram Bot • Discord Webhook • 自訂 Webhook</p>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        
+        <!-- Left: Notification Settings Form (5 cols) -->
+        <div class="lg:col-span-5 bg-dark-900/90 rounded-2xl border border-dark-800 p-5 space-y-4 shadow-xl">
+          <div class="flex items-center justify-between border-b border-dark-800 pb-3">
+            <h3 class="text-sm font-bold text-white flex items-center gap-2">
+              <span class="w-2 h-2 rounded-full bg-cyan-400"></span> 推播管道開關與憑證配置
+            </h3>
+            <button onclick="saveNotifyConfig()" class="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs shadow-md shadow-emerald-600/20 transition active:scale-95">
+              💾 儲存通知設定
+            </button>
+          </div>
+
+          <form id="notify-config-form" class="space-y-4 text-xs">
+            
+            <!-- macOS Alerts Group -->
+            <div class="p-3.5 rounded-xl bg-dark-850 border border-dark-800 space-y-3">
+              <div class="text-[11px] font-bold text-slate-300 flex items-center justify-between">
+                <span>🍎 macOS 本機即時預警</span>
+                <span class="text-emerald-400 text-[10px]">AppleScript 原生秒級推播</span>
+              </div>
+
+              <div class="grid grid-cols-2 gap-3">
+                <label class="flex items-center gap-2.5 p-2 rounded-lg bg-dark-900 border border-dark-750 cursor-pointer hover:border-slate-600 transition">
+                  <input type="checkbox" id="cfg-macos-desktop" class="w-4 h-4 rounded text-emerald-500 focus:ring-0 focus:ring-offset-0 bg-dark-800 border-dark-700">
+                  <span class="text-slate-200 font-medium">桌面橫幅通知</span>
+                </label>
+
+                <label class="flex items-center gap-2.5 p-2 rounded-lg bg-dark-900 border border-dark-750 cursor-pointer hover:border-slate-600 transition">
+                  <input type="checkbox" id="cfg-macos-sound" class="w-4 h-4 rounded text-emerald-500 focus:ring-0 focus:ring-offset-0 bg-dark-800 border-dark-700">
+                  <span class="text-slate-200 font-medium">播放系統音效 (Glass)</span>
+                </label>
+              </div>
+
+              <div>
+                <div class="flex items-center justify-between text-slate-400 text-[11px] mb-1">
+                  <span>5m 收線前提前預警秒數:</span>
+                  <span class="font-mono text-amber-400 font-bold" id="val-pre-close-sec">20 秒</span>
+                </div>
+                <input type="range" min="5" max="60" step="5" id="cfg-pre-close-sec" value="20" class="w-full h-1.5 bg-dark-700 rounded-lg appearance-none cursor-pointer accent-emerald-500" oninput="document.getElementById('val-pre-close-sec').innerText = this.value + ' 秒'">
+              </div>
+            </div>
+
+            <!-- Telegram Bot Config -->
+            <div class="p-3.5 rounded-xl bg-dark-850 border border-dark-800 space-y-2.5">
+              <div class="flex items-center justify-between">
+                <div class="flex items-center gap-2">
+                  <span class="text-sm">✈️</span>
+                  <span class="text-[11px] font-bold text-slate-300">Telegram Bot 推播</span>
+                </div>
+                <label class="relative inline-flex items-center cursor-pointer">
+                  <input type="checkbox" id="cfg-tg-enabled" class="sr-only peer">
+                  <div class="w-9 h-5 bg-dark-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-emerald-500"></div>
+                </label>
+              </div>
+
+              <div class="space-y-2">
+                <div>
+                  <label class="block text-slate-400 text-[10px] mb-0.5">Bot Token</label>
+                  <input type="password" id="cfg-tg-token" placeholder="123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ" class="w-full bg-dark-900 border border-dark-700 rounded-lg px-2.5 py-1.5 text-white font-mono focus:border-emerald-500 focus:outline-none">
+                </div>
+                <div>
+                  <label class="block text-slate-400 text-[10px] mb-0.5">Chat ID</label>
+                  <input type="text" id="cfg-tg-chat-id" placeholder="-1001234567890 或 987654321" class="w-full bg-dark-900 border border-dark-700 rounded-lg px-2.5 py-1.5 text-white font-mono focus:border-emerald-500 focus:outline-none">
+                </div>
+                <div class="flex items-center justify-between pt-1.5 border-t border-dark-800">
+                  <span class="text-slate-400 text-[10px]">開關單即時推播（已關閉靜音，專注 22:00 總結）</span>
+                  <label class="relative inline-flex items-center cursor-pointer">
+                    <input type="checkbox" id="cfg-tg-notify-orders" class="sr-only peer">
+                    <div class="w-7 h-4 bg-dark-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-emerald-500"></div>
+                  </label>
+                </div>
+                <div class="text-[10px] text-emerald-400/90 font-mono bg-dark-950/60 p-2 rounded-lg border border-dark-800">
+                  🌙 系統將於每天晚上 22:00（晚上 10 點）準時向 Telegram 推播【策略總結與多策略競技場戰報】。平時開關單完全靜音不打擾！
+                </div>
+              </div>
+            </div>
+
+            <!-- Discord Webhook Config -->
+            <div class="p-3.5 rounded-xl bg-dark-850 border border-dark-800 space-y-2.5">
+              <div class="flex items-center justify-between">
+                <div class="flex items-center gap-2">
+                  <span class="text-sm">🎮</span>
+                  <span class="text-[11px] font-bold text-slate-300">Discord Webhook 推播</span>
+                </div>
+                <label class="relative inline-flex items-center cursor-pointer">
+                  <input type="checkbox" id="cfg-discord-enabled" class="sr-only peer">
+                  <div class="w-9 h-5 bg-dark-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-emerald-500"></div>
+                </label>
+              </div>
+
+              <div>
+                <label class="block text-slate-400 text-[10px] mb-0.5">Webhook URL</label>
+                <input type="password" id="cfg-discord-webhook" placeholder="https://discord.com/api/webhooks/..." class="w-full bg-dark-900 border border-dark-700 rounded-lg px-2.5 py-1.5 text-white font-mono focus:border-emerald-500 focus:outline-none">
+              </div>
+            </div>
+
+            <!-- Custom Webhook -->
+            <div class="p-3.5 rounded-xl bg-dark-850 border border-dark-800 space-y-2.5">
+              <div class="flex items-center justify-between">
+                <div class="flex items-center gap-2">
+                  <span class="text-sm">🌐</span>
+                  <span class="text-[11px] font-bold text-slate-300">自訂 Webhook (HTTP POST JSON)</span>
+                </div>
+                <label class="relative inline-flex items-center cursor-pointer">
+                  <input type="checkbox" id="cfg-custom-enabled" class="sr-only peer">
+                  <div class="w-9 h-5 bg-dark-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-emerald-500"></div>
+                </label>
+              </div>
+
+              <div>
+                <input type="text" id="cfg-custom-webhook" placeholder="https://api.yourdomain.com/trading-signal" class="w-full bg-dark-900 border border-dark-700 rounded-lg px-2.5 py-1.5 text-white font-mono focus:border-emerald-500 focus:outline-none">
+              </div>
+            </div>
+
+          </form>
+        </div>
+
+        <!-- Right: Live Signal Feed / Historical Alerts (7 cols) -->
+        <div class="lg:col-span-7 bg-dark-900/90 rounded-2xl border border-dark-800 p-5 space-y-4 shadow-xl flex flex-col">
+          <div class="flex items-center justify-between border-b border-dark-800 pb-3">
+            <div>
+              <h3 class="text-sm font-bold text-white flex items-center gap-2">
+                <span>⚡</span> 即時訊號預警動態串流 (Live Signal Feed)
+              </h3>
+              <p class="text-[11px] text-slate-400">當前運行中序列、已發送警報與止盈/爆倉事件記錄</p>
+            </div>
+            <div class="flex items-center gap-2">
+              <button onclick="triggerTestNotification()" class="px-2.5 py-1 rounded-lg bg-dark-800 hover:bg-dark-750 text-cyan-300 border border-dark-700 text-xs font-medium transition active:scale-95">
+                發送測試
+              </button>
+              <span class="text-xs px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 font-mono font-semibold" id="signals-count-badge">0 筆</span>
+            </div>
+          </div>
+
+          <div class="overflow-y-auto flex-1 max-h-[460px] space-y-2.5 pr-1" id="notifications-feed-container">
+            <!-- Dynamic feed items -->
+            <div class="p-6 text-center text-slate-500 text-xs">目前尚無觸發訊號，系統持續監控中...</div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Footer -->
+  <footer class="mt-auto border-t border-dark-800 bg-dark-900/80 px-4 py-4 text-center text-xs text-slate-500">
+    ⚡ 5m 超買超賣反彈 & 馬丁格爾量化預測通知系統 • 專為比特幣 / 以太坊 / 索拉納高勝率短線預測市場量身打造 • 即時 API 服務運作中
+  </footer>
+
+  <!-- Toast Notification Container -->
+  <div id="toast-container" class="fixed bottom-5 right-5 z-50 space-y-2"></div>
+
+  <!-- JavaScript Application Logic -->
+  <script>
+    // State storage
+    let liveState = {};
+    let resonanceState = {};
+    let paperAccount = {};
+    let activeSequences = {};
+    let notifyConfig = {};
+    let optimalPresets = {};
+    let masterReport = null;
+    let currentStreakTab = 'down';
+    let equityChartInstance = null;
+    let cachedBacktestResult = null;
+
+    // Toast helper
+    function showToast(message, type = 'success') {
+      const container = document.getElementById('toast-container');
+      const toast = document.createElement('div');
+      const bg = type === 'success' 
+        ? 'bg-emerald-600/90 text-white border-emerald-500' 
+        : (type === 'error' ? 'bg-rose-600/90 text-white border-rose-500' : 'bg-cyan-600/90 text-white border-cyan-500');
+      
+      toast.className = `px-4 py-3 rounded-xl shadow-2xl border backdrop-blur-md text-xs font-semibold flex items-center gap-2 transition-all transform duration-300 translate-y-2 opacity-0 ${bg}`;
+      toast.innerHTML = `<span>${type === 'success' ? '✅' : (type === 'error' ? '❌' : 'ℹ️')}</span> <span>${message}</span>`;
+      
+      container.appendChild(toast);
+      setTimeout(() => {
+        toast.classList.remove('translate-y-2', 'opacity-0');
+      }, 20);
+
+      setTimeout(() => {
+        toast.classList.add('opacity-0', 'translate-y-2');
+        setTimeout(() => toast.remove(), 300);
+      }, 3500);
+    }
+
+    // Format numbers
+    function formatUSD(num) {
+      if (num === null || num === undefined || isNaN(num)) return '$0.00';
+      return '$' + Number(num).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+
+    function formatNumber(num) {
+      if (num === null || num === undefined || isNaN(num)) return '0';
+      return Number(num).toLocaleString('en-US');
+    }
+
+    // Format timestamp
+    function formatTimeUTC(ts) {
+      if (!ts) return '--';
+      const d = new Date(ts);
+      return d.toISOString().replace('T', ' ').substring(0, 19);
+    }
+
+    // Poll live status every 3 seconds
+    async function fetchStatus() {
+      try {
+        const resp = await fetch('/api/status');
+        if (!resp.ok) throw new Error('Status HTTP ' + resp.status);
+        const data = await resp.json();
+        window.lastStatusData = data;
+        
+        liveState = data.live || {};
+        resonanceState = data.resonance || {};
+        paperAccount = data.paper_account || {};
+        activeSequences = data.active_sequences || {};
+        notifyConfig = data.notify_config || {};
+        
+        renderResonanceBanner(resonanceState);
+        renderConfidenceMonitor(data.confidence_state);
+        renderArenaLeaderboard(data.arena_leaderboard);
+        renderMultiLanes(data.lanes, data.watchdog);
+        renderPaperAccount(paperAccount);
+        renderLiveCards();
+        renderSignalFeed(data.notifications || []);
+        syncNotifyConfigUI();
+        renderClobPanel(data);
+        updateReviewCountdown(data.review_state);
+
+        const isDry = data.clob_config && data.clob_config.dry_run;
+        document.getElementById('sys-status-text').innerText = isDry ? 'V5 高效複利版追蹤中 (3s)' : '🔥 真金實盤狙擊中 (3s)';
+        const sysTag = document.getElementById('system-mode-tag');
+        if (sysTag && data.confidence_state) {
+          const cs = data.confidence_state;
+          if (!isDry) {
+            sysTag.className = 'text-xs px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-bold animate-pulse';
+            sysTag.innerText = `🔥 真金實盤自動交易中 (LIVE CLOB V2 • 信心 ${cs.confidence_score}% • V5 高效版)`;
+          } else {
+            sysTag.className = 'text-xs px-2.5 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-bold animate-pulse';
+            sysTag.innerText = `🎯 V5 信心監控暖機中 (${cs.confidence_score}% / 95% • 再贏 ${cs.remaining_v4_wins_to_graduate} 輪自動轉正真金)`;
+          }
+        }
+        document.getElementById('last-update-time').innerText = '最後更新: ' + new Date().toLocaleTimeString();
+      } catch (err) {
+        console.error('fetchStatus error:', err);
+        document.getElementById('sys-status-text').innerText = '伺服器重新連線中...';
+      }
+    }
+
+    // Render Multi-Strategy Arena Leaderboard
+    function renderArenaLeaderboard(lb) {
+      const container = document.getElementById('arena-cards-grid');
+      if (!container) return;
+      if (!Array.isArray(lb) || lb.length === 0) {
+        container.innerHTML = '<div class="col-span-4 p-4 text-center text-slate-500 text-xs font-mono">競技場資料初始化中...</div>';
+        return;
+      }
+
+      container.innerHTML = lb.map((s, idx) => {
+        const isLeader = idx === 0;
+        const rankMedal = idx === 0 ? '🥇' : (idx === 1 ? '🥈' : (idx === 2 ? '🥉' : '🎖️'));
+        const borderColor = isLeader ? 'border-amber-400/50 shadow-amber-500/10' : 'border-dark-800';
+        const bgGrad = isLeader ? 'bg-gradient-to-br from-dark-850 via-dark-900 to-amber-950/20' : 'bg-dark-900/90';
+        const progressPct = Math.min(100.0, Math.max(0.0, s.target_progress_pct || 0.0));
+
+        return `
+          <div class="rounded-2xl border ${borderColor} ${bgGrad} p-4 space-y-3 shadow-xl transition-all hover:border-slate-600 relative overflow-hidden">
+            ${isLeader ? '<div class="absolute top-0 right-0 bg-gradient-to-l from-amber-500 to-yellow-400 text-dark-950 text-[10px] font-black px-2.5 py-0.5 rounded-bl-lg uppercase tracking-wider">🏆 領跑中 LEADER</div>' : ''}
+            
+            <div class="flex items-start gap-2.5">
+              <span class="text-2xl">${rankMedal}</span>
+              <div>
+                <div class="text-xs font-bold text-white flex items-center gap-1.5">
+                  <span>${s.name}</span>
+                </div>
+                <div class="text-[10px] font-mono text-slate-400">Track ${s.track} • 獨立 $80U 艙</div>
+              </div>
+            </div>
+
+            <div class="p-2.5 rounded-xl bg-dark-950/70 border border-dark-800 space-y-1">
+              <div class="flex items-baseline justify-between">
+                <span class="text-[10px] text-slate-400">當前模擬權益</span>
+                <span class="text-xs font-mono font-bold ${s.roi_pct >= 0 ? 'text-emerald-400' : 'text-rose-400'}">
+                  ${s.roi_pct >= 0 ? '+' : ''}${s.roi_pct.toFixed(1)}%
+                </span>
+              </div>
+              <div class="text-xl font-black font-mono text-cyan-300">
+                $${s.equity.toFixed(2)} <span class="text-xs text-slate-500 font-sans font-normal">/ $200U</span>
+              </div>
+              <div class="space-y-1 pt-1">
+                <div class="flex justify-between text-[9px] font-mono text-slate-400">
+                  <span>階段進度</span>
+                  <span>${progressPct.toFixed(1)}%</span>
+                </div>
+                <div class="w-full bg-dark-800 h-1.5 rounded-full overflow-hidden">
+                  <div class="h-full bg-gradient-to-r from-amber-400 via-emerald-400 to-cyan-400 transition-all duration-500" style="width: ${progressPct}%"></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="grid grid-cols-2 gap-2 text-[10px] font-mono">
+              <div class="p-2 rounded-lg bg-dark-850 border border-dark-750">
+                <div class="text-slate-400">CAS 評分</div>
+                <div class="text-xs font-bold text-amber-300 mt-0.5">${s.cas_score.toFixed(1)} <span class="text-[9px] text-slate-500">/ 100</span></div>
+              </div>
+              <div class="p-2 rounded-lg bg-dark-850 border border-dark-750">
+                <div class="text-slate-400">最大回撤 MDD</div>
+                <div class="text-xs font-bold text-rose-300 mt-0.5">${s.max_drawdown_pct.toFixed(1)}%</div>
+              </div>
+              <div class="p-2 rounded-lg bg-dark-850 border border-dark-750">
+                <div class="text-slate-400">累積勝率</div>
+                <div class="text-xs font-bold text-emerald-400 mt-0.5">${s.win_rate_pct.toFixed(1)}% <span class="text-[9px] text-slate-500">(${s.sequence_wins}W/${s.sequence_losses}L)</span></div>
+              </div>
+              <div class="p-2 rounded-lg bg-dark-850 border border-dark-750">
+                <div class="text-slate-400">首碼直贏率</div>
+                <div class="text-xs font-bold text-cyan-300 mt-0.5">${s.step1_win_rate_pct.toFixed(1)}%</div>
+              </div>
+            </div>
+
+            <p class="text-[10px] text-slate-400 leading-tight pt-1 border-t border-dark-800">
+              ${s.description}
+            </p>
+          </div>
+        `;
+      }).join('');
+    }
+
+    // Render Multi-Lane Asymmetric Radar
+    function renderMultiLanes(lanes, wd) {
+      const container = document.getElementById('lanes-container');
+      const badge = document.getElementById('watchdog-live-badge');
+      if (badge && wd && wd.status_label) {
+        badge.innerHTML = `<span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>${wd.status_label}`;
+      }
+      if (!container || !lanes) return;
+
+      const symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+      container.innerHTML = symbols.map(sym => {
+        const lane = lanes[sym] || { status: 'IDLE', current_step: 1 };
+        let statusBadge = '';
+        let detailsHtml = '';
+        let borderColor = 'border-dark-800';
+
+        if (lane.status === 'IDLE') {
+          statusBadge = '<span class="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-bold">🟢 空手待命 (可開新單)</span>';
+          detailsHtml = '<div class="text-slate-400 text-[11px]">無在場資金 • 隨時可依 CAP 規則承接首碼共振訊號</div>';
+        } else if (lane.status === 'ACTIVE_STEP1') {
+          borderColor = 'border-cyan-500/40';
+          statusBadge = '<span class="text-[10px] px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-bold animate-pulse">🔵 首碼在場 (ACTIVE STEP 1)</span>';
+          detailsHtml = `
+            <div class="space-y-1 text-[11px] font-mono">
+              <div class="flex justify-between text-slate-300">
+                <span>持倉成本: <b class="text-cyan-300">$${(lane.active_cost || 2.55).toFixed(2)}U</b></span>
+                <span>方向: <b class="${lane.direction === 'LONG_BOUNCE' ? 'text-emerald-400' : 'text-rose-400'}">${lane.direction || '--'}</b></span>
+              </div>
+              <div class="text-slate-400 text-[10px]">起算 TWAP: $${(lane.price_to_beat || 0).toFixed(2)}</div>
+            </div>
+          `;
+        } else if (lane.status === 'PENDING_RESCUE') {
+          borderColor = 'border-amber-500/50';
+          const elapsedMin = lane.pending_since ? ((Date.now() / 1000 - lane.pending_since) / 60) : 0;
+          const timeoutPct = Math.min(100, (elapsedMin / 90.0) * 100);
+          statusBadge = `<span class="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 font-bold animate-pulse">🟡 待命救援 (第 ${lane.current_step}/4 碼)</span>`;
+          detailsHtml = `
+            <div class="space-y-1.5 text-[11px] font-mono">
+              <div class="flex justify-between text-slate-300">
+                <span>待命時間: <b class="text-amber-300">${elapsedMin.toFixed(0)} 分鐘 / 90m</b></span>
+                <span>在險風險: <b class="text-rose-400">$${(lane.cumulative_loss || 2.55).toFixed(2)}U</b></span>
+              </div>
+              <div class="w-full bg-dark-800 h-1.5 rounded-full overflow-hidden">
+                <div class="h-full bg-gradient-to-r from-amber-400 to-rose-500" style="width: ${timeoutPct}%"></div>
+              </div>
+              <div class="text-[10px] text-amber-400/80">90m 超時將由看門狗自動認賠 -$2.55U 並重置為空手防死鎖</div>
+            </div>
+          `;
+        } else if (lane.status === 'ACTIVE_RESCUE') {
+          borderColor = 'border-purple-500/50';
+          statusBadge = `<span class="text-[10px] px-2 py-0.5 rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/40 font-bold animate-pulse">🟣 救援在場 (STEP ${lane.current_step})</span>`;
+          detailsHtml = `
+            <div class="text-slate-300 text-[11px] font-mono">
+              救援單撮合執行中 • 成本: $${(lane.active_cost || 5.61).toFixed(2)}U
+            </div>
+          `;
+        }
+
+        const coinIcon = sym.startsWith('BTC') ? '₿' : (sym.startsWith('ETH') ? 'Ξ' : '◎');
+        const coinColor = sym.startsWith('BTC') ? 'text-amber-400' : (sym.startsWith('ETH') ? 'text-indigo-400' : 'text-purple-400');
+
+        return `
+          <div class="p-3.5 rounded-xl bg-dark-850 border ${borderColor} space-y-2.5 transition">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-2">
+                <span class="text-base font-bold ${coinColor}">${coinIcon}</span>
+                <span class="text-xs font-bold text-white font-mono">${sym}</span>
+              </div>
+              ${statusBadge}
+            </div>
+            ${detailsHtml}
+          </div>
+        `;
+      }).join('');
+    }
+
+    // Render Resonance Banner
+    function renderResonanceBanner(res) {
+      if (!res) return;
+      const meanRsi = res.mean_rsi_6 !== undefined ? res.mean_rsi_6 : '--';
+      const syncDown = res.sync_down_coins !== undefined ? res.sync_down_coins : 0;
+      const syncUp = res.sync_up_coins !== undefined ? res.sync_up_coins : 0;
+      const isOversold = !!res.oversold_resonance_active;
+      const isOverbought = !!res.overbought_resonance_active;
+
+      const meanEl = document.getElementById('res-mean-rsi');
+      meanEl.innerText = meanRsi;
+      if (meanRsi <= 25) {
+        meanEl.className = 'font-bold text-rose-400 font-black animate-pulse';
+      } else if (meanRsi >= 75) {
+        meanEl.className = 'font-bold text-emerald-400 font-black animate-pulse';
+      } else {
+        meanEl.className = 'font-bold text-slate-200';
+      }
+
+      document.getElementById('res-sync-down').innerText = `${syncDown} / 3`;
+      document.getElementById('res-sync-up').innerText = `${syncUp} / 3`;
+
+      const badge = document.getElementById('res-status-badge');
+      if (isOversold) {
+        badge.className = 'px-3 py-1.5 rounded-xl bg-rose-500/20 border border-rose-500/40 text-rose-300 font-sans font-bold flex items-center gap-1.5 animate-pulse glow-red';
+        badge.innerHTML = `<span class="w-2 h-2 rounded-full bg-rose-400 animate-ping"></span><span>🚨 全市場極限超賣共振中 (做多反彈就緒)</span>`;
+      } else if (isOverbought) {
+        badge.className = 'px-3 py-1.5 rounded-xl bg-amber-500/20 border border-amber-500/40 text-amber-300 font-sans font-bold flex items-center gap-1.5 animate-pulse glow-amber';
+        badge.innerHTML = `<span class="w-2 h-2 rounded-full bg-amber-400 animate-ping"></span><span>🚨 全市場極限超買共振中 (做空回調就緒)</span>`;
+      } else {
+        badge.className = 'px-3 py-1.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 font-sans font-bold flex items-center gap-1.5';
+        badge.innerHTML = `<span class="w-2 h-2 rounded-full bg-emerald-400"></span><span>🟢 宏觀共振待機中 (常態震盪)</span>`;
+      }
+    }
+
+    // Render Live Simulated Account Panel
+    function renderPaperAccount(acct) {
+      if (!acct) return;
+      const totEq = acct.total_equity_u !== undefined ? acct.total_equity_u : 80.00;
+      const actEq = acct.active_equity_u !== undefined ? acct.active_equity_u : 80.00;
+      const vltEq = acct.vault_locked_u !== undefined ? acct.vault_locked_u : 0.0;
+      const pkEq = acct.peak_equity_u !== undefined ? acct.peak_equity_u : 80.00;
+      const prgPct = acct.progress_pct !== undefined ? acct.progress_pct : ((totEq / 1000.0) * 100.0);
+      const nextS1 = acct.next_step1_stake_u !== undefined ? acct.next_step1_stake_u : 2.55;
+      const nextS2 = acct.next_step2_stake_u !== undefined ? acct.next_step2_stake_u : 5.76;
+      const nextS3 = acct.next_step3_stake_u !== undefined ? acct.next_step3_stake_u : 12.90;
+      const nextS4 = acct.next_step4_stake_u !== undefined ? acct.next_step4_stake_u : 29.02;
+      const nextS1Shares = acct.next_step1_shares !== undefined ? acct.next_step1_shares : (nextS1 / 0.51).toFixed(1);
+      const nextS2Shares = acct.next_step2_shares !== undefined ? acct.next_step2_shares : (nextS2 / 0.51).toFixed(1);
+      const nextS3Shares = acct.next_step3_shares !== undefined ? acct.next_step3_shares : (nextS3 / 0.51).toFixed(1);
+      const nextS4Shares = acct.next_step4_shares !== undefined ? acct.next_step4_shares : (nextS4 / 0.51).toFixed(1);
+      const totSeq = acct.total_sequences || 0;
+      const wonSeq = acct.won_sequences || 0;
+      const winRate = acct.win_rate_pct !== undefined ? acct.win_rate_pct : (totSeq ? ((wonSeq/totSeq)*100).toFixed(1) : 0);
+
+      document.getElementById('paper-total-equity').innerText = formatUSD(totEq).replace('$', '');
+      document.getElementById('paper-active-equity').innerText = `${formatUSD(actEq)} U`;
+      const nextMs = acct.next_vault_milestone_u !== undefined ? acct.next_vault_milestone_u : 220.0;
+      const msPct = Math.min(100.0, (totEq / Math.max(nextMs, 1.0)) * 100.0);
+      const msLabelEl = document.getElementById('paper-milestone-label');
+      if (msLabelEl) msLabelEl.innerText = `下一鎖倉門檻 ($${Number(nextMs).toLocaleString()}U) 進度`;
+      document.getElementById('paper-vault-equity').innerText = vltEq > 0
+        ? `🔒 $${Number(vltEq).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})} U 鎖死`
+        : `$0.00 U (滿$${Number(nextMs).toLocaleString()}鎖$115)`;
+      document.getElementById('paper-peak-equity').innerText = `${formatUSD(pkEq)} U`;
+      document.getElementById('paper-progress-pct').innerText = `${msPct.toFixed(2)}%`;
+      document.getElementById('paper-progress-bar').style.width = `${Math.min(100, Math.max(2, msPct))}%`;
+
+      const walletAmtEl = document.getElementById('btn-wallet-amount');
+      if (walletAmtEl) walletAmtEl.innerText = `($${Number(liveCash).toFixed(2)} pUSD)`;
+
+      document.getElementById('paper-next-s1').innerText = `${formatUSD(nextS1)} U`;
+      document.getElementById('paper-next-s1-shares').innerText = nextS1Shares;
+      document.getElementById('paper-next-s2').innerText = `${formatUSD(nextS2)} U`;
+      document.getElementById('paper-next-s2-shares').innerText = nextS2Shares;
+      const s3El = document.getElementById('paper-next-s3');
+      if (s3El) s3El.innerText = `${formatUSD(nextS3)} U`;
+      const s3ShEl = document.getElementById('paper-next-s3-shares');
+      if (s3ShEl) s3ShEl.innerText = nextS3Shares;
+      const s4El = document.getElementById('paper-next-s4');
+      const s4ShEl = document.getElementById('paper-next-s4-shares');
+      if (nextS4 > 0) {
+        if (s4El) s4El.innerText = `${formatUSD(nextS4)} U`;
+        if (s4ShEl) s4ShEl.innerText = nextS4Shares;
+      } else {
+        if (s4El) s4El.innerText = `🔒 $140U 解鎖`;
+        if (s4ShEl) s4ShEl.innerText = `護城河保護中`;
+      }
+
+      const isLiveReal = !(window.lastStatusData && window.lastStatusData.clob_config && window.lastStatusData.clob_config.dry_run);
+      const wmTag = document.getElementById('paper-watermark-tag');
+      if (wmTag && acct.watermark_label) {
+        wmTag.innerText = acct.watermark_label.split(' ')[0] + ' • V7.1 雙顧問階梯';
+      }
+      const ladderNote = document.getElementById('paper-live-ladder-note');
+      if (ladderNote) {
+        const p2 = acct.pending_step2;
+        if (p2 && p2.stake_usd) {
+          const pStep = p2.step || 2;
+          ladderNote.className = 'text-[10px] text-amber-300 font-bold leading-snug pt-1 border-t border-dark-800/80';
+          ladderNote.innerText = `🔥 待發第 ${pStep} 碼延遲共振子彈就緒：下一次三幣共振將直接買入 ${(p2.stake_usd / 0.51).toFixed(1)} 份 ($${Number(p2.stake_usd).toFixed(2)}U)！`;
+        } else {
+          ladderNote.className = 'text-[10px] text-cyan-300 font-medium leading-snug pt-1 border-t border-dark-800/80';
+          ladderNote.innerText = `📌 當前階梯：${acct.watermark_label || 'Lv.1A 本金優勢四碼起步階'}（下一晉升門檻：$${acct.next_watermark_u || 110} U）`;
+        }
+      }
+
+      document.getElementById('paper-seq-count-label').innerText = `實盤序列: ${totSeq} 輪 (${wonSeq} 勝 / ${acct.busts || 0} 停損)`;
+      document.getElementById('paper-winrate-stat').innerText = isLiveReal ? `實盤勝率: ${winRate}%` : `模擬勝率: ${winRate}%`;
+
+      // Render Trade Log
+      const tbody = document.getElementById('paper-trade-log-body');
+      const logs = acct.trade_log || [];
+      if (!logs.length) {
+        tbody.innerHTML = `<tr><td colspan="7" class="py-4 text-center text-slate-500 font-sans">${isLiveReal ? '等待 V7.1 三幣共振訊號觸發實盤 CLOB 下單與結算...' : '等待四引擎訊號觸發模擬金交割結算...'}</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = logs.slice(0, 50).map(t => {
+        const isLong = t.direction === 'LONG_BOUNCE';
+        const dirBadge = isLong 
+          ? `<span class="text-emerald-400 font-bold">多(UP)</span>` 
+          : `<span class="text-rose-400 font-bold">空(DOWN)</span>`;
+        
+        let exitBadge = '';
+        const exitC = t.exit_share_cents !== undefined ? t.exit_share_cents : (t.won ? 100.0 : 0.0);
+        if (exitC >= 95) {
+          exitBadge = `<span class="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold text-[9px]">100¢ 到期 (+96%)</span>`;
+        } else if (exitC >= 88) {
+          exitBadge = `<span class="px-1.5 py-0.5 rounded bg-teal-500/20 text-teal-300 font-bold text-[9px]">90¢ 救援護利 (+76%)</span>`;
+        } else if (exitC >= 80) {
+          exitBadge = `<span class="px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 font-bold text-[9px]">85¢ 首碼護利 (+67%)</span>`;
+        } else if (exitC >= 70) {
+          exitBadge = `<span class="px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 font-bold text-[9px]">72¢ 護利 (+41%)</span>`;
+        } else if (t.won_at_step < 4 && !t.won) {
+          exitBadge = `<span class="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-bold text-[9px]">第${t.won_at_step||1}碼未過 (延遲共振待發)</span>`;
+        } else {
+          exitBadge = `<span class="px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-400 font-bold text-[9px]">0¢ 停損</span>`;
+        }
+
+        const pnlColor = t.pnl_u >= 0 ? 'text-emerald-400' : 'text-rose-400';
+        const s1Stake = t.step1_stake_u !== undefined ? t.step1_stake_u : '--';
+        const s2Stake = t.step2_stake_u !== undefined ? t.step2_stake_u : '--';
+
+        return `
+          <tr class="hover:bg-dark-850/60 transition">
+            <td class="py-1 px-2 text-slate-500">#${t.seq}</td>
+            <td class="py-1 px-2 text-slate-200">${(t.symbol || '').replace('USDT','')}/${dirBadge}</td>
+            <td class="py-1 px-2 text-slate-400">${t.rsi_6 || '--'}/${t.streak || '--'}根</td>
+            <td class="py-1 px-2 text-slate-300">$${s1Stake}${s2Stake && s2Stake !== 0 ? '/$' + s2Stake : ''}</td>
+            <td class="py-1 px-2">${exitBadge}</td>
+            <td class="py-1 px-2 text-right ${pnlColor} font-bold">${t.pnl_u >= 0 ? '+' : ''}${formatUSD(t.pnl_u)}</td>
+            <td class="py-1 px-2 text-right text-slate-100 font-bold">${formatUSD(t.equity_after_u)}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    // Update 2-Day Review Countdown
+    function updateReviewCountdown(reviewState) {
+      if (!reviewState) return;
+      const sec = reviewState.next_review_sec || 0;
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const s = sec % 60;
+      const timeStr = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+      const cdEl = document.getElementById('review-countdown-display');
+      if (cdEl) cdEl.innerText = timeStr;
+    }
+
+    // Trigger 2-Day Review On Demand
+    async function triggerTwoDayReview() {
+      try {
+        showToast('正在分析近 48 小時勝率並生成 Review 報告...', 'info');
+        const resp = await fetch('/api/review/run', { method: 'POST' });
+        const data = await resp.json();
+        if (data.status === 'ok') {
+          const rep = data.report;
+          const m = rep.metrics;
+          const v = rep.verdict;
+          showToast(`📊 2天 Review 完成！勝率: ${m.combined_win_rate_pct}% (${m.total_sequences}輪) • ${v.icon} ${v.title}，報告已發送至 Telegram！`, 'success');
+          await fetchStatus();
+        } else {
+          showToast('Review 生成異常', 'error');
+        }
+      } catch (e) {
+        showToast('Review 請求失敗: ' + e.message, 'error');
+      }
+    }
+
+    // Render V4 Confidence Monitor & Auto-Graduation Panel
+    function renderConfidenceMonitor(conf) {
+      if (!conf) return;
+      const score = conf.confidence_score !== undefined ? Number(conf.confidence_score) : 88.0;
+      const thresh = conf.threshold_pct !== undefined ? Number(conf.threshold_pct) : 95.0;
+      const isDry = !conf.is_live_real_money;
+      const remWins = conf.remaining_v4_wins_to_graduate !== undefined ? conf.remaining_v4_wins_to_graduate : 3;
+      const streak = conf.consecutive_wins !== undefined ? conf.consecutive_wins : 11;
+
+      const scoreEl = document.getElementById('conf-score-number');
+      if (scoreEl) {
+        scoreEl.innerText = `${score.toFixed(1)}%`;
+        scoreEl.className = score >= thresh
+          ? 'text-2xl md:text-3xl font-black text-emerald-400'
+          : 'text-2xl md:text-3xl font-black text-cyan-400';
+      }
+
+      const barEl = document.getElementById('conf-score-bar');
+      if (barEl) {
+        barEl.style.width = `${Math.min(100, Math.max(5, score))}%`;
+      }
+
+      const stageBadge = document.getElementById('conf-stage-badge');
+      if (stageBadge) {
+        if (!isDry) {
+          stageBadge.className = 'text-[11px] px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-mono font-bold animate-pulse';
+          stageBadge.innerText = `🟢 真金實盤自動運行中 (LIVE CLOB V2 • ${streak} 連勝)`;
+        } else if (score >= thresh) {
+          stageBadge.className = 'text-[11px] px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-mono font-bold animate-pulse';
+          stageBadge.innerText = `🚀 信心已達標 (${score.toFixed(1)}%) • 隨時可切換真金`;
+        } else {
+          stageBadge.className = 'text-[11px] px-2.5 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 font-mono font-bold';
+          stageBadge.innerText = conf.status_label || `🔥 實況 ${streak} 連勝中 • 再贏 ${remWins} 輪自動切換真金`;
+        }
+      }
+
+      const summaryEl = document.getElementById('conf-summary-text');
+      if (summaryEl && (conf.next_action_desc || conf.status_summary)) {
+        summaryEl.innerText = conf.next_action_desc || conf.status_summary;
+      }
+
+      const progLabel = document.getElementById('conf-progress-label');
+      if (progLabel) {
+        const diff = Math.max(0, thresh - score);
+        if (!isDry) {
+          progLabel.innerText = `✅ 已正式轉入真金實盤 ($2.55U 最小注額起步 • 連損 2 輪自動熔斷保護)`;
+        } else if (diff <= 0) {
+          progLabel.innerText = `🎉 已跨越 ${thresh}% 轉正門檻！`;
+        } else {
+          progLabel.innerText = `目前 ${score.toFixed(1)}%（距離 ${thresh}% 自動轉正僅差 +${diff.toFixed(1)}%，再贏 ${remWins} 輪 V4 驗證即自動切換真金）`;
+        }
+      }
+
+      const autoCb = document.getElementById('conf-auto-graduate-cb');
+      if (autoCb) {
+        autoCb.checked = conf.auto_graduate_enabled !== false;
+      }
+
+      const gradBtn = document.getElementById('btn-graduate-now');
+      if (gradBtn) {
+        if (!isDry) {
+          gradBtn.className = 'px-3.5 py-1.5 rounded-lg bg-emerald-950/80 text-emerald-300 border border-emerald-500/40 font-bold text-xs flex items-center justify-center gap-1.5 cursor-default';
+          gradBtn.innerHTML = '<span>✅ 真金實盤已啟動 ($2.55U 最小注)</span>';
+        } else {
+          gradBtn.className = 'px-3.5 py-1.5 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs flex items-center justify-center gap-1.5 shadow-md shadow-emerald-600/20 transition active:scale-95';
+          gradBtn.innerHTML = '<span>🚀 立即啟動真金實盤 ($2.55U 最小注)</span>';
+        }
+      }
+
+      const grid = document.getElementById('conf-pillars-grid');
+      if (grid && conf.pillars) {
+        const pillarList = Array.isArray(conf.pillars) ? conf.pillars : Object.values(conf.pillars);
+        grid.innerHTML = pillarList.map(p => {
+          const maxScore = Number(p.max !== undefined ? p.max : p.max_score) || 1;
+          const curScore = Number(p.score) || 0;
+          const pct = Math.min(100, Math.max(0, (curScore / maxScore) * 100));
+          const isPass = curScore >= maxScore * 0.9;
+          const borderCol = isPass ? 'border-emerald-500/30' : 'border-amber-500/40';
+          const badgeCol = isPass ? 'bg-emerald-500/20 text-emerald-300' : 'bg-amber-500/20 text-amber-300';
+          const barCol = isPass ? 'bg-emerald-500' : 'bg-amber-400';
+          return `
+            <div class="p-3 rounded-xl bg-dark-900/90 border ${borderCol} space-y-1.5 flex flex-col justify-between">
+              <div>
+                <div class="flex items-center justify-between text-[11px] gap-1">
+                  <span class="font-bold text-white truncate">${p.label}</span>
+                  <span class="px-1.5 py-0.5 rounded font-mono text-[10px] font-bold shrink-0 ${badgeCol}">${curScore}/${maxScore}</span>
+                </div>
+              </div>
+              <div class="space-y-1 pt-1">
+                <div class="w-full bg-dark-800 h-1.5 rounded-full overflow-hidden">
+                  <div class="${barCol} h-full transition-all duration-500" style="width: ${pct}%"></div>
+                </div>
+                <div class="text-[10px] text-slate-400">${isPass ? '✅ 已達標滿分' : '⏳ V4 實戰暖機累積中'}</div>
+              </div>
+            </div>
+          `;
+        }).join('');
+      }
+    }
+
+    async function toggleAutoGraduate(enabled) {
+      try {
+        const resp = await fetch('/api/confidence/toggle_auto', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: !!enabled })
+        });
+        const data = await resp.json();
+        if (data.confidence_state) renderConfidenceMonitor(data.confidence_state);
+        showToast(
+          enabled
+            ? '✅ 已開啟「信心達 95% 自動切換真金實盤」！再贏 3 輪 V4 驗證將自動轉為真金實盤。'
+            : '⏸ 已改為手動轉正模式（達 95% 時將通知您，由您點擊按鈕切換）。',
+          'info'
+        );
+      } catch (e) {
+        showToast('設定失敗: ' + e.message, 'error');
+      }
+    }
+
+    async function graduateToRealMoneyNow() {
+      if (!confirm('確定要立即結束模擬暖機，直接切換為 Polymarket 真金實盤（以最小安全注額 5.0 份 / $2.55U 起步，並附帶連損 2 輪自動熔斷保護）嗎？')) {
+        return;
+      }
+      try {
+        showToast('正在啟動 Polymarket CLOB V2 真金實盤交易模式...', 'info');
+        const resp = await fetch('/api/confidence/graduate_now', { method: 'POST' });
+        const data = await resp.json();
+        clobFormSynced = false;
+        await fetchStatus();
+        showToast('🚀 已正式啟動 Polymarket 真金實盤模式 ($2.55U 最小注額起步 + 自動熔斷保護)！', 'success');
+      } catch (e) {
+        showToast('啟動真金實盤失敗: ' + e.message, 'error');
+      }
+    }
+
+    // Simulate Paper Step (1, 10, 100)
+    async function simulatePaperStep(count = 1) {
+      try {
+        const resp = await fetch('/api/master/paper/simulate_step', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ count: count })
+        });
+        if (!resp.ok) {
+          const err = await resp.json();
+          throw new Error(err.detail || '模擬失敗');
+        }
+        const data = await resp.json();
+        paperAccount = data.paper_account;
+        renderPaperAccount(paperAccount);
+        const lastT = data.last_trade;
+        const pnlMsg = lastT ? (lastT.pnl_u >= 0 ? `+${formatUSD(lastT.pnl_u)}` : formatUSD(lastT.pnl_u)) : '';
+        showToast(`已推演 ${data.executed_count} 輪！目前總權益: ${formatUSD(paperAccount.total_equity_u)} U (${pnlMsg})`, 'success');
+      } catch (e) {
+        showToast(e.message, 'error');
+      }
+    }
+
+    // Reset Paper Account
+    async function resetPaperAccount() {
+      if (!confirm('確定要將 10U 滾倉實戰測試艙重置回初始 $10.00 U 嗎？')) return;
+      try {
+        const resp = await fetch('/api/master/paper/reset', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ initial_u: 10.0, target_u: 1000.0 })
+        });
+        if (!resp.ok) throw new Error('重置失敗');
+        const data = await resp.json();
+        paperAccount = data.paper_account;
+        renderPaperAccount(paperAccount);
+        showToast('已成功重置回初始 $10.00 U！', 'info');
+      } catch (e) {
+        showToast(e.message, 'error');
+      }
+    }
+
+    // Load Master Report (2-Year Validation & 24 Months)
+    async function loadMasterReport() {
+      try {
+        const resp = await fetch('/api/master/report');
+        if (!resp.ok) return;
+        const rep = await resp.json();
+        masterReport = rep;
+        renderMasterStats(rep);
+      } catch (e) {
+        console.warn('loadMasterReport error:', e);
+      }
+    }
+
+    // Render Master Strategy Stats & 24 Months Table
+    function renderMasterStats(rep) {
+      if (!rep) return;
+      const overall = rep.overall_2year_stats || {};
+      const comp = rep.compounding_10u_to_1000u_summary || {};
+      const monthly = rep.monthly_24_breakdown || [];
+
+      // CLOB dual-stage win rates vs strict expiration
+      const clobWr = overall.step_2_cumulative_win_rate_pct || 91.47;
+      const clobS1 = overall.step_1_win_rate_pct || 73.30;
+      const strictS1 = overall.strict_expiration_only_1st_wr_pct || 54.51;
+      const strictS2 = overall.strict_expiration_only_2step_wr_pct || 78.55;
+      const strictS3 = overall.strict_expiration_only_3step_wr_pct || 89.34;
+
+      document.getElementById('ms-kpi-winrate').innerText = `${clobWr}%`;
+      document.getElementById('ms-kpi-s1-wr').innerText = `${clobS1}%`;
+      document.getElementById('ms-clob-wr').innerText = `${clobWr}%`;
+      document.getElementById('ms-strict-wr').innerText = `${strictS2}%`;
+      document.getElementById('ms-strict-wr3').innerText = `${strictS3}%`;
+
+      document.getElementById('ms-kpi-oos').innerText = `${overall.year1_in_sample_2step_wr_pct || 92.8}% vs ${overall.year2_out_of_sample_2step_wr_pct || 91.5}%`;
+      document.getElementById('ms-kpi-min-wr').innerText = `${overall.min_monthly_win_rate_pct || 82.8}%`;
+      document.getElementById('ms-kpi-median-u').innerText = `${formatUSD(comp.median_30d_ending_u || 3299.17)} U`;
+      document.getElementById('ms-kpi-worst-u').innerText = `${formatUSD(comp.worst_month_ending_u || 29.78)} U`;
+
+      // Render 24 Months Breakdown Table
+      const tbody = document.getElementById('ms-monthly-body');
+      if (!monthly.length) {
+        tbody.innerHTML = '<tr><td colspan="9" class="py-4 text-center text-slate-500 font-sans">無逐月報告數據</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = monthly.map(m => {
+        const reached = !!m.reached_1000u;
+        const reachedBadge = reached 
+          ? `<span class="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold text-[10px]">✅ ${m.days_to_1000u}天達標</span>` 
+          : `<span class="px-2 py-0.5 rounded bg-dark-800 text-slate-400 font-medium text-[10px]">未達標 ($${m.final_u})</span>`;
+
+        const wr = m.win_rate_pct || 0;
+        const wrColor = wr >= 93 ? 'text-emerald-400 font-black' : (wr >= 90 ? 'text-teal-300 font-bold' : 'text-slate-300');
+        const finalColor = m.final_u >= 1000 ? 'text-emerald-400 font-black' : 'text-cyan-300 font-bold';
+
+        return `
+          <tr class="hover:bg-dark-850/60 transition">
+            <td class="py-1.5 px-2.5 font-bold text-white">${m.period_label}</td>
+            <td class="py-1.5 px-2 text-slate-300">${m.total_sequences}</td>
+            <td class="py-1.5 px-2 text-emerald-400">${m.step1_wins}</td>
+            <td class="py-1.5 px-2 text-amber-300">${m.step2_wins}</td>
+            <td class="py-1.5 px-2 text-rose-400 font-bold">${m.busts}</td>
+            <td class="py-1.5 px-2 ${wrColor}">${wr.toFixed(1)}%</td>
+            <td class="py-1.5 px-2 ${finalColor}">${formatUSD(m.final_u)}</td>
+            <td class="py-1.5 px-2 text-amber-300 font-bold">${m.multiple_x}x</td>
+            <td class="py-1.5 px-2">${reachedBadge}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    // Render 3 Live Coin Cards with Polymarket CLOB Box
+    function renderLiveCards() {
+      const container = document.getElementById('live-cards-container');
+      const symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+      
+      const htmls = symbols.map(sym => {
+        const data = liveState[sym];
+        if (!data) {
+          return `
+            <div class="p-6 rounded-2xl bg-dark-900 border border-dark-800 text-slate-400 text-center">
+              等待 ${sym} 數據...
+            </div>
+          `;
+        }
+
+        const price = data.price || 0;
+        const bodyPct = data.body_pct || 0;
+        const secToClose = data.seconds_to_close !== undefined ? data.seconds_to_close : 300;
+        const progressPct = Math.min(100, Math.max(0, ((300 - secToClose) / 300) * 100));
+        const forming = data.forming_candle || {};
+        const activeSeq = data.active_sequence;
+        
+        const rsi2 = forming.rsi_2 !== undefined ? forming.rsi_2 : '--';
+        const rsi6 = forming.rsi_6 !== undefined ? forming.rsi_6 : '--';
+        const rsi14 = forming.rsi_14 !== undefined ? forming.rsi_14 : '--';
+        const streakDown = forming.streak_down || 0;
+        const streakUp = forming.streak_up || 0;
+        const streakRet = forming.streak_ret_pct || 0;
+        const bbB = forming.bb_pct_b !== undefined ? forming.bb_pct_b : '--';
+        const volRatio = forming.vol_ratio !== undefined ? forming.vol_ratio : '--';
+
+        // Polymarket CLOB Data
+        const pm = data.polymarket_clob || {};
+        const strikeOpen = pm.strike_open_price ? formatUSD(pm.strike_open_price) : '--';
+        const escapeTarget = pm.escape_target_price ? formatUSD(pm.escape_target_price) : '--';
+        const upCents = pm.up_share_cents !== undefined ? pm.up_share_cents : 50.0;
+        const downCents = pm.down_share_cents !== undefined ? pm.down_share_cents : 50.0;
+        const clobGuide = pm.clob_action_guide || '📌 開盤前掛單 50¢~51¢';
+        const bounceTriggered = !!pm.bounce_protect_triggered;
+        
+        // Taker buy ratio
+        const takerRatioRaw = forming.taker_buy_ratio !== undefined ? forming.taker_buy_ratio : 0.5;
+        const takerRatioPct = (takerRatioRaw * 100).toFixed(1);
+        let takerColor = 'text-slate-300';
+        let takerTag = '';
+        if (takerRatioRaw <= 0.46) {
+          takerColor = 'text-rose-400 font-bold';
+          takerTag = ' (拋售高潮)';
+        } else if (takerRatioRaw >= 0.54) {
+          takerColor = 'text-emerald-400 font-bold';
+          takerTag = ' (追買高潮)';
+        }
+
+        const isGreen = bodyPct >= 0;
+        const priceColor = isGreen ? 'text-emerald-400' : 'text-rose-400';
+        const pctBadge = isGreen 
+          ? `<span class="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 text-xs font-mono font-bold">+${bodyPct.toFixed(2)}%</span>`
+          : `<span class="px-2 py-0.5 rounded bg-rose-500/15 text-rose-400 border border-rose-500/30 text-xs font-mono font-bold">${bodyPct.toFixed(2)}%</span>`;
+
+        // Streak badge
+        let streakBadge = '';
+        if (streakDown >= 2) {
+          streakBadge = `<span class="px-2 py-0.5 rounded-lg bg-rose-500/20 text-rose-300 border border-rose-500/40 text-[11px] font-bold font-mono">連跌 ${streakDown} 根 (${streakRet.toFixed(2)}%)</span>`;
+        } else if (streakUp >= 2) {
+          streakBadge = `<span class="px-2 py-0.5 rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[11px] font-bold font-mono">連漲 ${streakUp} 根 (+${streakRet.toFixed(2)}%)</span>`;
+        } else {
+          streakBadge = `<span class="px-2 py-0.5 rounded-lg bg-dark-800 text-slate-400 border border-dark-700 text-[11px] font-mono">單根震盪</span>`;
+        }
+
+        // RSI highlight
+        const rsi2Highlight = (rsi2 !== '--' && (rsi2 <= 5 || rsi2 >= 95)) ? 'text-amber-400 font-black' : 'text-slate-200';
+        const rsi6Highlight = (rsi6 !== '--' && (rsi6 <= 20 || rsi6 >= 80)) ? 'text-cyan-400 font-black' : 'text-slate-200';
+
+        // Countdown urgency
+        const isUrgent = secToClose <= 25;
+        const timerColor = isUrgent ? 'text-rose-400 font-black animate-pulse' : 'text-slate-300 font-medium';
+        const barColor = isUrgent ? 'bg-gradient-to-r from-amber-500 to-rose-500' : 'bg-gradient-to-r from-emerald-500 to-teal-400';
+
+        // Martingale status
+        let seqStatusHTML = '';
+        if (activeSeq) {
+          seqStatusHTML = `
+            <div class="p-2.5 rounded-xl bg-rose-500/15 border border-rose-500/40 text-xs flex items-center justify-between animate-pulse">
+              <div class="flex items-center gap-1.5 font-bold text-rose-300">
+                <span>🚨</span> 第 ${activeSeq.step} / ${activeSeq.max_steps} 碼進行中
+              </div>
+              <div class="font-mono text-white text-[11px]">
+                注金: <strong class="text-amber-300 font-bold">$${activeSeq.stake_usd}</strong>
+              </div>
+            </div>
+          `;
+        } else {
+          seqStatusHTML = `
+            <div class="p-2.5 rounded-xl bg-dark-850/80 border border-dark-750 text-xs flex items-center justify-between">
+              <div class="flex items-center gap-1.5 text-slate-300">
+                <span class="w-2 h-2 rounded-full bg-emerald-400"></span> 序列待機中
+              </div>
+              <div class="text-[10px] text-slate-500">等待極限共振 + 衰竭條件</div>
+            </div>
+          `;
+        }
+
+        // Mini recent candles preview
+        const recentCandles = data.recent_candles || [];
+        const miniBars = recentCandles.slice(-12).map(c => {
+          const bg = c.is_green ? 'bg-emerald-500' : 'bg-rose-500';
+          return `<div class="h-4 w-1.5 rounded-sm ${bg} opacity-80" title="收盤: ${c.close}"></div>`;
+        }).join('');
+
+        return `
+          <div class="rounded-2xl bg-dark-900/90 border border-dark-800 p-5 space-y-3.5 shadow-xl hover:border-dark-700 transition relative overflow-hidden group">
+            
+            <!-- Card Header -->
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-2">
+                <span class="text-base font-black text-white tracking-wider font-mono">${sym.replace('USDT', '')}</span>
+                <span class="text-[10px] px-1.5 py-0.5 rounded bg-dark-800 text-slate-400 font-mono">USDT</span>
+              </div>
+              <div class="flex items-center gap-2">
+                ${pctBadge}
+                <button onclick="selectSymbolForBacktest('${sym}')" class="text-[11px] text-cyan-400 hover:text-cyan-300 hover:underline">
+                  帶入回測 &rarr;
+                </button>
+              </div>
+            </div>
+
+            <!-- Price & Streak -->
+            <div class="flex items-baseline justify-between">
+              <div class="text-2xl lg:text-3xl font-black font-mono tracking-tight ${priceColor}">
+                ${formatUSD(price)}
+              </div>
+              <div>
+                ${streakBadge}
+              </div>
+            </div>
+
+            <!-- 5m Countdown & Progress bar -->
+            <div class="space-y-1.5">
+              <div class="flex items-center justify-between text-[11px]">
+                <span class="text-slate-400">5m 收線倒數:</span>
+                <span class="font-mono ${timerColor}">${secToClose} 秒後收盤</span>
+              </div>
+              <div class="w-full bg-dark-800 h-1.5 rounded-full overflow-hidden">
+                <div class="h-full ${barColor} transition-all duration-1000" style="width: ${progressPct}%"></div>
+              </div>
+            </div>
+
+            <!-- Indicators Grid (RSI / BB / Vol) -->
+            <div class="grid grid-cols-4 gap-2 pt-1 border-t border-dark-800 text-center font-mono">
+              <div class="p-2 rounded-xl bg-dark-850/60 border border-dark-800">
+                <div class="text-[9px] text-slate-400 font-sans">RSI (2)</div>
+                <div class="text-xs ${rsi2Highlight} mt-0.5">${rsi2}</div>
+              </div>
+              <div class="p-2 rounded-xl bg-dark-850/60 border border-dark-800">
+                <div class="text-[9px] text-slate-400 font-sans">RSI (6)</div>
+                <div class="text-xs ${rsi6Highlight} mt-0.5">${rsi6}</div>
+              </div>
+              <div class="p-2 rounded-xl bg-dark-850/60 border border-dark-800">
+                <div class="text-[9px] text-slate-400 font-sans">布林 %B</div>
+                <div class="text-xs text-slate-300 mt-0.5">${bbB}</div>
+              </div>
+              <div class="p-2 rounded-xl bg-dark-850/60 border border-dark-800">
+                <div class="text-[9px] text-slate-400 font-sans">成交量</div>
+                <div class="text-xs text-slate-300 mt-0.5">${volRatio}x</div>
+              </div>
+            </div>
+
+            <!-- Dedicated Polymarket 5m CLOB Real-time Box -->
+            <div class="p-3 rounded-xl bg-dark-850/90 border border-cyan-500/30 space-y-2">
+              <div class="flex items-center justify-between text-[11px]">
+                <span class="font-bold text-cyan-300 flex items-center gap-1.5">
+                  <span>🎯</span> Polymarket 5m CLOB 即時盤口與指引
+                </span>
+                <a href="https://polymarket.com/crypto" target="_blank" class="text-[10px] px-2 py-0.5 rounded bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 font-sans transition">
+                  開啟盤口 &rarr;
+                </a>
+              </div>
+
+              <!-- Strike and Escape Target -->
+              <div class="grid grid-cols-2 gap-1.5 text-[10px] font-mono">
+                <div class="p-1.5 rounded-lg bg-dark-900 border border-dark-800">
+                  <div class="text-[9px] text-slate-400 font-sans">5m 開盤基準價 (Strike)</div>
+                  <div class="text-xs text-white font-bold mt-0.5">${strikeOpen}</div>
+                </div>
+                <div class="p-1.5 rounded-lg bg-dark-900 border border-dark-800">
+                  <div class="text-[9px] text-slate-400 font-sans">+0.10% 護利目標價</div>
+                  <div class="text-xs text-amber-300 font-bold mt-0.5">${escapeTarget}</div>
+                </div>
+              </div>
+
+              <!-- Live Share Pricing Badges & Taker buy ratio -->
+              <div class="flex items-center justify-between gap-1 text-[11px] font-mono">
+                <span class="px-2 py-0.5 rounded-md bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 font-bold">
+                  🟢 UP: ${upCents}¢
+                </span>
+                <span class="px-2 py-0.5 rounded-md bg-rose-500/15 border border-rose-500/30 text-rose-400 font-bold">
+                  🔴 DOWN: ${downCents}¢
+                </span>
+                <span class="text-[10px] px-1.5 py-0.5 rounded bg-dark-900 ${takerColor} border border-dark-800" title="Taker 主動買盤佔比">
+                  買盤: ${takerRatioPct}%${takerTag}
+                </span>
+              </div>
+
+              <!-- Action Guide -->
+              <div class="p-2 rounded-lg bg-dark-900/95 border border-dark-800 text-[10px] text-slate-300 leading-snug">
+                ${clobGuide}
+              </div>
+            </div>
+
+            <!-- Active Sequence Box -->
+            ${seqStatusHTML}
+
+            <!-- Mini 12-candle momentum strip -->
+            <div class="flex items-center justify-between pt-1 text-[10px] text-slate-500">
+              <span>近 12 根 K 線動能:</span>
+              <div class="flex items-center gap-1">
+                ${miniBars}
+              </div>
+            </div>
+
+          </div>
+        `;
+      });
+
+      container.innerHTML = htmls.join('');
+    }
+
+    // Select symbol from card and scroll to backtest
+    function selectSymbolForBacktest(sym) {
+      document.getElementById('param-symbol').value = sym;
+      runBacktest(false);
+      showToast(`已載入 ${sym} 策略參數並重新計算回測！`, 'info');
+    }
+
+    // Switch empirical streak table tab
+    function switchStreakTab(tab) {
+      currentStreakTab = tab;
+      const tabDown = document.getElementById('tab-streak-down');
+      const tabUp = document.getElementById('tab-streak-up');
+
+      if (tab === 'down') {
+        tabDown.className = 'px-2.5 py-1 rounded-md bg-rose-500/20 text-rose-300 font-semibold transition';
+        tabUp.className = 'px-2.5 py-1 rounded-md text-slate-400 hover:text-white transition';
+      } else {
+        tabUp.className = 'px-2.5 py-1 rounded-md bg-emerald-500/20 text-emerald-300 font-semibold transition';
+        tabDown.className = 'px-2.5 py-1 rounded-md text-slate-400 hover:text-white transition';
+      }
+
+      if (cachedBacktestResult && cachedBacktestResult.raw_streak_distribution) {
+        renderRawStreakTable(cachedBacktestResult.raw_streak_distribution);
+      }
+    }
+
+    // Render Raw Streak Distribution Table
+    function renderRawStreakTable(dist) {
+      const tbody = document.getElementById('raw-streak-body');
+      if (!dist) {
+        tbody.innerHTML = '<tr><td colspan="6" class="py-4 text-center text-slate-500 font-sans">暫無分佈數據</td></tr>';
+        return;
+      }
+
+      const rows = currentStreakTab === 'down' ? (dist.down_streak_table || []) : (dist.up_streak_table || []);
+      if (!rows.length) {
+        tbody.innerHTML = '<tr><td colspan="6" class="py-4 text-center text-slate-500 font-sans">無足夠數據</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = rows.map(r => {
+        const bounce1 = currentStreakTab === 'down' ? r.next_1_bounce_pct : r.next_1_pullback_pct;
+        const wr3 = r.martingale_3_win_pct || 0;
+        const wr3Color = wr3 >= 90 ? 'text-emerald-400 font-bold' : (wr3 >= 80 ? 'text-teal-300' : 'text-slate-300');
+        const wr4 = r.martingale_4_win_pct || 0;
+        const wr4Color = wr4 >= 98 ? 'text-emerald-400 font-black' : 'text-slate-300';
+
+        return `
+          <tr class="hover:bg-dark-850/60 transition">
+            <td class="py-2 px-2.5 font-bold ${currentStreakTab === 'down' ? 'text-rose-400' : 'text-emerald-400'}">連${currentStreakTab === 'down' ? '跌' : '漲'} ${r.streak} 根</td>
+            <td class="py-2 px-2.5 text-slate-300">${formatNumber(r.occurrences)} 次</td>
+            <td class="py-2 px-2.5 text-slate-200">${bounce1}%</td>
+            <td class="py-2 px-2.5 text-slate-200">${r.martingale_2_win_pct}%</td>
+            <td class="py-2 px-2.5 ${wr3Color}">${wr3}%</td>
+            <td class="py-2 px-2.5 ${wr4Color}">${wr4}%</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    // Render Martingale Step Breakdown Table
+    function renderMartingaleBreakdown(steps, curve) {
+      const tbody = document.getElementById('martingale-breakdown-body');
+      if (!steps || !steps.length) {
+        tbody.innerHTML = '<tr><td colspan="7" class="py-4 text-center text-slate-500 font-sans">無資料</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = steps.map((s, idx) => {
+        const c = curve && curve[idx] ? curve[idx] : {};
+        const cumWR = s.cumulative_win_rate_pct || 0;
+        const wrColor = cumWR >= 90 ? 'text-emerald-400 font-black' : (cumWR >= 80 ? 'text-teal-300 font-bold' : 'text-slate-200');
+        const bustCount = c.bust_count_in_2y !== undefined ? c.bust_count_in_2y : '--';
+        const bustColor = bustCount === 0 ? 'text-emerald-400 font-bold' : (bustCount <= 10 ? 'text-amber-400' : 'text-rose-400');
+        const reqBankroll = c.required_table_bankroll_usd !== undefined ? formatUSD(c.required_table_bankroll_usd) : '--';
+
+        return `
+          <tr class="hover:bg-dark-850/60 transition">
+            <td class="py-2 px-2.5 font-bold text-white">第 ${s.step} 碼</td>
+            <td class="py-2 px-2.5 text-amber-300">${formatUSD(s.stake_usd)}</td>
+            <td class="py-2 px-2.5 text-slate-300">${reqBankroll}</td>
+            <td class="py-2 px-2.5 text-slate-200">${formatNumber(s.wins)} 次</td>
+            <td class="py-2 px-2.5 text-slate-400">${s.share_of_total_pct}%</td>
+            <td class="py-2 px-2.5 ${wrColor}">
+              <div class="flex items-center gap-2">
+                <span>${cumWR.toFixed(2)}%</span>
+                <div class="w-16 bg-dark-800 h-1 rounded-full overflow-hidden hidden sm:block">
+                  <div class="bg-emerald-500 h-full" style="width: ${Math.min(100, cumWR)}%"></div>
+                </div>
+              </div>
+            </td>
+            <td class="py-2 px-2.5 ${bustColor}">${bustCount} 次</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    // Render Recent Trades Table
+    function renderRecentTrades(trades) {
+      const tbody = document.getElementById('recent-trades-body');
+      const badge = document.getElementById('trades-count-badge');
+      if (!trades || !trades.length) {
+        tbody.innerHTML = '<tr><td colspan="7" class="py-4 text-center text-slate-500 font-sans">無交易紀錄</td></tr>';
+        badge.innerText = '0 筆';
+        return;
+      }
+
+      badge.innerText = `${trades.length} 筆`;
+      tbody.innerHTML = trades.map(t => {
+        const isLong = t.direction === 'LONG_BOUNCE';
+        const dirBadge = isLong 
+          ? `<span class="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-[10px]">反彈多</span>`
+          : `<span class="px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/30 text-[10px]">回調空</span>`;
+        
+        const resBadge = t.won 
+          ? `<span class="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold text-[10px]">✅ 第 ${t.won_at_step} 碼勝出</span>`
+          : `<span class="px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-400 font-bold text-[10px]">❌ 爆倉 (${t.actual_steps_to_reverse}碼)</span>`;
+
+        const pnlColor = t.pnl_usd >= 0 ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold';
+
+        return `
+          <tr class="hover:bg-dark-850/60 transition">
+            <td class="py-2 px-2 text-slate-500">#${t.seq}</td>
+            <td class="py-2 px-2 text-slate-300">${formatTimeUTC(t.signal_ts).substring(5, 16)}</td>
+            <td class="py-2 px-2">${dirBadge}</td>
+            <td class="py-2 px-2 text-slate-200">$${t.signal_price}</td>
+            <td class="py-2 px-2 text-slate-400">RSI:${t.rsi} | ${t.streak}根</td>
+            <td class="py-2 px-2">${resBadge}</td>
+            <td class="py-2 px-2 text-right ${pnlColor}">${t.pnl_usd >= 0 ? '+' : ''}${formatUSD(t.pnl_usd)}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    // Render Equity Chart
+    function renderEquityChart(curve) {
+      const ctx = document.getElementById('equity-chart').getContext('2d');
+      if (equityChartInstance) {
+        equityChartInstance.destroy();
+      }
+
+      if (!curve || !curve.length) {
+        return;
+      }
+
+      const labels = curve.map(pt => formatTimeUTC(pt.ts).substring(0, 10));
+      const dataPoints = curve.map(pt => pt.equity);
+
+      const gradient = ctx.createLinearGradient(0, 0, 0, 220);
+      gradient.addColorStop(0, 'rgba(6, 182, 212, 0.35)');
+      gradient.addColorStop(1, 'rgba(6, 182, 212, 0.0)');
+
+      equityChartInstance = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: labels,
+          datasets: [{
+            label: '累計淨利潤 ($)',
+            data: dataPoints,
+            borderColor: '#06b6d4',
+            backgroundColor: gradient,
+            borderWidth: 2,
+            pointRadius: 0,
+            pointHoverRadius: 4,
+            fill: true,
+            tension: 0.15
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { display: false },
+            tooltip: {
+              mode: 'index',
+              intersect: false,
+              callbacks: {
+                label: function(context) {
+                  return ` 淨利潤: $${context.parsed.y.toLocaleString('en-US', { minimumFractionDigits: 2 })}`;
+                }
+              }
+            }
+          },
+          scales: {
+            x: {
+              grid: { color: '#1a233e' },
+              ticks: { color: '#64748b', maxTicksLimit: 8, font: { size: 10 } }
+            },
+            y: {
+              grid: { color: '#1a233e' },
+              ticks: { 
+                color: '#64748b', 
+                font: { size: 10 },
+                callback: function(val) { return '$' + val; }
+              }
+            }
+          }
+        }
+      });
+    }
+
+    // Render Notifications Signal Feed
+    function renderSignalFeed(notifications) {
+      const container = document.getElementById('notifications-feed-container');
+      const badge = document.getElementById('signals-count-badge');
+      
+      if (!notifications || !notifications.length) {
+        container.innerHTML = '<div class="p-6 text-center text-slate-500 text-xs">目前尚無即時訊號紀錄，系統持續秒級掃描中...</div>';
+        badge.innerText = '0 筆';
+        return;
+      }
+
+      badge.innerText = `${notifications.length} 筆`;
+      container.innerHTML = notifications.map(item => {
+        const event = item.event || item || {};
+        const type = event.event_type || 'SIGNAL_ENTRY';
+        const isWin = type === 'SEQUENCE_WIN';
+        const isBust = type === 'SEQUENCE_BUST';
+        const isPreview = type === 'PRE_CLOSE_PREVIEW';
+        const isBounce = type === 'BOUNCE_PROTECT';
+        
+        let borderClass = 'border-dark-750 bg-dark-850';
+        let icon = '⚡';
+        let title = '訊號觸發 (進場)';
+
+        if (isWin) {
+          borderClass = 'border-emerald-500/40 bg-emerald-500/10';
+          icon = '🎉';
+          title = '序列止盈收復';
+        } else if (isBust) {
+          borderClass = 'border-rose-500/40 bg-rose-500/10';
+          icon = '❌';
+          title = '序列斷尾停損';
+        } else if (isBounce) {
+          borderClass = 'border-cyan-500/40 bg-cyan-500/10';
+          icon = '🛡️';
+          title = '72¢ 盤中反彈護利';
+        } else if (isPreview) {
+          borderClass = 'border-amber-500/40 bg-amber-500/10';
+          icon = '⏳';
+          title = '收線前預警 (Preview)';
+        }
+
+        const isLong = event.direction === 'LONG_BOUNCE';
+        const dirBadge = isLong 
+          ? `<span class="px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 font-bold text-[10px]">做多反彈 (UP)</span>`
+          : `<span class="px-1.5 py-0.2 rounded bg-rose-500/20 text-rose-300 font-bold text-[10px]">做空回調 (DOWN)</span>`;
+
+        const tsVal = item.timestamp_ms || event.timestamp_ms;
+        const priceVal = event.price !== undefined ? event.price : '--';
+        const rsiVal = event.rsi !== undefined ? event.rsi : '--';
+        const stepVal = event.step !== undefined ? event.step : 1;
+        const maxStepsVal = event.max_steps !== undefined ? event.max_steps : 2;
+        const stakeVal = event.stake_usd !== undefined ? event.stake_usd : '--';
+        const wrVal = event.expected_win_rate_pct !== undefined ? event.expected_win_rate_pct : 91.5;
+
+        return `
+          <div class="p-3 rounded-xl border ${borderClass} space-y-1.5 transition">
+            <div class="flex items-center justify-between text-xs">
+              <div class="flex items-center gap-1.5 font-bold text-white">
+                <span>${icon}</span>
+                <span>${event.symbol || 'BTCUSDT'}</span>
+                <span class="text-slate-400 font-normal">|</span>
+                <span>${title}</span>
+                ${dirBadge}
+              </div>
+              <span class="text-[10px] text-slate-400 font-mono">${formatTimeUTC(tsVal).substring(11, 19)} UTC</span>
+            </div>
+
+            <div class="text-xs text-slate-300 leading-relaxed">
+              ${(event.message || '訊號條件達成').replace(/\n/g, '<br>')}
+            </div>
+
+            <div class="flex flex-wrap items-center gap-3 text-[10px] text-slate-400 font-mono pt-0.5">
+              <span>進場價: <strong class="text-white">$${priceVal}</strong></span>
+              <span>RSI: <strong class="text-cyan-300">${rsiVal}</strong></span>
+              <span>第 <strong class="text-amber-300">${stepVal}</strong> / ${maxStepsVal} 碼</span>
+              <span>注金: <strong class="text-emerald-400">$${stakeVal}</strong></span>
+              <span>預期勝率: <strong class="text-emerald-400">${wrVal}%</strong></span>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    // Run 2-Year Backtest
+    async function runBacktest(applyToLive = false) {
+      try {
+        const payload = {
+          symbol: document.getElementById('param-symbol').value,
+          rsi_period: parseInt(document.getElementById('param-rsi-period').value, 10),
+          oversold_rsi: parseFloat(document.getElementById('param-oversold-rsi').value),
+          overbought_rsi: parseFloat(document.getElementById('param-overbought-rsi').value),
+          min_streak: parseInt(document.getElementById('param-min-streak').value, 10),
+          min_streak_ret_pct: parseFloat(document.getElementById('param-min-streak-ret').value),
+          use_bb_filter: document.getElementById('param-use-bb').value === 'true',
+          min_vol_ratio: parseFloat(document.getElementById('param-min-vol').value),
+          min_wick_ratio: parseFloat(document.getElementById('param-min-wick').value),
+          direction: document.getElementById('param-direction').value,
+          win_mode: document.getElementById('param-win-mode').value,
+          target_bounce_pct: parseFloat(document.getElementById('param-target-bounce-pct').value),
+          max_martingale_steps: parseInt(document.getElementById('param-max-steps').value, 10),
+          martingale_multiplier: parseFloat(document.getElementById('param-martingale-mult').value),
+          payout_ratio: parseFloat(document.getElementById('param-payout-ratio').value),
+          base_stake: parseFloat(document.getElementById('param-base-stake').value),
+          apply_to_live: applyToLive
+        };
+
+        const resp = await fetch('/api/backtest', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        if (!resp.ok) {
+          const err = await resp.json();
+          throw new Error(err.detail || '回測計算失敗');
+        }
+
+        const res = await resp.json();
+        cachedBacktestResult = res;
+
+        // Update KPIs
+        const s = res.summary || {};
+        const winRate = s.sequence_win_rate_pct || 0;
+        const winEl = document.getElementById('kpi-win-rate');
+        winEl.innerText = `${winRate.toFixed(2)}%`;
+        if (winRate >= 85) {
+          winEl.className = 'text-2xl font-black font-mono text-emerald-400';
+          document.getElementById('kpi-win-tag').innerText = '超高勝率';
+        } else if (winRate >= 70) {
+          winEl.className = 'text-2xl font-black font-mono text-cyan-400';
+          document.getElementById('kpi-win-tag').innerText = '良好';
+        } else {
+          winEl.className = 'text-2xl font-black font-mono text-amber-400';
+          document.getElementById('kpi-win-tag').innerText = '低於標準';
+        }
+
+        document.getElementById('kpi-first-shot-wr').innerText = `${(s.first_shot_win_rate_pct || 0).toFixed(2)}%`;
+        document.getElementById('kpi-net-profit').innerText = formatUSD(s.net_profit_usd);
+        document.getElementById('kpi-pf').innerText = s.profit_factor || '--';
+        document.getElementById('kpi-sequences').innerText = `${s.total_sequences} / ${s.won_sequences} / ${s.bust_sequences}`;
+        document.getElementById('kpi-won-cnt').innerText = s.won_sequences;
+        document.getElementById('kpi-bust-cnt').innerText = s.bust_sequences;
+        document.getElementById('kpi-bankroll').innerText = formatUSD(s.required_table_bankroll_usd);
+        document.getElementById('kpi-max-steps').innerText = `${s.max_steps_needed_in_2y} 碼`;
+        document.getElementById('kpi-drawdown').innerText = formatUSD(s.max_drawdown_usd);
+
+        // Breakdown & Equity curve & tables
+        renderMartingaleBreakdown(res.step_breakdown, res.martingale_curve_1_to_6);
+        renderEquityChart(res.equity_curve);
+        renderRecentTrades(res.recent_trades);
+        renderRawStreakTable(res.raw_streak_distribution);
+
+        if (applyToLive) {
+          showToast(`已成功套用至 ${payload.symbol} 即時掃描通知引擎！預期勝率 ${winRate}%`, 'success');
+        } else {
+          showToast(`2 年 (210,240 根) 回測計算完成！勝率: ${winRate}%`, 'success');
+        }
+
+      } catch (e) {
+        console.error('runBacktest error:', e);
+        showToast(e.message, 'error');
+      }
+    }
+
+    // Apply Presets
+    function applyPreset(presetType) {
+      if (presetType === 'golden_3step') {
+        document.getElementById('param-rsi-period').value = '6';
+        document.getElementById('param-oversold-rsi').value = '15.0';
+        document.getElementById('param-overbought-rsi').value = '85.0';
+        document.getElementById('param-min-streak').value = '4';
+        document.getElementById('param-min-streak-ret').value = '0.30';
+        document.getElementById('param-use-bb').value = 'false';
+        document.getElementById('param-win-mode').value = 'candle_color';
+        document.getElementById('param-max-steps').value = '3';
+        document.getElementById('param-martingale-mult').value = '2.1';
+        document.getElementById('param-base-stake').value = '10.0';
+        showToast('已載入「🔥 黃金 3 碼馬丁高勝率 (>90%~96%)」預設！', 'info');
+      } else if (presetType === 'ironclad_4step') {
+        document.getElementById('param-rsi-period').value = '2';
+        document.getElementById('param-oversold-rsi').value = '3.0';
+        document.getElementById('param-overbought-rsi').value = '97.0';
+        document.getElementById('param-min-streak').value = '5';
+        document.getElementById('param-min-streak-ret').value = '0.40';
+        document.getElementById('param-use-bb').value = 'true';
+        document.getElementById('param-win-mode').value = 'candle_color';
+        document.getElementById('param-max-steps').value = '4';
+        document.getElementById('param-martingale-mult').value = '2.1';
+        document.getElementById('param-base-stake').value = '10.0';
+        showToast('已載入「🛡️ 兩年零爆倉鐵壁 4 碼策略 (100% 勝率)」預設！', 'info');
+      } else if (presetType === 'target_bounce') {
+        document.getElementById('param-rsi-period').value = '6';
+        document.getElementById('param-oversold-rsi').value = '12.0';
+        document.getElementById('param-overbought-rsi').value = '88.0';
+        document.getElementById('param-min-streak').value = '4';
+        document.getElementById('param-min-streak-ret').value = '0.30';
+        document.getElementById('param-use-bb').value = 'true';
+        document.getElementById('param-win-mode').value = 'target_bounce';
+        document.getElementById('param-target-bounce-pct').value = '0.15';
+        document.getElementById('param-max-steps').value = '2';
+        document.getElementById('param-martingale-mult').value = '2.1';
+        document.getElementById('param-base-stake').value = '10.0';
+        showToast('已載入「🎯 單發反彈達標策略 (Target Bounce)」預設！', 'info');
+      }
+
+      runBacktest(false);
+    }
+
+    // Sync Notify Config UI
+    let configSynced = false;
+    function syncNotifyConfigUI() {
+      if (configSynced || !notifyConfig) return;
+      document.getElementById('cfg-macos-desktop').checked = !!notifyConfig.macos_desktop;
+      document.getElementById('cfg-macos-sound').checked = !!notifyConfig.macos_sound;
+      document.getElementById('cfg-pre-close-sec').value = notifyConfig.pre_close_warning_sec || 20;
+      document.getElementById('val-pre-close-sec').innerText = (notifyConfig.pre_close_warning_sec || 20) + ' 秒';
+      document.getElementById('header-pre-warning').innerText = (notifyConfig.pre_close_warning_sec || 20) + ' 秒';
+
+      document.getElementById('cfg-tg-enabled').checked = !!notifyConfig.telegram_enabled;
+      document.getElementById('cfg-tg-token').value = notifyConfig.telegram_bot_token || '';
+      document.getElementById('cfg-tg-chat-id').value = notifyConfig.telegram_chat_id || '';
+      const elTgOrders = document.getElementById('cfg-tg-notify-orders');
+      if (elTgOrders) elTgOrders.checked = !!notifyConfig.telegram_notify_orders;
+
+      document.getElementById('cfg-discord-enabled').checked = !!notifyConfig.discord_enabled;
+      document.getElementById('cfg-discord-webhook').value = notifyConfig.discord_webhook_url || '';
+
+      document.getElementById('cfg-custom-enabled').checked = !!notifyConfig.custom_webhook_enabled;
+      document.getElementById('cfg-custom-webhook').value = notifyConfig.custom_webhook_url || '';
+
+      configSynced = true;
+    }
+
+    // Save Notify Config
+    async function saveNotifyConfig() {
+      try {
+        const payload = {
+          macos_desktop: document.getElementById('cfg-macos-desktop').checked,
+          macos_sound: document.getElementById('cfg-macos-sound').checked,
+          pre_close_warning_sec: parseInt(document.getElementById('cfg-pre-close-sec').value, 10),
+          telegram_enabled: document.getElementById('cfg-tg-enabled').checked,
+          telegram_bot_token: document.getElementById('cfg-tg-token').value.trim(),
+          telegram_chat_id: document.getElementById('cfg-tg-chat-id').value.trim(),
+          telegram_notify_orders: document.getElementById('cfg-tg-notify-orders') ? document.getElementById('cfg-tg-notify-orders').checked : false,
+          discord_enabled: document.getElementById('cfg-discord-enabled').checked,
+          discord_webhook_url: document.getElementById('cfg-discord-webhook').value.trim(),
+          custom_webhook_enabled: document.getElementById('cfg-custom-enabled').checked,
+          custom_webhook_url: document.getElementById('cfg-custom-webhook').value.trim(),
+        };
+
+        const resp = await fetch('/api/notify_config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        if (!resp.ok) throw new Error('儲存通知設定失敗');
+        const res = await resp.json();
+        notifyConfig = res.config;
+        document.getElementById('header-pre-warning').innerText = notifyConfig.pre_close_warning_sec + ' 秒';
+        showToast('通知設定已成功儲存並同步至伺服器！', 'success');
+      } catch (e) {
+        showToast(e.message, 'error');
+      }
+    }
+
+    // Trigger Test Notification
+    async function triggerTestNotification() {
+      try {
+        const sym = document.getElementById('param-symbol') ? document.getElementById('param-symbol').value : 'ETHUSDT';
+        const resp = await fetch('/api/test_notify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ symbol: sym })
+        });
+        if (!resp.ok) throw new Error('測試通知發送失敗');
+        const res = await resp.json();
+        showToast(`已發送 ${sym} 測試訊號！請檢查 macOS 桌面或音效/通訊頻道`, 'success');
+        fetchStatus();
+      } catch (e) {
+        showToast(e.message, 'error');
+      }
+    }
+
+    // Load presets from server on mount
+    async function loadPresets() {
+      try {
+        const resp = await fetch('/api/presets');
+        if (resp.ok) {
+          optimalPresets = await resp.json();
+        }
+      } catch (e) {
+        console.warn('Could not load presets:', e);
+      }
+    }
+
+    let clobFormSynced = false;
+
+    function renderClobPanel(data) {
+      if (!data) return;
+      const geo = data.clob_geoblock || {};
+      const vg = data.vpn_guardian || {};
+      const cfg = data.clob_config || {};
+      const orders = data.clob_orders || [];
+      const markets = data.live_5m_markets || {};
+
+      // 1. Update Geoblock card with live HA Gateway telemetry
+      const pill = document.getElementById('geo-status-pill');
+      const box = document.getElementById('geo-card-box');
+      const ipCountry = document.getElementById('geo-ip-country');
+      const apiAllowed = document.getElementById('geo-api-allowed');
+      const advice = document.getElementById('geo-advice-text');
+
+      if (geo.ip || vg.primary_ip) {
+        const activeIp = vg.primary_ip || geo.ip || '--';
+        const activeCountry = vg.primary_country || geo.country || 'HK';
+        const activeMs = vg.primary_latency_ms !== undefined ? `${vg.primary_latency_ms}ms` : '';
+        const tunnels = vg.total_tunnels_opened !== undefined ? vg.total_tunnels_opened : 0;
+        const failovers = vg.failover_count !== undefined ? vg.failover_count : 0;
+        const isWebUnlocked = (!geo.blocked) || !!vg.web_deposit_unlocked;
+        const isApiUnlocked = isWebUnlocked || !!geo.can_trade_api || !!vg.clob_api_unlocked;
+
+        ipCountry.innerText = `${activeIp} (${activeCountry} ${activeMs}) | HA網關 127.0.0.1:10809`;
+        const extraStats = vg.gateway_running
+          ? ` [已建立隧道: ${tunnels} | 自動故障切換: ${failovers} 次]`
+          : '';
+        if (isWebUnlocked) {
+          pill.className = 'text-[11px] px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-mono font-bold';
+          pill.innerText = `✅ 已解鎖 (${activeCountry} ${activeMs})`;
+          box.className = 'p-3.5 rounded-xl bg-dark-850 border border-emerald-500/40 space-y-2';
+          apiAllowed.className = 'font-mono font-bold text-emerald-400';
+          apiAllowed.innerText = '✅ 網頁與 CLOB V2 API 皆完全開放 (HA 多節點熱備援 + 持久熱連線)';
+          advice.innerText = (geo.advice || `✅ 本地高可用 VPN 網關 (127.0.0.1:10809) 穩定運行中！主節點：${activeIp} (${activeCountry} | ${activeMs})，網頁充值與 CLOB 下單 100% 解鎖！`) + extraStats;
+        } else if (isApiUnlocked) {
+          pill.className = 'text-[11px] px-2.5 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-mono font-bold';
+          pill.innerText = `🟢 API 可交易 (${activeCountry} ${activeMs})`;
+          box.className = 'p-3.5 rounded-xl bg-dark-850 border border-cyan-500/40 space-y-2';
+          apiAllowed.className = 'font-mono font-bold text-cyan-300';
+          apiAllowed.innerText = '🟢 CLOB V2 API 自動下單完全開放 (僅網頁前端限制)';
+          advice.innerText = (geo.advice || `🟢 CLOB V2 自動下單通道正常運行中 (${activeIp} / ${activeCountry})！`) + extraStats;
+        } else {
+          pill.className = 'text-[11px] px-2.5 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 font-mono font-bold animate-pulse';
+          pill.innerText = `🔄 節點自癒補充中 (${activeCountry})`;
+          box.className = 'p-3.5 rounded-xl bg-dark-850 border border-amber-500/30 space-y-2';
+          apiAllowed.className = 'font-mono font-bold text-amber-400';
+          apiAllowed.innerText = '🔄 背景正自動掃描並切換低延遲白名單節點 (或點擊下方開啟 ProtonVPN/TunnelBear)';
+          advice.innerText = (geo.advice || '⚠️ 正在背景自動切換備援節點...') + extraStats;
+        }
+      }
+
+      // 2. Mode badge & form initial sync
+      const modeBadge = document.getElementById('clob-mode-badge');
+      if (modeBadge) {
+        if (cfg.enabled && !cfg.dry_run) {
+          modeBadge.className = 'text-[11px] px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-bold animate-pulse';
+          modeBadge.innerText = '🔥 正式實盤全自動下單中 (LIVE CLOB V2)';
+        } else if (cfg.enabled && cfg.dry_run) {
+          modeBadge.className = 'text-[11px] px-2.5 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-bold animate-pulse';
+          modeBadge.innerText = '🧪 模擬金實測驗證中 (DRY RUN • 零真金風險)';
+        } else {
+          modeBadge.className = 'text-[11px] px-2.5 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 font-bold';
+          modeBadge.innerText = '⏸️ 策略待機中 (未啟動)';
+        }
+      }
+
+      if (!clobFormSynced && cfg) {
+        const enCb = document.getElementById('clob-enabled');
+        if (enCb) enCb.checked = !!cfg.enabled;
+        const dryCb = document.getElementById('clob-dry-run');
+        if (dryCb) dryCb.checked = cfg.dry_run !== false;
+        if (cfg.private_key) document.getElementById('clob-private-key').value = cfg.private_key;
+        if (cfg.funder_address) document.getElementById('clob-funder-address').value = cfg.funder_address;
+        if (cfg.signature_type !== undefined) document.getElementById('clob-sig-type').value = String(cfg.signature_type);
+        if (cfg.proxy_url) document.getElementById('clob-proxy-url').value = cfg.proxy_url;
+        if (cfg.entry_limit_price) document.getElementById('clob-entry-price').value = cfg.entry_limit_price;
+        if (cfg.bounce_protect_limit_price) document.getElementById('clob-bounce-price').value = cfg.bounce_protect_limit_price;
+        clobFormSynced = true;
+      }
+
+      document.getElementById('clob-signer-addr').innerText = cfg.signer_address
+        ? (cfg.signer_address.slice(0, 8) + '...' + cfg.signer_address.slice(-6))
+        : '尚未綁定';
+      const credsEl = document.getElementById('clob-creds-status');
+      if (cfg.has_api_creds) {
+        credsEl.className = 'text-emerald-400 font-bold';
+        credsEl.innerText = `✅ 已就緒 (${(cfg.api_key || '').slice(0, 8)}...)`;
+      } else {
+        credsEl.className = 'text-amber-400';
+        credsEl.innerText = '待貼上私鑰推導';
+      }
+
+      // 3. Live 5m market slugs
+      const slugList = Object.values(markets).map(m => `${m.symbol.replace('USDT','')}: ${m.slug}`).join(' | ');
+      if (slugList) {
+        document.getElementById('clob-live-slugs').innerText = slugList;
+      }
+
+      // 4. CLOB Orders table
+      const tbody = document.getElementById('clob-orders-tbody');
+      if (!orders.length) return;
+      tbody.innerHTML = orders.slice(0, 15).map(o => {
+        const tStr = new Date(o.timestamp_ms).toLocaleTimeString();
+        const isUp = o.direction === 'LONG_BOUNCE' || (o.outcome || '').includes('UP');
+        const sideColor = isUp ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold';
+        const statusColor = (o.status || '').includes('ERROR')
+          ? 'text-rose-400'
+          : ((o.status || '').includes('MATCHED') ? 'text-emerald-400 font-bold' : ((o.status || '').includes('LIVE') ? 'text-cyan-300 font-bold' : 'text-slate-400'));
+        return `
+          <tr class="hover:bg-dark-850/60 transition">
+            <td class="py-1 px-2 text-slate-400">${tStr}</td>
+            <td class="py-1 px-2 text-white"><a href="${o.event_url || 'https://polymarket.com/crypto'}" target="_blank" class="underline hover:text-cyan-300">${o.slug || o.symbol}</a></td>
+            <td class="py-1 px-2 ${sideColor}">${o.action}: ${o.outcome}</td>
+            <td class="py-1 px-2 text-slate-200">${o.shares} 份 @ ${o.price_cents}¢ ($${o.effective_cost_u || o.effective_Proceeds_u || '--'}U)</td>
+            <td class="py-1 px-2 text-emerald-400 font-bold">LIVE_CLOB</td>
+            <td class="py-1 px-2 ${statusColor}">${o.status} ${o.error ? '(' + o.error.slice(0, 38) + '...)' : (o.order_id ? '[' + String(o.order_id).slice(0, 14) + ']' : '')}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    async function checkPolymarketGeoblock() {
+      try {
+        showToast('正在向 Polymarket 檢測目前 VPN / IP 解鎖狀態...', 'info');
+        const resp = await fetch('/api/polymarket/geoblock');
+        const data = await resp.json();
+        const geo = data.geoblock || {};
+        await fetchStatus();
+        if (!geo.blocked || geo.can_trade_api) {
+          showToast(`🎉 解鎖成功！當前 IP: ${geo.ip} (${geo.country}) 可直接進行 Polymarket API 交易！`, 'success');
+        } else {
+          showToast(`⛔ 目前仍為受限 IP (${geo.ip} / ${geo.country})，請啟動 ProtonVPN 或 TunnelBear 切換節點！`, 'error');
+        }
+      } catch (e) {
+        showToast('檢測失敗: ' + e.message, 'error');
+      }
+    }
+
+    async function launchVpnApp(appId) {
+      try {
+        const resp = await fetch('/api/polymarket/launch_vpn', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ app_id: appId })
+        });
+        const res = await resp.json();
+        if (res.ok) {
+          showToast(res.message, 'success');
+        } else {
+          showToast(res.error || '啟動失敗', 'error');
+        }
+      } catch (e) {
+        showToast(e.message, 'error');
+      }
+    }
+
+    async function savePolymarketClobConfig() {
+      try {
+        const enCb = document.getElementById('clob-enabled');
+        const dryCb = document.getElementById('clob-dry-run');
+        const payload = {
+          enabled: enCb ? enCb.checked : true,
+          dry_run: dryCb ? dryCb.checked : true,
+          private_key: document.getElementById('clob-private-key').value.trim(),
+          funder_address: document.getElementById('clob-funder-address').value.trim(),
+          signature_type: parseInt(document.getElementById('clob-sig-type').value, 10),
+          proxy_url: document.getElementById('clob-proxy-url').value.trim(),
+          entry_limit_price: parseFloat(document.getElementById('clob-entry-price').value) || 0.51,
+          bounce_protect_limit_price: parseFloat(document.getElementById('clob-bounce-price').value) || 0.72,
+          derive_creds: true
+        };
+        const resp = await fetch('/api/polymarket/clob_config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await resp.json();
+        clobFormSynced = false;
+        await fetchStatus();
+        if (data.derive_result && data.derive_result.ok) {
+          showToast(`✅ CLOB 設定已儲存！已自動推導 L2 API Key (${data.derive_result.api_key.slice(0,8)}...)`, 'success');
+        } else if (data.derive_result && !data.derive_result.ok) {
+          showToast(`設定已儲存，但推導憑證失敗：${data.derive_result.error}`, 'error');
+        } else if (payload.dry_run) {
+          showToast('✅ 策略配置已儲存！【模擬金驗證模式】運行中（真實資產 100% 安全保護中）！', 'success');
+        } else {
+          showToast('✅ 策略配置已儲存！【正式實盤模式】運行中！', 'success');
+        }
+      } catch (e) {
+        showToast('儲存失敗: ' + e.message, 'error');
+      }
+    }
+
+    async function derivePolymarketCreds() {
+      await savePolymarketClobConfig();
+    }
+
+    async function syncLiveWalletNow() {
+      try {
+        showToast('正在向 Polygon 鏈上查詢 Polymarket 實盤 pUSD 餘額...', 'info');
+        const resp = await fetch('/api/polymarket/clob_balance');
+        const data = await resp.json();
+        await fetchStatus();
+        if (data.ok) {
+          showToast(`💰 實盤錢包同步成功！可用現金: $${Number(data.cash_pusd || 0).toFixed(2)} U | 總權益: $${Number(data.total_equity_pusd || 0).toFixed(2)} U`, 'success');
+        } else {
+          showToast(`錢包查詢失敗: ${data.error || '請確認網路狀態'}`, 'error');
+        }
+      } catch (e) {
+        showToast('同步失敗: ' + e.message, 'error');
+      }
+    }
+
+    // Clock
+    function updateClock() {
+      const now = new Date();
+      document.getElementById('utc-clock').innerText = now.toUTCString().substring(17, 25) + ' UTC';
+    }
+
+    // Init lifecycle
+    window.addEventListener('DOMContentLoaded', async () => {
+      setInterval(updateClock, 1000);
+      updateClock();
+
+      await loadPresets();
+      await loadMasterReport();
+      await fetchStatus();
+      setInterval(fetchStatus, 3000);
+
+      // Auto run initial backtest
+      runBacktest(false);
+    });
+  </script>
+</body>
+</html>

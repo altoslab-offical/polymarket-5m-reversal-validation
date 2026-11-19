@@ -1,10 +1,64 @@
 # Polymarket 5m Strategy Research & Empirical Validation Repository
 
-> Complete open-source data, verification scripts, and empirical handoffs for both **Phase A (NO-GO)** and **Phase C / Platform Discovery (Intrawindow Chainlink TWAP Sniper + Nov 20 Fee Overhaul)**.
+> Complete runnable **5m Late-Window Chainlink TWAP Sniper** codebase + open-source datasets, Phase 4.2 live validation tooling, and empirical handoffs (**100% 5m-only focus**; Phase A pre-window RSI `NO-GO`, 15m BTC track cancelled).
 
 ---
 
-## Start Here (For Claude / Reviewers)
+## Complete 5m Strategy Package — Architecture & Quick Start
+
+### 1. Directory & Module Map
+
+| Path | Role |
+|---|---|
+| [`app.py`](app.py) | FastAPI control room (`http://127.0.0.1:8088`), REST APIs (`/api/sniper/status`, `/api/status`, `/api/sniper/trades`, `/api/sniper/enable`), Telegram command integration |
+| [`engine/signal_core.py`](engine/signal_core.py) | Single source of truth for 5m TWAP Sniper entry/exit gating, Binance 1s sigma + order-flow microstructure, depth-aware FAK fill simulation (`+1s`/`+2s`), and freshness guards |
+| [`engine/oracle_sniper.py`](engine/oracle_sniper.py) | Pure 5m TWAP fair-value estimator, fee curve (`post_nov20`), EV sizing (`risk_fraction`, vault lock, 5-share floor), `TWAP_V2_FILTERED_CONFIG` / `TWAP_V2_PURE_CONFIG` / `DEFAULT_SNIPER_CONFIG` |
+| [`engine/oracle_sniper_runner.py`](engine/oracle_sniper_runner.py) | 1 Hz single-slot execution & paper-trading loop, write-ahead intent guard, crash recovery, Gamma settlement, shadow telemetry (`runner_shadow_events.jsonl`) |
+| [`engine/oracle_sniper_feeds.py`](engine/oracle_sniper_feeds.py) | Isolated per-symbol Polymarket CLOB WebSocket loops, Binance `aggTrade`/`bookTicker`, Coinbase fallback, REST `/book` fallback |
+| [`engine/oracle_sniper_ledger.py`](engine/oracle_sniper_ledger.py) | Trade ledger, daily loss cap (`16%` / `>=$4.5`), consecutive/rolling win-rate pause gates, vault accounting |
+| [`engine/chainlink_oracle.py`](engine/chainlink_oracle.py) | Polymarket Chainlink RTDS spot + 60s TWAP WebSocket client |
+| [`engine/polymarket_auto_trader.py`](engine/polymarket_auto_trader.py) | Polymarket CLOB L2 execution (`sniper_buy` / `sniper_sell`), deterministic 5m slug discovery, `sniper_live = False` safety gate |
+| [`engine/notifier.py`](engine/notifier.py) | Multi-channel alert dispatcher (Telegram via `TELEGRAM_BOT_TOKEN` & `TELEGRAM_CHAT_ID` env vars, Discord, macOS desktop) |
+| [`static/index.html`](static/index.html) | Web cockpit dashboard served at `http://127.0.0.1:8088` |
+| [`edge_validation/`](edge_validation/) | Phase 4.2 read-only 3-coin 1 Hz recorder ([`live_recorder_42.py`](edge_validation/live_recorder_42.py)), [`frozen_config.json`](edge_validation/frozen_config.json), 24-variant [`exploration_grid.py`](edge_validation/exploration_grid.py), [`run_daily_bundle.py`](edge_validation/run_daily_bundle.py), [`q1_soak_audit.py`](edge_validation/q1_soak_audit.py) |
+| [`tests/`](tests/) & `verify_*.py` | Unit, parity, shadow, and end-to-end verification suites |
+
+### 2. Quick Start (Paper / Read-Only Mode by Default)
+
+> **Safety Gate**: `sniper_live` defaults to `False` (`paper_mode = True`). Do **NOT** flip to real-money orders until Phase 4.2 pre-registered gates (`n >= 300`, `98.33%` Bonferroni CI lower bound `> 0`) pass.
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+
+# Optional Telegram alerts (sanitized from source; set via environment or data/notify_config.json)
+export TELEGRAM_BOT_TOKEN="your_bot_token"
+export TELEGRAM_CHAT_ID="your_chat_id"
+
+# Start FastAPI control room + 1 Hz paper sniper
+bash run.sh
+
+# Start Section 4.2 read-only 3-coin 1 Hz recorder (BTC/ETH/SOL)
+.venv/bin/python -u edge_validation/live_recorder_42.py --db data/validation_42/live_3coin_42.db
+
+# Run Q1 soak health audit & daily Tier-1 + Tier-2 (nice -n 19) bundle
+.venv/bin/python edge_validation/q1_soak_audit.py --since-ts 1795078200
+.venv/bin/python edge_validation/run_daily_bundle.py --db data/validation_42/live_3coin_42.db
+
+# Run tests & parity verifiers
+.venv/bin/pytest -q tests/
+.venv/bin/python verify_oracle_sniper.py --fast
+```
+
+### 3. Latest Active Research & Monitoring Reports
+
+- **Current 5m Monitoring & `CLAUDE_RESPONSE_10` Handoff**: [`edge_validation/CLAUDE_5M_MONITORING_HANDOFF.md`](edge_validation/CLAUDE_5M_MONITORING_HANDOFF.md)
+- **24-Variant Offline Exploration Grid Report**: [`edge_validation/exploration_grid_report.md`](edge_validation/exploration_grid_report.md)
+- **Q1 3.46h Live Telemetry & `-4.04U` Forensics**: [`edge_validation/Q1_SOAK_INTERIM_3H.md`](edge_validation/Q1_SOAK_INTERIM_3H.md)
+
+---
+
+## Start Here (Validation History & Audits)
 
 - **🚀 LEAD ARCHITECT SPEC (`V12.0` Full-Candle Multi-Period RSI Strategy): [`V12_RSI_STRATEGY_SPEC.md`](V12_RSI_STRATEGY_SPEC.md)** (`raw`: [V12_RSI_STRATEGY_SPEC.md](https://raw.githubusercontent.com/altoslab-offical/polymarket-5m-reversal-validation/main/V12_RSI_STRATEGY_SPEC.md))
   - Strategy implementation: [`strategy_reference/v12_rsi_strategy.py`](strategy_reference/v12_rsi_strategy.py)

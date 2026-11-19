@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pandas as pd
 
+from edge_validation.binance_1s_audit import normalize_open_ts_sec, parse_binance_1s_csv_bytes
 from edge_validation.live_recorder_42 import LiveRecorder42, _aggregate_shadow_parity, _sim_one_cfg, analyze_recording, init_db
 from edge_validation.parity_replay import _make_replay_runner, run_parity_replay
 from engine.chainlink_oracle import ChainlinkRTDSFeed
@@ -352,7 +353,10 @@ def check_9_live_shadow_parity_and_reports(tmp: Path) -> int:
     fr_data = json.loads((Path(__file__).resolve().parent / "edge_validation" / "frozen_config.json").read_text(encoding="utf-8"))
     fr_data["count_start_window_ts"] = w
     fr_p.write_text(json.dumps(fr_data), encoding="utf-8")
-    rep = analyze_recording(db_path=db_p, frozen_path=fr_p, out_dir=tmp, daily_report=True, shadow_log_path=sh_p)
+    rep = analyze_recording(
+        db_path=db_p, frozen_path=fr_p, out_dir=tmp, daily_report=True,
+        shadow_log_path=sh_p, kline_loader=lambda *_a: ({}, "OFFLINE_TEST"),
+    )
     assert rep["live_shadow_parity"]["matched"] == 1 and rep["live_shadow_parity"]["parity_rate"] == 1.0
     assert len(rep["r1_diagnostics"]["mismatches"]) == 1
     assert abs(rep["freshness_ms"]["age_ms"]["cl_spot"]["p50"] - 400.0) < 1e-3
@@ -515,26 +519,45 @@ def check_15_clob_sustained_stale_forces_resub_and_roll_sync(tmp: Path) -> int:
 
 
 def check_16_daily_report_twap_buckets_and_carry_forward(tmp: Path) -> int:
-    """Verify parity_replay shadow isolation plus Chainlink age PnL & carry-forward daily tables."""
+    """Verify parity_replay shadow isolation, microsecond kline parsing, and Binance 1s kline audit gates."""
     _cl, _hub, replay_runner = _make_replay_runner(tmp, [1795020000.0])
     assert replay_runner.policy.live_shadow_log_path is None
+    assert normalize_open_ts_sec(1794960000000000) == 1794960000 and normalize_open_ts_sec(1794960001000) == 1794960001
+    parsed = parse_binance_1s_csv_bytes(b"open_time,o,h,l,c,v,ct,qv,trades\n1794960000000000,1,1,1,100.5,1,2,3,4\n1794960001000,1,1,1,100.6,0,2,0,0\n")
+    assert parsed[1794960000] == (100.5, 4) and parsed[1794960001] == (100.6, 0), parsed
+
     db_p = tmp / "rep16.db"
     con = init_db(db_p)
     w = 1795020000
     con.execute("INSERT INTO windows_42 (window_ts,symbol,slug,twap_strike,twap_close,resolved_outcome) VALUES (?,?,?,?,?,?)", (w, "BTCUSDT", f"btc-updown-5m-{w}", 100.0, 100.05, "UP"))
-    for i in range(7):
-        con.execute("INSERT INTO snapshots_1hz (ts_sec,window_ts,symbol,elapsed_sec,cl_spot,cl_twap60,bn_close,bn_trades,bn_age_sec) VALUES (?,?,?,?,?,?,?,?,?)", (w + i, w, "BTCUSDT", i, 100.0, 100.0, 100.0, 0, 0.2))
+    for i in range(10):
+        # ts_sec = w + i aligns to kline_ts = w + i - 1
+        con.execute("INSERT INTO snapshots_1hz (ts_sec,window_ts,symbol,elapsed_sec,cl_spot,cl_twap60,bn_close,bn_trades,bn_age_sec) VALUES (?,?,?,?,?,?,?,?,?)", (w + i, w, "BTCUSDT", i, 100.0, 100.0, 100.0, 0 if i < 2 else 3, 0.2))
+        con.execute("INSERT INTO snapshots_1hz (ts_sec,window_ts,symbol,elapsed_sec,cl_spot,cl_twap60,bn_close,bn_trades,bn_age_sec) VALUES (?,?,?,?,?,?,?,?,?)", (w + i, w, "ETHUSDT", i, 100.0, 100.0, 100.15 if i < 2 else 100.0, 0 if i < 6 else 2, 0.2))
+        con.execute("INSERT INTO snapshots_1hz (ts_sec,window_ts,symbol,elapsed_sec,cl_spot,cl_twap60,bn_close,bn_trades,bn_age_sec) VALUES (?,?,?,?,?,?,?,?,?)", (w + i, w, "SOLUSDT", i, 100.0, 100.0, 100.0, 0 if i < 3 else 1, 0.2))
     con.commit()
     con.close()
+
+    def _mock_klines(sym: str, _day: str, _lo: int, _hi: int) -> tuple[dict[int, tuple[float, int]], str]:
+        if sym == "BTCUSDT":
+            return ({w + i - 1: (100.0, 0 if i < 2 else 4) for i in range(10)}, "binance.vision")
+        if sym == "ETHUSDT":
+            return ({w + i - 1: (100.0, 0 if i < 1 else 2) for i in range(10)}, "api.binance.com/1s")
+        return ({w + i - 1: (100.0, 0 if i < 1 else 2) for i in range(10)}, "api.binance.com/1s")
+
     fr_p = tmp / "frozen16.json"
     fr_data = json.loads((Path(__file__).resolve().parent / "edge_validation" / "frozen_config.json").read_text(encoding="utf-8"))
     fr_data["count_start_window_ts"] = w
     fr_p.write_text(json.dumps(fr_data), encoding="utf-8")
-    rep = analyze_recording(db_path=db_p, frozen_path=fr_p, out_dir=tmp, daily_report=True, shadow_log_path=tmp / "missing.jsonl")
-    assert rep["carry_forward"]["rows"][0]["zero_trade_pct"] == 100.0 and rep["carry_forward"]["rows"][0]["gt5s_sec"] == 2
+    rep = analyze_recording(db_path=db_p, frozen_path=fr_p, out_dir=tmp, daily_report=True, shadow_log_path=tmp / "missing.jsonl", kline_loader=_mock_klines)
+    by_sym = {r["symbol"]: r for r in rep["binance_1s_audit"]["rows"]}
+    assert by_sym["BTCUSDT"]["status"] == "PASS" and by_sym["BTCUSDT"]["close_match_2bps_pct"] == 100.0 and by_sym["BTCUSDT"]["rec_zero_pct"] == 20.0
+    assert by_sym["ETHUSDT"]["status"] == "FAIL_CLOSE" and by_sym["ETHUSDT"]["close_match_2bps_pct"] == 80.0
+    assert by_sym["SOLUSDT"]["status"] == "ALERT_ZERO" and by_sym["SOLUSDT"]["zero_diff_pp"] == 20.0
+    assert rep["binance_1s_audit"]["overall_pass"] is False
     md = (tmp / "phase42_daily_report.md").read_text(encoding="utf-8")
     assert "Chainlink TWAP Age vs Filled PnL" in md and "< 0.5s" in md and "0.5–1.5s" in md and "> 1.5s" in md
-    assert "Binance 1s Volatility Carry-Forward Ratio" in md and "ALERT (>5%)" in md
+    assert "Binance 1s Kline Integrity & Zero-Trade Parity" in md and "FAIL_CLOSE" in md and "ALERT_ZERO" in md and "ALERT (>5%)" not in md
     return 1
 
 

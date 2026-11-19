@@ -62,6 +62,11 @@ from engine.signal_core import (
     simulate_fak_sell,
 )
 
+try:
+    from edge_validation.binance_1s_audit import KlineLoader, audit_recorder_vs_binance_1s
+except ImportError:
+    from binance_1s_audit import KlineLoader, audit_recorder_vs_binance_1s
+
 LOG = logging.getLogger("recorder42")
 SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 COIN_MAP = {"BTCUSDT": "btc", "ETHUSDT": "eth", "SOLUSDT": "sol"}
@@ -1395,43 +1400,8 @@ def _summarize_twap_age_buckets(df_t: pd.DataFrame) -> List[Dict[str, Any]]:
     return out
 
 
-def _carry_symbol_metrics(rows: pd.DataFrame) -> Tuple[int, int, int, int]:
-    rows_s = rows.sort_values("ts_sec")
-    tot = zero_c = gt5 = streak = max_s = 0
-    for tr_raw, age_raw in zip(rows_s["bn_trades"], rows_s["bn_age_sec"]):
-        tot += 1
-        n_tr = int(tr_raw) if pd.notna(tr_raw) else 0
-        age_v = float(age_raw) if pd.notna(age_raw) else 9999.0
-        if n_tr == 0 and age_v <= 5.0:
-            zero_c += 1
-            streak += 1
-            max_s = max(max_s, streak)
-            if streak > 5:
-                gt5 += 1
-        else:
-            streak = 0
-    return tot, zero_c, gt5, max_s
-
-
-def _compute_carry_forward_stats(df_s: pd.DataFrame, count_start_ts: int) -> Dict[str, Any]:
-    """Measure Binance zero-trade carry-forward ratio (total and >5s extended) in vol_hist."""
-    if len(df_s) == 0 or "bn_age_sec" not in df_s.columns:
-        return {"scope": "none", "rows": []}
-    has_bn = df_s[df_s["bn_age_sec"].notna()]
-    post = has_bn[has_bn["window_ts"] >= count_start_ts] if (len(has_bn) and count_start_ts > 0) else has_bn
-    sub = post if len(post) else has_bn
-    scope = "post_reset" if len(post) else "all_ms"
-    out_rows: List[Dict[str, Any]] = []
-    sum_tot = sum_zero = sum_gt5 = all_max = 0
-    for sym in SYMBOLS:
-        g = sub[sub["symbol"] == sym]
-        tot, zero_c, gt5, max_s = _carry_symbol_metrics(g) if len(g) else (0, 0, 0, 0)
-        sum_tot, sum_zero, sum_gt5, all_max = sum_tot + tot, sum_zero + zero_c, sum_gt5 + gt5, max(all_max, max_s)
-        z_pct = round(zero_c / tot * 100.0, 2) if tot else 0.0
-        out_rows.append({"symbol": sym, "total_sec": tot, "zero_trade_sec": zero_c, "zero_trade_pct": z_pct, "gt5s_sec": gt5, "gt5s_pct": round(gt5 / tot * 100.0, 2) if tot else 0.0, "max_quiet_sec": max_s, "status": "ALERT (>5%)" if (tot > 0 and z_pct > 5.0) else "OK"})
-    all_pct = round(sum_zero / sum_tot * 100.0, 2) if sum_tot else 0.0
-    out_rows.append({"symbol": "ALL", "total_sec": sum_tot, "zero_trade_sec": sum_zero, "zero_trade_pct": all_pct, "gt5s_sec": sum_gt5, "gt5s_pct": round(sum_gt5 / sum_tot * 100.0, 2) if sum_tot else 0.0, "max_quiet_sec": all_max, "status": "ALERT (>5%)" if (sum_tot > 0 and all_pct > 5.0) else "OK"})
-    return {"scope": scope, "rows": out_rows}
+def _fmt_num(val: Optional[float], suffix: str = "") -> str:
+    return f"{val}{suffix}" if val is not None else "n/a"
 
 
 def _append_twap_age_and_carry_tables(lines: List[str], report: Dict[str, Any]) -> None:
@@ -1440,10 +1410,27 @@ def _append_twap_age_and_carry_tables(lines: List[str], report: Dict[str, Any]) 
     for sc_lbl in ("post_reset", "all"):
         for b in ta.get(sc_lbl) or []:
             lines.append(f"| `{sc_lbl}` | `{b['bucket']}` | {b['trades']} | {b['wr']} | {b['mean_pnl_1s']} | {b['mean_pnl_hold']} |")
-    cf = report.get("carry_forward") or {}
-    lines += ["", f"## Binance 1s Volatility Carry-Forward Ratio (`feed_alive` Monitor, scope=`{cf.get('scope', 'none')}`)", "", "_Note: `compute_sigma_from_vol_hist` takes `max(sample_var, ewma_var)`; multi-second cumulative variance stays unbiased under zero-return carry-forward while `sample_var` floor prevents quiet-regime EWMA under-estimation._", "", "| Symbol | Total Sec | Zero-Trade Carry (`bn_trades=0`) | Extended `>5s` Carry | Max Quiet Streak | Status (`<=5%`) |", "|---|---:|---:|---:|---:|---|"]
-    for r in cf.get("rows") or []:
-        lines.append(f"| `{r['symbol']}` | {r['total_sec']} | {r['zero_trade_sec']} (**{r['zero_trade_pct']}%**) | {r['gt5s_sec']} ({r['gt5s_pct']}%) | {r['max_quiet_sec']}s | **{r['status']}** |")
+    b1s = report.get("binance_1s_audit") or {}
+    lines += [
+        "",
+        f"## Binance 1s Kline Integrity & Zero-Trade Parity (scope=`{b1s.get('scope', 'none')}`, align=`ts_sec-1`)",
+        "",
+        "_Replaces the revoked `>5%` zero-trade carry-forward alert (natural zero-trade 1s seconds ~14–44% match historical 1s klines). Official gates: Close `<=2bps` parity `>= 99.0%` (`FAIL_CLOSE` below) and `|Rec Zero - Kline Zero| <= 5.0 pp` (`ALERT_ZERO` above)._",
+        "",
+        "| UTC Day | Symbol | Source | Matched Sec | Close `<=2bps` (`>=99%`) | Exact % | P99 / Max (bps) | Rec Zero % | Kline Zero % | Delta (`±5pp`) | Max Quiet | Status |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+    ]
+    for r in b1s.get("rows") or []:
+        c2 = _fmt_num(r.get("close_match_2bps_pct"), "%")
+        ex = _fmt_num(r.get("exact_match_pct"), "%")
+        bps_s = f"{_fmt_num(r.get('p99_diff_bps'))} / {_fmt_num(r.get('max_diff_bps'))}"
+        rz = _fmt_num(r.get("rec_zero_pct"), "%")
+        kz = _fmt_num(r.get("kline_zero_pct"), "%")
+        zd_raw = r.get("zero_diff_pp")
+        zd = f"{zd_raw:+.2f} pp" if zd_raw is not None else "n/a"
+        lines.append(
+            f"| `{r['utc_day']}` | `{r['symbol']}` | `{r['source']}` | {r['matched_sec']} | **{c2}** | {ex} | {bps_s} | {rz} | {kz} | {zd} | {r['max_quiet_sec']}s | **{r['status']}** |"
+        )
 
 
 def _append_r1_and_shadow_tables(lines: List[str], report: Dict[str, Any]) -> None:
@@ -1538,6 +1525,7 @@ def analyze_recording(
     db_path: pathlib.Path = DEFAULT_DB, frozen_path: pathlib.Path = FROZEN_CFG_PATH,
     out_dir: pathlib.Path = ROOT, daily_report: bool = False,
     shadow_log_path: pathlib.Path = DEFAULT_SHADOW_LOG,
+    kline_loader: Optional[KlineLoader] = None,
 ) -> dict[str, Any]:
     """Conservative (+1s / +2s) depth-aware FAK simulation + diagnostics with re-freeze reset boundary."""
     frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
@@ -1603,7 +1591,7 @@ def analyze_recording(
         "warmup_diag": {"all": _count_warmup_episodes(v2_warm_secs), "post_reset": _count_warmup_episodes({t for t in v2_warm_secs if t >= count_start_ts})},
         "live_shadow_parity": shadow_parity,
         "twap_age_pnl": {"post_reset": _summarize_twap_age_buckets(v2_df_reset), "all": _summarize_twap_age_buckets(v2_df_t)},
-        "carry_forward": _compute_carry_forward_stats(df_s, count_start_ts),
+        "binance_1s_audit": audit_recorder_vs_binance_1s(df_s, count_start_ts, kline_loader=kline_loader),
     }
     if daily_report:
         report["daily_report_path"] = str(_write_daily_report_md(report, out_dir))

@@ -1,0 +1,5 @@
+window_ts,symbol,recorder_side,recorder_ts,recorder_z,recorder_ask,runner_side,runner_ts,runner_z,runner_ask,runner_book_lag_ms,recorder_ask_at_runner_ts,recorder_book_lag_ms_at_runner_ts,resolved_outcome,runner_filled,root_cause
+1795068600,ETHUSDT,DOWN,1795068842,1.322183,0.819,DOWN,1795068840,1.578185,0.82,151.63,0.837,151.25,UP,MISSED_PRICE_1S,Same side DOWN 2s apart (1Hz phase diff + Recorder 240s saw ask=0.837 > 0.82); Runner +1s missed price
+1795068900,SOLUSDT,,,,,UP,1795069140,1.327593,0.81,153.21,0.75,252.69,UP,MISSED_PRICE_1S,Recorder 240s book lag=253ms saw ask=0.75 vs Runner 0.81 (and +1s jumped to 0.89 -> missed)
+1795071900,ETHUSDT,UP,1795072117,1.383539,0.82,UP,1795072118,1.306747,0.81,47.66,0.83,49.45,DOWN,FILLED_PAPER,Same coin/window/side UP 1s apart; 1Hz phase diff |dz|=0.077 > 0.02 and |dask|=0.01 > 0.001
+1795075200,ETHUSDT,,,,,UP,1795075377,1.489923,0.81,4.3,0.86,2201.87,DOWN,FILLED_PAPER,Recorder CLOB 1013 slow consumer lag=2202ms stale at ask=0.86 while Runner saw live 0.81 (4.3ms lag)

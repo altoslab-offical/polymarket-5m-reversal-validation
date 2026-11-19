@@ -38,17 +38,30 @@ EXPECTED_FROZEN_SHA256: dict[str, str] = {
 }
 
 
-def check_frozen_hashes(repo_dir: pathlib.Path = REPO) -> dict[str, Any]:
-    """Verify SHA256 prefixes for all 12 frozen core files without modifying them."""
+CORE_5M_FILES: frozenset[str] = frozenset(k for k in EXPECTED_FROZEN_SHA256 if k not in ("app.py", "engine/scanner.py"))
+
+
+def check_frozen_hashes(
+    repo_dir: pathlib.Path = REPO,
+    expected_hashes: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
+    """Verify SHA256 prefixes for frozen core files without modifying them."""
+    ref = EXPECTED_FROZEN_SHA256 if expected_hashes is None else expected_hashes
     mismatches: list[dict[str, str]] = []
     actual: dict[str, str] = {}
-    for rel, expected in EXPECTED_FROZEN_SHA256.items():
+    for rel, expected in ref.items():
         fp = repo_dir / rel
         got = hashlib.sha256(fp.read_bytes()).hexdigest()[:16] if fp.exists() else "MISSING"
         actual[rel] = got
         if got != expected:
             mismatches.append({"file": rel, "expected": expected, "actual": got})
-    return {"matched": len(EXPECTED_FROZEN_SHA256) - len(mismatches), "total": len(EXPECTED_FROZEN_SHA256), "ok": len(mismatches) == 0, "mismatches": mismatches, "actual": actual}
+    core_mismatches = [m for m in mismatches if m["file"] in CORE_5M_FILES]
+    core_total = sum(1 for k in ref if k in CORE_5M_FILES)
+    return {
+        "matched": len(ref) - len(mismatches), "total": len(ref), "ok": len(mismatches) == 0,
+        "core_5m_matched": core_total - len(core_mismatches), "core_5m_total": core_total,
+        "core_5m_ok": len(core_mismatches) == 0, "mismatches": mismatches, "actual": actual,
+    }
 
 
 def count_recorder_1013(log_path: pathlib.Path) -> dict[str, Any]:
@@ -56,7 +69,7 @@ def count_recorder_1013(log_path: pathlib.Path) -> dict[str, Any]:
     if not log_path.exists():
         return {"exists": False, "code_1013": 0, "ws_lines": 0, "lines": []}
     lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    hits_1013 = [ln for ln in lines if "1013" in ln]
+    hits_1013 = [ln for ln in lines if "code=1013" in ln or "1013" in ln.replace("1013_total", "")]
     ws_lines = [ln for ln in lines if "CLOB WS" in ln]
     return {"exists": True, "code_1013": len(hits_1013), "ws_lines": len(ws_lines), "lines": hits_1013[-20:]}
 
@@ -376,7 +389,10 @@ def render_q1_markdown(res: dict[str, Any]) -> str:
         lines.append(f"- Runner `ENTER` (`ts={ev['ts_sec']}`, `t={ev['elapsed']}s`, `ask={ev['ask_top']}`): `book_age={ages.get('book')} ms`, `book_lag={lags.get('book_ms')} ms`, `cl_twap_age={ages.get('cl_twap')} ms`。")
     for snap in f["recorder_snapshots_250_252"]:
         lines.append(f"- Recorder 1 Hz (`ts={snap['ts_sec']}`, `t={snap['elapsed']}s`, `up_ask1={snap['up_ask1']}`): `up_book_age={snap['up_book_age_ms']} ms`, `up_book_lag={snap['up_book_lag_ms']} ms`。")
-    lines.append(f"- 凍結檔案指紋檢查：`{res['frozen_check']['matched']}/{res['frozen_check']['total']}` 符合（`ok={res['frozen_check']['ok']}`）。")
+    lines.append(
+        f"- 凍結檔案指紋檢查：`{res['frozen_check']['matched']}/{res['frozen_check']['total']}` 符合（`ok={res['frozen_check']['ok']}`，"
+        f"5m 核心 `{res['frozen_check']['core_5m_matched']}/{res['frozen_check']['core_5m_total']}` `core_5m_ok={res['frozen_check']['core_5m_ok']}`）。"
+    )
     return "\n".join(lines) + "\n"
 
 

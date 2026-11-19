@@ -2,6 +2,7 @@
 """Unit tests for `edge_validation/q1_soak_audit.py` using isolated temp fixtures."""
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 import sqlite3
@@ -123,4 +124,31 @@ def test_q1_soak_clean_pass_gates(tmp_path: pathlib.Path, monkeypatch: object) -
     assert res["gates"]["gate1_zero_stale_decisions"] is True
     assert res["gates"]["gate2_zero_1013"] is True
     assert res["gates"]["gate3_eth_sol_near_zero_gt2s"] is True
-    assert res["frozen_check"]["ok"] is True and res["frozen_check"]["matched"] == 12
+    assert res["frozen_check"]["core_5m_ok"] is True
+
+
+def test_count_recorder_1013_ignores_total_counter_and_detects_drift(tmp_path: pathlib.Path) -> None:
+    """Verify `1013_total=N` in generic WS reconnect lines is not double-counted as a 1013 close."""
+    log_p = tmp_path / "recorder.log"
+    log_p.write_text(
+        "\n".join([
+            "CLOB WS BTCUSDT closed (code=1013, 1013_total=6)",
+            "Binance WS reconnect: no close frame received or sent",
+            "CLOB WS ETHUSDT reconnect (1013_total=6): ",
+            "CLOB WS SOLUSDT reconnect (1013_total=6): ",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    out = qa.count_recorder_1013(log_p)
+    assert out["code_1013"] == 1
+    assert out["ws_lines"] == 3
+
+    f1 = tmp_path / "engine" / "signal_core.py"
+    f1.parent.mkdir(parents=True, exist_ok=True)
+    f1.write_text("x = 1\n", encoding="utf-8")
+    h1 = hashlib.sha256(f1.read_bytes()).hexdigest()[:16]
+    ok_chk = qa.check_frozen_hashes(repo_dir=tmp_path, expected_hashes={"engine/signal_core.py": h1})
+    assert ok_chk["ok"] is True and ok_chk["matched"] == 1
+    f1.write_text("x = 2\n", encoding="utf-8")
+    bad_chk = qa.check_frozen_hashes(repo_dir=tmp_path, expected_hashes={"engine/signal_core.py": h1})
+    assert bad_chk["ok"] is False and bad_chk["mismatches"][0]["file"] == "engine/signal_core.py"

@@ -23,6 +23,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+import aiohttp
 import httpx
 import numpy as np
 import pandas as pd
@@ -64,8 +65,24 @@ from engine.signal_core import (
 
 try:
     from edge_validation.binance_1s_audit import KlineLoader, audit_recorder_vs_binance_1s
+    from edge_validation.daily_diagnostics import (
+        aggregate_shadow_parity_v2 as _aggregate_shadow_parity,
+        append_q3_diagnostics_md,
+        append_shadow_parity_md,
+        compute_live_shadow_parity_v2 as _compute_live_shadow_parity,
+        compute_q3_diagnostics,
+    )
+    from edge_validation.sqlite_writer import AsyncSQLiteWriter, query_pending_windows
 except ImportError:
     from binance_1s_audit import KlineLoader, audit_recorder_vs_binance_1s
+    from daily_diagnostics import (
+        aggregate_shadow_parity_v2 as _aggregate_shadow_parity,
+        append_q3_diagnostics_md,
+        append_shadow_parity_md,
+        compute_live_shadow_parity_v2 as _compute_live_shadow_parity,
+        compute_q3_diagnostics,
+    )
+    from sqlite_writer import AsyncSQLiteWriter, query_pending_windows
 
 LOG = logging.getLogger("recorder42")
 SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
@@ -337,6 +354,7 @@ class LiveRecorder42:
     def __init__(self, db_path: pathlib.Path = DEFAULT_DB) -> None:
         self.db_path = db_path
         self.con = init_db(db_path)
+        self._db_writer: Optional[AsyncSQLiteWriter] = None
         self.chainlink = ChainlinkRTDSFeed()
         self.states: Dict[str, CoinState42] = {s: CoinState42(s) for s in SYMBOLS}
         self.micro: Dict[str, Bn1sMicroTracker] = {s: Bn1sMicroTracker(1800, 20) for s in SYMBOLS}
@@ -345,8 +363,39 @@ class LiveRecorder42:
         self.prefetched: Dict[Tuple[str, int], dict[str, Any]] = {}
         self._stop = asyncio.Event()
         self._clob_resub = asyncio.Event()
+        self._clob_resub_by_sym: Dict[str, asyncio.Event] = {s: asyncio.Event() for s in SYMBOLS}
         self._clob_stale_since: float = 0.0
+        self._clob_stale_by_sym: Dict[str, float] = {s: 0.0 for s in SYMBOLS}
+        self._active_clob_ws: Dict[str, Any] = {}
+        self._clob_1013_count: int = 0
         self._trade_buf: List[Tuple[int, int, str, str, str, float, float]] = []
+
+    def _db_exec(self, sql: str, params: Tuple[Any, ...] = ()) -> None:
+        if self._db_writer is not None:
+            self._db_writer.execute(sql, params)
+        else:
+            self.con.execute(sql, params)
+
+    def _db_many(self, sql: str, rows: List[Tuple[Any, ...]]) -> None:
+        if self._db_writer is not None:
+            self._db_writer.executemany(sql, rows)
+        else:
+            self.con.executemany(sql, rows)
+
+    def _db_commit(self) -> None:
+        if self._db_writer is not None:
+            self._db_writer.commit()
+        else:
+            self.con.commit()
+
+    def _trigger_clob_resub(self, sym: Optional[str] = None) -> None:
+        self._clob_resub.set()
+        targets = (sym,) if sym else SYMBOLS
+        for s in targets:
+            self._clob_resub_by_sym[s].set()
+            ws = self._active_clob_ws.get(s)
+            if ws is not None and not ws.closed:
+                asyncio.create_task(ws.close())
 
     async def _discover_market(self, client: httpx.AsyncClient, sym: str, window_ts: int) -> Optional[dict[str, Any]]:
         slug = f"{COIN_MAP[sym]}-updown-5m-{window_ts}"
@@ -411,7 +460,9 @@ class LiveRecorder42:
     async def _binance_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                async with websockets.connect(BINANCE_WS, open_timeout=8.0, ping_interval=20.0) as ws:
+                async with websockets.connect(
+                    BINANCE_WS, open_timeout=8.0, ping_interval=20.0, compression=None, max_queue=4096
+                ) as ws:
                     while not self._stop.is_set():
                         self._on_binance_msg(await asyncio.wait_for(ws.recv(), timeout=15.0))
             except asyncio.CancelledError:
@@ -459,13 +510,21 @@ class LiveRecorder42:
                 st.dn_source_ts_ms = src_ms
                 st.dn_last_lag_ms = round(now_r * 1000.0 - float(src_ms), 2)
 
-    def _note_clob_freshness(self, now_r: float, src_ms: int) -> bool:
+    def _note_clob_freshness(self, now_r: float, src_ms: int, sym: str = "") -> bool:
         if src_ms > 0 and (now_r * 1000.0 - float(src_ms)) > 2500.0:
-            self._clob_stale_since = self._clob_stale_since or now_r
-            if (now_r - self._clob_stale_since) >= 1.5:
-                self._clob_resub.set()
+            if sym:
+                since = self._clob_stale_by_sym.get(sym, 0.0) or now_r
+                self._clob_stale_by_sym[sym] = since
+            else:
+                since = self._clob_stale_since or now_r
+                self._clob_stale_since = since
+            if (now_r - since) >= 1.5:
+                self._trigger_clob_resub(sym or None)
             return False
-        self._clob_stale_since = 0.0
+        if sym:
+            self._clob_stale_by_sym[sym] = 0.0
+        else:
+            self._clob_stale_since = 0.0
         return True
 
     def _apply_book(
@@ -487,10 +546,10 @@ class LiveRecorder42:
         st.mark_dirty(side)
         self._stamp_book_recv(st, side, (now_m, now_r, source_ts_ms, via_ws))
 
-    def _apply_price_change(self, msg: dict[str, Any]) -> None:
+    def _apply_price_change(self, msg: dict[str, Any], sym_hint: str = "") -> None:
         now_m, now_r = time.monotonic_ns() / 1_000_000.0, time.time()
         top_src = self._parse_src_ms(msg.get("timestamp"))
-        if not self._note_clob_freshness(now_r, top_src):
+        if not self._note_clob_freshness(now_r, top_src, sym=sym_hint):
             return
         touched: Dict[Tuple[str, str], int] = {}
         for ch in msg.get("price_changes") or ():
@@ -517,7 +576,7 @@ class LiveRecorder42:
             st.mark_dirty(side)
             self._stamp_book_recv(st, side, (now_m, now_r, src_ms, True))
 
-    def _handle_clob_msg(self, raw: str) -> None:
+    def _handle_clob_msg(self, raw: str, sym_hint: str = "") -> None:
         if not raw or raw in ("PING", "PONG"):
             return
         obj = json.loads(raw)
@@ -527,33 +586,61 @@ class LiveRecorder42:
             ev_type = str(m.get("event_type") or "")
             if ev_type == "book" and m.get("asset_id"):
                 src_ms = self._parse_src_ms(m.get("timestamp"))
-                if self._note_clob_freshness(time.time(), src_ms):
+                if self._note_clob_freshness(time.time(), src_ms, sym=sym_hint):
                     self._apply_book(str(m["asset_id"]), m.get("bids"), m.get("asks"), src_ms, via_ws=True)
             elif ev_type == "price_change":
-                self._apply_price_change(m)
+                self._apply_price_change(m, sym_hint=sym_hint)
             elif ev_type == "last_trade_price" and m.get("asset_id"):
                 meta = self.token_to_meta.get(str(m["asset_id"]))
                 if meta:
                     ts_ms = int(m.get("timestamp") or time.time() * 1000)
                     self._trade_buf.append((ts_ms, self.states[meta[0]].window_ts, meta[0], meta[1], str(m["asset_id"]), float(m.get("price") or 0), float(m.get("size") or 0)))
 
-    async def _clob_ws_loop(self) -> None:
+    async def _drain_clob_ws(self, ws: Any, sym: str) -> None:
+        async for msg in ws:
+            if self._stop.is_set() or self._clob_resub_by_sym[sym].is_set():
+                break
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                self._handle_clob_msg(msg.data, sym_hint=sym)
+            elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                break
+
+    async def _pump_clob_symbol_ws(self, session: aiohttp.ClientSession, sym: str, assets: List[str]) -> Optional[int]:
+        ws_tmo = aiohttp.ClientWSTimeout(ws_receive=15.0, ws_close=5.0)
+        async with session.ws_connect(
+            CLOB_WS, heartbeat=15.0, compress=0, max_msg_size=0, autoping=True, timeout=ws_tmo
+        ) as ws:
+            self._active_clob_ws[sym] = ws
+            try:
+                await ws.send_str(json.dumps({"assets_ids": assets, "type": "market"}))
+                await self._drain_clob_ws(ws, sym)
+            finally:
+                self._active_clob_ws.pop(sym, None)
+            return ws.close_code
+
+    async def _clob_ws_symbol_loop(self, session: aiohttp.ClientSession, sym: str) -> None:
+        resub_ev = self._clob_resub_by_sym[sym]
         while not self._stop.is_set():
-            assets = [tok for st in self.states.values() for tok in (st.up_token, st.down_token) if tok]
-            if not assets:
+            st = self.states[sym]
+            assets = [tok for tok in (st.up_token, st.down_token) if tok]
+            if len(assets) < 2:
                 await asyncio.sleep(0.5)
                 continue
-            self._clob_resub.clear()
-            self._clob_stale_since = 0.0
+            resub_ev.clear()
+            self._clob_stale_by_sym[sym] = 0.0
             try:
-                async with websockets.connect(CLOB_WS, open_timeout=8.0, ping_interval=15.0, ping_timeout=10.0, max_queue=64) as ws:
-                    await ws.send(json.dumps({"assets_ids": assets, "type": "market"}))
-                    while not self._stop.is_set() and not self._clob_resub.is_set():
-                        self._handle_clob_msg(await asyncio.wait_for(ws.recv(), timeout=12.0))
+                code = await self._pump_clob_symbol_ws(session, sym, assets)
+                if code == 1013:
+                    self._clob_1013_count += 1
+                if not resub_ev.is_set() and not self._stop.is_set():
+                    LOG.warning("CLOB WS %s closed (code=%s, 1013_total=%d)", sym, code, self._clob_1013_count)
+                    await asyncio.sleep(1.0)
             except asyncio.CancelledError:
                 raise
-            except (websockets.WebSocketException, asyncio.TimeoutError, OSError, ValueError) as exc:
-                LOG.warning("CLOB WS reconnect: %s", exc)
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
+                if "1013" in str(exc):
+                    self._clob_1013_count += 1
+                LOG.warning("CLOB WS %s reconnect (1013_total=%d): %s", sym, self._clob_1013_count, exc)
                 await asyncio.sleep(1.5)
 
     async def _refresh_symbol_meta(self, client: httpx.AsyncClient, sym: str, cur_t: int, elapsed: float) -> bool:
@@ -596,17 +683,22 @@ class LiveRecorder42:
                 LOG.debug("REST /book fallback failed %s: %s", tok[:10], exc)
 
     async def _settle_pending_windows(self, client: httpx.AsyncClient, cur_t: int) -> None:
-        pending = self.con.execute(
-            "SELECT window_ts, symbol FROM windows_42 WHERE window_ts < ? AND (resolved_outcome IS NULL OR gamma_final_price IS NULL) LIMIT 30",
-            (cur_t - 120,),
-        ).fetchall()
+        cutoff = cur_t - 120
+        if self._db_writer is not None:
+            pending = await asyncio.to_thread(query_pending_windows, self.db_path, cutoff)
+        else:
+            pending = self.con.execute(
+                "SELECT window_ts, symbol FROM windows_42 WHERE window_ts < ? "
+                "AND (resolved_outcome IS NULL OR gamma_final_price IS NULL) LIMIT 30",
+                (cutoff,),
+            ).fetchall()
         for w_ts, sym in pending:
             info = await self._discover_market(client, sym, int(w_ts))
             if not info:
                 continue
             tw_s = self.chainlink.get_settlement_twap_at(sym, int(w_ts))
             tw_c = self.chainlink.get_settlement_twap_at(sym, int(w_ts) + 300)
-            self.con.execute(
+            self._db_exec(
                 """
                 UPDATE windows_42
                 SET gamma_price_to_beat = COALESCE(?, gamma_price_to_beat),
@@ -618,18 +710,19 @@ class LiveRecorder42:
                 """,
                 (info["gamma_ptb"], info["gamma_final"], info["resolved"], tw_s, tw_c, w_ts, sym),
             )
-        self.con.commit()
+        self._db_commit()
 
     async def _meta_and_settlement_loop(self, client: httpx.AsyncClient) -> None:
         last_settle_scan = 0.0
         while not self._stop.is_set():
             now = time.time()
             cur_t = (int(now) // 300) * 300
-            changed = any([await self._refresh_symbol_meta(client, sym, cur_t, now - cur_t) for sym in SYMBOLS])
+            changed = [sym for sym in SYMBOLS if await self._refresh_symbol_meta(client, sym, cur_t, now - cur_t)]
             if changed:
                 keep = {tok for st in self.states.values() for tok in (st.up_token, st.down_token) if tok}
                 self.token_to_meta = {k: v for k, v in self.token_to_meta.items() if k in keep}
-                self._clob_resub.set()
+                for sym in changed:
+                    self._trigger_clob_resub(sym)
             if now - last_settle_scan >= 20.0:
                 last_settle_scan = now
                 await self._settle_pending_windows(client, cur_t)
@@ -643,7 +736,7 @@ class LiveRecorder42:
         return round(a_ms, 2), last_lag_ms, round(a_ms / 1000.0, 3)
 
     def _roll_window_if_needed(self, cur_t: int) -> None:
-        changed = False
+        changed: List[str] = []
         for sym, st in self.states.items():
             if st.window_ts == cur_t:
                 continue
@@ -652,11 +745,12 @@ class LiveRecorder42:
             if pre:
                 st.condition_id, st.up_token, st.down_token = pre["condition_id"], pre["up_token"], pre["down_token"]
                 self.token_to_meta[st.up_token], self.token_to_meta[st.down_token] = (sym, "UP"), (sym, "DOWN")
-            changed = True
+            changed.append(sym)
         if changed:
             keep = {tok for st in self.states.values() for tok in (st.up_token, st.down_token) if tok}
             self.token_to_meta = {k: v for k, v in self.token_to_meta.items() if k in keep}
-            self._clob_resub.set()
+            for sym in changed:
+                self._trigger_clob_resub(sym)
 
     def _record_second(self, ts_sec: int) -> None:
         cur_t, elapsed = (ts_sec // 300) * 300, ts_sec % 300
@@ -682,19 +776,19 @@ class LiveRecorder42:
             self._insert_snapshot_row(ts_sec, cur_t, elapsed, sym, st, (cl_spot, cl_twap, tw_age, sp_age, bn_age, up_age, dn_age, ms_metrics, bn_flush))
             dec, ages = self._eval_live_symbol(ts_sec, cur_t, sym, st, (cl_spot, cl_twap, tw_age, sp_age, bn_age, up_age, dn_age, tw_s, bn_flush))
             if dec.action == "ENTER":
-                self.con.execute(
+                self._db_exec(
                     "INSERT OR IGNORE INTO signal_enters_42 (ts_sec,window_ts,symbol,model_name,side,z,p_model,sigma,ask_top,cl_twap_age_sec,cl_spot_age_sec,bn_age_sec,book_age_sec) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (ts_sec, cur_t, sym, "v2_filtered", dec.side, dec.z, dec.p_model, dec.sigma, dec.ask_top, ages["cl_twap"], ages["cl_spot"], ages["bn"], ages["book"]),
                 )
             elif 150 <= elapsed <= 255:
                 skips_sec[dec.reason] = skips_sec.get(dec.reason, 0) + 1
         for reason, cnt in skips_sec.items():
-            self.con.execute("INSERT OR REPLACE INTO signal_skips_42 VALUES (?,?,?,?,?)", (ts_sec, cur_t, "v2_filtered", reason, cnt))
+            self._db_exec("INSERT OR REPLACE INTO signal_skips_42 VALUES (?,?,?,?,?)", (ts_sec, cur_t, "v2_filtered", reason, cnt))
         if self._trade_buf:
-            self.con.executemany("INSERT INTO pm_trades_42(recv_ts_ms, window_ts, symbol, side, token_id, price, size) VALUES (?,?,?,?,?,?,?)", self._trade_buf)
+            self._db_many("INSERT INTO pm_trades_42(recv_ts_ms, window_ts, symbol, side, token_id, price, size) VALUES (?,?,?,?,?,?,?)", self._trade_buf)
             self._trade_buf.clear()
         if ts_sec % 5 == 0:
-            self.con.commit()
+            self._db_commit()
 
     def _upsert_window_row(self, cur_t: int, elapsed: int, sym: str, st: CoinState42, tw_s: Optional[float], sp_s: Optional[float]) -> None:
         same_w = st.window_ts == cur_t
@@ -702,7 +796,7 @@ class LiveRecorder42:
         cid_val = st.condition_id if same_w else ""
         up_tok = st.up_token if same_w else ""
         dn_tok = st.down_token if same_w else ""
-        self.con.execute(
+        self._db_exec(
             """
             INSERT INTO windows_42 (window_ts, symbol, slug, condition_id, up_token_id, down_token_id, twap_strike, spot_strike)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -720,7 +814,7 @@ class LiveRecorder42:
             prev_t = cur_t if elapsed >= 298 else (cur_t - 300)
             tw_c = self.chainlink.get_settlement_twap_at(sym, prev_t + 300)
             if tw_c is not None:
-                self.con.execute("UPDATE windows_42 SET twap_close = COALESCE(twap_close, ?) WHERE window_ts=? AND symbol=?", (tw_c, prev_t, sym))
+                self._db_exec("UPDATE windows_42 SET twap_close = COALESCE(twap_close, ?) WHERE window_ts=? AND symbol=?", (tw_c, prev_t, sym))
 
     def _insert_snapshot_row(self, ts_sec: int, cur_t: int, elapsed: int, sym: str, st: CoinState42, feed_vals: Tuple[Any, ...]) -> None:
         cl_spot, cl_twap, tw_age, sp_age, bn_age, up_age, dn_age, ms_metrics, bn_flush = feed_vals
@@ -729,7 +823,7 @@ class LiveRecorder42:
         d_b1 = st.dn_bids[0] if st.dn_bids else (None, None)
         d_a1 = st.dn_asks[0] if st.dn_asks else (None, None)
         b_vol, b_buy, b_sell, b_n = bn_flush
-        self.con.execute(
+        self._db_exec(
             """
             INSERT OR REPLACE INTO snapshots_1hz (
                 ts_sec, window_ts, symbol, elapsed_sec, cl_spot, cl_twap60, bn_close,
@@ -774,26 +868,41 @@ class LiveRecorder42:
         inp = MarketInputs(sym, cur_t, float(ts_sec), strike, cl_twap, cl_spot, tr.prices[-1] if tr.prices else px, tuple(tr.prices), st.up_asks, st.dn_asks, st.up_bids, st.dn_bids, ages, flow, cvd, gap, r240)
         return evaluate_signal(inp, TWAP_V2_FILTERED_CONFIG), ages
 
+    async def _tick_loop(self, duration_sec: int) -> None:
+        t_start = time.time()
+        while not self._stop.is_set():
+            t0 = time.time()
+            if duration_sec > 0 and (t0 - t_start) >= duration_sec:
+                break
+            self._record_second(int(t0))
+            await asyncio.sleep(max(0.05, float(int(t0)) + 1.05 - time.time()))
+
     async def run_record(self, duration_sec: int = 0) -> None:
         """Start read-only WebSocket & settlement loops and record 1Hz snapshots."""
         self.chainlink.start()
+        self.con.close()
+        self._db_writer = AsyncSQLiteWriter(self.db_path)
+        self._db_writer.start()
         limits = httpx.Limits(max_connections=20, max_keepalive_connections=20)
-        async with httpx.AsyncClient(limits=limits) as client:
-            tasks = [asyncio.create_task(fn) for fn in (self._binance_loop(), self._clob_ws_loop(), self._meta_and_settlement_loop(client))]
-            t_start = time.time()
-            try:
-                while not self._stop.is_set():
-                    t0 = time.time()
-                    if duration_sec > 0 and (t0 - t_start) >= duration_sec:
-                        break
-                    self._record_second(int(t0))
-                    await asyncio.sleep(max(0.05, float(int(t0)) + 1.05 - time.time()))
-            finally:
-                self._stop.set()
-                for t in tasks:
-                    t.cancel()
-                self.chainlink.stop()
-                self.con.commit()
+        try:
+            async with httpx.AsyncClient(limits=limits) as client, aiohttp.ClientSession(trust_env=False) as ws_sess:
+                tasks = [
+                    asyncio.create_task(self._binance_loop()),
+                    *(asyncio.create_task(self._clob_ws_symbol_loop(ws_sess, sym)) for sym in SYMBOLS),
+                    asyncio.create_task(self._meta_and_settlement_loop(client)),
+                ]
+                try:
+                    await self._tick_loop(duration_sec)
+                finally:
+                    self._stop.set()
+                    for t in tasks:
+                        t.cancel()
+        finally:
+            self.chainlink.stop()
+            if self._db_writer is not None:
+                self._db_writer.close()
+                self._db_writer = None
+            self.con = init_db(self.db_path)
 
 
 def _parse_levels_json(raw: Any, reverse: bool = False) -> List[Tuple[float, float]]:
@@ -1300,70 +1409,6 @@ def _count_warmup_episodes(secs: set[int]) -> Dict[str, Any]:
     return {"seconds": len(ordered), "hours": round(len(ordered) / 3600.0, 2), "restarts": restarts}
 
 
-def _compute_live_shadow_parity(con: sqlite3.Connection, shadow_path: pathlib.Path, count_start_ts: int) -> Dict[str, Any]:
-    rows_e = con.execute("SELECT ts_sec, window_ts, symbol, side, z, ask_top FROM signal_enters_42 WHERE model_name='v2_filtered' AND window_ts >= ?", (count_start_ts,)).fetchall()
-    rec_map: Dict[Tuple[int, str], Tuple[str, int, float, float]] = {}
-    for ts_s, wt, sym, side, z_v, ask_v in rows_e:
-        rec_map.setdefault((int(wt), str(sym)), (str(side), int(ts_s), float(z_v or 0.0), float(ask_v or 0.0)))
-    run_warm: set[Tuple[int, str]] = set()
-    run_map: Dict[Tuple[int, str], Tuple[str, int, float, float]] = {}
-    if shadow_path.exists():
-        for line in shadow_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            ev = json.loads(line)
-            wt = int(ev.get("window_ts") or 0)
-            sym = str(ev.get("symbol") or "")
-            if wt < count_start_ts or not sym:
-                continue
-            if ev.get("type") == "WARM_WINDOW":
-                run_warm.add((wt, sym))
-            elif ev.get("type") == "ENTER":
-                run_warm.add((wt, sym))
-                run_map.setdefault((wt, sym), (str(ev["side"]), int(ev["ts_sec"]), float(ev.get("z") or 0.0), float(ev.get("ask_top") or 0.0)))
-    cov_rows = con.execute("SELECT window_ts, symbol FROM snapshots_1hz WHERE window_ts >= ? AND elapsed_sec BETWEEN 150 AND 255 GROUP BY window_ts, symbol HAVING COUNT(*) >= 60", (count_start_ts,)).fetchall()
-    overlap = sorted({(int(wt), str(sym)) for wt, sym in cov_rows} & (run_warm | set(rec_map)))
-    return _aggregate_shadow_parity(overlap, rec_map, run_map)
-
-
-def _aggregate_shadow_parity(
-    overlap: List[Tuple[int, str]],
-    rec_map: Dict[Tuple[int, str], Tuple[str, int, float, float]],
-    run_map: Dict[Tuple[int, str], Tuple[str, int, float, float]],
-) -> Dict[str, Any]:
-    by_day: Dict[str, Dict[str, Any]] = {}
-    mismatches: List[Dict[str, Any]] = []
-    tot_u = tot_m = 0
-    for wt, sym in overlap:
-        day = datetime.fromtimestamp(wt, timezone.utc).strftime("%Y-%m-%d")
-        d = by_day.setdefault(day, {"utc_day": day, "overlap_coin_windows": 0, "recorder_enters": 0, "runner_enters": 0, "union": 0, "matched": 0})
-        d["overlap_coin_windows"] += 1
-        ra, rb = rec_map.get((wt, sym)), run_map.get((wt, sym))
-        if ra is not None:
-            d["recorder_enters"] += 1
-        if rb is not None:
-            d["runner_enters"] += 1
-        if ra is None and rb is None:
-            continue
-        d["union"] += 1
-        tot_u += 1
-        ok = bool(ra and rb and ra[0] == rb[0] and abs(ra[1] - rb[1]) <= 1 and abs(ra[2] - rb[2]) <= 0.02 and abs(ra[3] - rb[3]) <= 0.001)
-        if ok:
-            d["matched"] += 1
-            tot_m += 1
-        elif len(mismatches) < 20:
-            mismatches.append({"window_ts": wt, "symbol": sym, "recorder": ra, "runner": rb})
-    for d in by_day.values():
-        d["parity_rate"] = round(d["matched"] / d["union"], 4) if d["union"] else None
-    overall_rate = round(tot_m / tot_u, 4) if tot_u else None
-    return {
-        "by_day": [by_day[k] for k in sorted(by_day)],
-        "overlap_coin_windows": len(overlap), "union_enters": tot_u, "matched": tot_m,
-        "parity_rate": overall_rate, "gate_pass": (overall_rate >= 0.99) if overall_rate is not None else None,
-        "mismatches": mismatches,
-    }
-
-
 def _append_diagnostics_sections(lines: List[str], report: Dict[str, Any]) -> None:
     fm = report.get("freshness_ms") or {}
     lines += ["", f"## Feed Freshness & Upstream Lag in Milliseconds (`v2_filtered` Window 150–255s, scope=`{fm.get('scope', 'ms')}`)", "", "| Feed | Metric | Samples (Disc) | P50 (ms) | P90 (ms) | P99 (ms) | Max (ms) |", "|---|---|---:|---:|---:|---:|---:|"]
@@ -1441,12 +1486,9 @@ def _append_r1_and_shadow_tables(lines: List[str], report: Dict[str, Any]) -> No
             f"{st.get('missed_price', 0)} ({st.get('missed_price_pct', 0.0)}%) | {st.get('mean_pnl_1s')} | "
             f"{st.get('mean_pnl_hold')} | {st.get('sl_triggered', 0)} ({st.get('sl_was_wrong', 0)}) |"
         )
+    append_q3_diagnostics_md(lines, report.get("q3_diagnostics") or {})
     _append_twap_age_and_carry_tables(lines, report)
-    sh = report.get("live_shadow_parity") or {}
-    lines += ["", f"## Live Shadow Parity (`PAPER_40U` Runner vs 4.2 Recorder, overlap={sh.get('overlap_coin_windows', 0)}, overall={sh.get('parity_rate')})", "", "| UTC Day | Overlap Coin-Win | Recorder ENTER | Runner ENTER | Union | Matched | Parity | Gate (`>=99%`) |", "|---|---:|---:|---:|---:|---:|---:|---|"]
-    for d in sh.get("by_day") or []:
-        st_lbl = "PASS" if (d["parity_rate"] is not None and d["parity_rate"] >= 0.99) else ("FAIL" if d["parity_rate"] is not None else "PENDING")
-        lines.append(f"| `{d['utc_day']}` | {d['overlap_coin_windows']} | {d['recorder_enters']} | {d['runner_enters']} | {d['union']} | {d['matched']} | {d['parity_rate']} | **{st_lbl}** |")
+    append_shadow_parity_md(lines, report.get("live_shadow_parity") or {})
     r1 = report.get("r1_diagnostics") or {}
     lines += ["", f"## R1 TWAP Parity Mismatches (All: {r1.get('matched_all', 0)}/{r1.get('total_all', 0)}={r1.get('parity_all')} | Post-reset: {r1.get('matched_post_reset', 0)}/{r1.get('total_post_reset', 0)}={r1.get('parity_post_reset')})", "", "| Window TS | Symbol | Slug | Program `twap_strike` | Program `twap_close` | Gamma `priceToBeat` | Gamma `finalPrice` | Gamma Outcome | Pred |", "|---:|---|---|---:|---:|---:|---:|---|---|"]
     for m in r1.get("mismatches") or []:
@@ -1521,6 +1563,26 @@ def _freshness_stats(age_samples: Dict[str, List[float]]) -> Dict[str, Any]:
     return out
 
 
+def _run_highband_shadow(
+    frozen: dict[str, Any], ctx: Tuple[Dict[str, float], List[int], Dict[Tuple[int, str], Dict[int, Any]], Dict[Tuple[int, str], Any]],
+    out_dir: pathlib.Path, bounds: Tuple[int, int],
+) -> Dict[str, Any]:
+    fee_map, settled_ts, snap_by_wt_sym, w_meta = ctx
+    count_start_ts, primary_ts = bounds
+    raw_sh = {k: v for k, v in (frozen.get("shadow_config_v2_highband") or {}).items() if k != "_meta"}
+    sh_cfg = _cfg_from_dict(raw_sh) if raw_sh else TWAP_V2_HIGHBAND_SHADOW_CONFIG
+    df_sh, _, _, _ = _sim_one_cfg(sh_cfg, fee_map, settled_ts, snap_by_wt_sym, w_meta)
+    df_sh.to_csv(out_dir / "phase42_trades_1s_v2_highband_shadow.csv", index=False)
+    df_sh_reset = df_sh[df_sh["window_ts"] >= count_start_ts] if (len(df_sh) and count_start_ts > 0) else df_sh
+    return {
+        "v2_highband_shadow": {
+            "bonferroni_included": False,
+            "post_nov21": _summarize_model_trades(df_sh_reset[df_sh_reset["window_ts"] >= primary_ts] if len(df_sh_reset) else df_sh_reset),
+            "pre_nov21": _summarize_model_trades(df_sh_reset[df_sh_reset["window_ts"] < primary_ts] if len(df_sh_reset) else df_sh_reset),
+        }
+    }
+
+
 def analyze_recording(
     db_path: pathlib.Path = DEFAULT_DB, frozen_path: pathlib.Path = FROZEN_CFG_PATH,
     out_dir: pathlib.Path = ROOT, daily_report: bool = False,
@@ -1547,14 +1609,11 @@ def analyze_recording(
         "v2_filtered": _cfg_from_dict(frozen["sniper_config_v2_filtered"]) if "sniper_config_v2_filtered" in frozen else TWAP_V2_FILTERED_CONFIG,
         "v1": _cfg_from_dict(frozen["sniper_config"]),
     }
-    post_summaries: Dict[str, Any] = {}
-    pre_summaries: Dict[str, Any] = {}
-    combined: Dict[str, Any] = {}
+    post_summaries, pre_summaries, combined = {}, {}, {}
     v2_skips: Dict[str, int] = {}
     v2_ages: Dict[str, List[float]] = {}
     v2_warm_secs: set[int] = set()
-    v2_df_t = pd.DataFrame()
-    v2_df_reset = pd.DataFrame()
+    v2_df_t, v2_df_reset = pd.DataFrame(), pd.DataFrame()
     for lbl, cfg in models.items():
         df_t, skips_m, ages_m, warm_s = _sim_one_cfg(cfg, fee_map, settled_ts, snap_by_wt_sym, w_meta)
         df_t.to_csv(out_dir / f"phase42_trades_1s_{lbl}.csv", index=False)
@@ -1564,18 +1623,7 @@ def analyze_recording(
         pre_summaries[lbl] = _summarize_model_trades(df_reset[df_reset["window_ts"] < primary_ts] if len(df_reset) else df_reset)
         post_summaries[lbl] = _summarize_model_trades(df_reset[df_reset["window_ts"] >= primary_ts] if len(df_reset) else df_reset)
         combined[lbl] = _summarize_model_trades(df_t)
-    raw_sh = {k: v for k, v in (frozen.get("shadow_config_v2_highband") or {}).items() if k != "_meta"}
-    sh_cfg = _cfg_from_dict(raw_sh) if raw_sh else TWAP_V2_HIGHBAND_SHADOW_CONFIG
-    df_sh, _, _, _ = _sim_one_cfg(sh_cfg, fee_map, settled_ts, snap_by_wt_sym, w_meta)
-    df_sh.to_csv(out_dir / "phase42_trades_1s_v2_highband_shadow.csv", index=False)
-    df_sh_reset = df_sh[df_sh["window_ts"] >= count_start_ts] if (len(df_sh) and count_start_ts > 0) else df_sh
-    shadow_out = {
-        "v2_highband_shadow": {
-            "bonferroni_included": False,
-            "post_nov21": _summarize_model_trades(df_sh_reset[df_sh_reset["window_ts"] >= primary_ts] if len(df_sh_reset) else df_sh_reset),
-            "pre_nov21": _summarize_model_trades(df_sh_reset[df_sh_reset["window_ts"] < primary_ts] if len(df_sh_reset) else df_sh_reset),
-        }
-    }
+    shadow_out = _run_highband_shadow(frozen, (fee_map, settled_ts, snap_by_wt_sym, w_meta), out_dir, (count_start_ts, primary_ts))
     v2_post = post_summaries["v2_filtered"]
     report: Dict[str, Any] = {
         "windows_recorded": int(len(df_w)), "windows_settled": int(len(settled)),
@@ -1591,6 +1639,7 @@ def analyze_recording(
         "warmup_diag": {"all": _count_warmup_episodes(v2_warm_secs), "post_reset": _count_warmup_episodes({t for t in v2_warm_secs if t >= count_start_ts})},
         "live_shadow_parity": shadow_parity,
         "twap_age_pnl": {"post_reset": _summarize_twap_age_buckets(v2_df_reset), "all": _summarize_twap_age_buckets(v2_df_t)},
+        "q3_diagnostics": compute_q3_diagnostics(v2_df_t, df_s, count_start_ts),
         "binance_1s_audit": audit_recorder_vs_binance_1s(df_s, count_start_ts, kline_loader=kline_loader),
     }
     if daily_report:

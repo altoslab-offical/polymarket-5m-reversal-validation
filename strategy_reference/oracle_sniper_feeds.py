@@ -315,11 +315,13 @@ class SniperMarketHub:
             for s in SYMBOLS
         }
         self.prefetched: dict[tuple[str, int], dict[str, Any]] = {}
-        self.stats: dict[str, Any] = {"binance_ws": False, "coinbase_ws": False, "clob_ws": False}
+        self.stats: dict[str, Any] = {"binance_ws": False, "coinbase_ws": False, "clob_ws": False, "clob_1013_count": 0}
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
         self._meta_tasks: set[asyncio.Task[None]] = set()
         self._session: Optional[aiohttp.ClientSession] = None
+        self._ws_session: Optional[aiohttp.ClientSession] = None
+        self._active_clob_ws: dict[str, Any] = {}
 
     def mono_ms(self) -> float:
         """Current monotonic clock in milliseconds (lockstep with injected test clock if custom)."""
@@ -333,11 +335,15 @@ class SniperMarketHub:
         if self._tasks and not all(t.done() for t in self._tasks):
             return
         self._stop.clear()
-        loops = (self._binance_ws_loop, self._coinbase_ws_loop, self._clob_ws_loop, self._rest_fallback_loop)
-        self._tasks = [asyncio.create_task(fn()) for fn in loops]
+        self._tasks = [
+            asyncio.create_task(self._binance_ws_loop()),
+            asyncio.create_task(self._coinbase_ws_loop()),
+            asyncio.create_task(self._rest_fallback_loop()),
+            *(asyncio.create_task(self._clob_ws_symbol_loop(sym)) for sym in SYMBOLS),
+        ]
 
     async def stop(self) -> None:
-        """Cancel feed tasks and close the HTTP session."""
+        """Cancel feed tasks and close HTTP/WS sessions."""
         self._stop.set()
         for t in self._tasks:
             t.cancel()
@@ -345,6 +351,9 @@ class SniperMarketHub:
         if self._session is not None:
             await self._session.close()
             self._session = None
+        if self._ws_session is not None:
+            await self._ws_session.close()
+            self._ws_session = None
 
     def _http(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -352,6 +361,11 @@ class SniperMarketHub:
                 timeout=aiohttp.ClientTimeout(total=3.0), headers={"Accept": "application/json"}, trust_env=False
             )
         return self._session
+
+    def _ws_http(self) -> aiohttp.ClientSession:
+        if self._ws_session is None or self._ws_session.closed:
+            self._ws_session = aiohttp.ClientSession(trust_env=False)
+        return self._ws_session
 
     # ----- window metadata -----
     def roll_window(self, now: float) -> int:
@@ -364,6 +378,9 @@ class SniperMarketHub:
             pre = self.prefetched.pop((sym, window_ts), None)
             if pre:
                 st.apply_market(pre)
+            ws = self._active_clob_ws.get(sym)
+            if ws is not None and not ws.closed:
+                asyncio.create_task(ws.close())
         for key in [k for k in self.prefetched if k[1] < window_ts]:
             self.prefetched.pop(key, None)
         return window_ts
@@ -438,7 +455,9 @@ class SniperMarketHub:
     async def _binance_ws_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                async with websockets.connect(BINANCE_WS_URL, ping_interval=15, ping_timeout=10, open_timeout=8) as ws:
+                async with websockets.connect(
+                    BINANCE_WS_URL, ping_interval=15, ping_timeout=10, open_timeout=8, compression=None, max_queue=4096
+                ) as ws:
                     self.stats["binance_ws"] = True
                     while not self._stop.is_set():
                         self._on_binance_message(json.loads(await asyncio.wait_for(ws.recv(), timeout=8.0)))
@@ -567,26 +586,85 @@ class SniperMarketHub:
                 bid, ask = None, None
             self._set_side_book(st, side, bid, ask, ev_ts, via_ws=via_ws)
 
-    async def _clob_ws_loop(self) -> None:
+    def _process_clob_payload(
+        self, raw: str, tokens: dict[str, tuple[str, str]], stale_since: float
+    ) -> tuple[bool, float]:
+        if not raw or raw in ("PING", "PONG"):
+            return True, stale_since
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            return True, stale_since
+        for ev in payload if isinstance(payload, list) else [payload]:
+            if not isinstance(ev, dict):
+                continue
+            ev_type = str(ev.get("event_type") or "")
+            fresh, stale_since = self._check_clob_ev_fresh(ev_type, ev, stale_since)
+            if not fresh:
+                if (self._clock() - stale_since) >= 1.5:
+                    return False, stale_since
+                continue
+            if ev_type == "book":
+                mapped = tokens.get(str(ev.get("asset_id")))
+                if mapped:
+                    self.apply_book(mapped[0], mapped[1], ev, via_ws=True)
+            elif ev_type == "price_change":
+                self.apply_price_change(ev, tokens, via_ws=True)
+        return True, stale_since
+
+    async def _drain_clob_symbol_ws(
+        self, ws: Any, tokens: dict[str, tuple[str, str]], subscribed_window: int
+    ) -> None:
+        stale_since = 0.0
+        async for msg in ws:
+            if self._stop.is_set() or (int(self._clock()) // 300) * 300 != subscribed_window:
+                break
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    break
+                continue
+            keep_going, stale_since = self._process_clob_payload(msg.data, tokens, stale_since)
+            if not keep_going:
+                break
+
+    async def _pump_clob_symbol(self, sym: str, tokens: dict[str, tuple[str, str]], subscribed_window: int) -> Optional[int]:
+        ws_tmo = aiohttp.ClientWSTimeout(ws_receive=15.0, ws_close=5.0)
+        async with self._ws_http().ws_connect(
+            POLY_CLOB_WS_URL, heartbeat=15.0, compress=0, max_msg_size=0, autoping=True, timeout=ws_tmo
+        ) as ws:
+            self._active_clob_ws[sym] = ws
+            self.stats["clob_ws"] = True
+            try:
+                await ws.send_str(json.dumps({"assets_ids": list(tokens), "type": "market"}))
+                await self._drain_clob_symbol_ws(ws, tokens, subscribed_window)
+            finally:
+                self._active_clob_ws.pop(sym, None)
+                self.stats["clob_ws"] = bool(self._active_clob_ws)
+            return ws.close_code
+
+    async def _clob_ws_symbol_loop(self, sym: str) -> None:
         while not self._stop.is_set():
-            tokens = self._token_map()
-            if not tokens:
+            st = self.states[sym]
+            if not (st.up_token and st.down_token):
                 await asyncio.sleep(0.5)
                 continue
+            tokens = {st.up_token: (sym, "UP"), st.down_token: (sym, "DOWN")}
             subscribed_window = (int(self._clock()) // 300) * 300
             try:
-                async with websockets.connect(
-                    POLY_CLOB_WS_URL, ping_interval=15, ping_timeout=10, open_timeout=8, max_queue=64
-                ) as ws:
-                    await ws.send(json.dumps({"assets_ids": list(tokens), "type": "market"}))
-                    self.stats["clob_ws"] = True
-                    await self._clob_ws_pump(ws, tokens, subscribed_window)
+                code = await self._pump_clob_symbol(sym, tokens, subscribed_window)
+                if code == 1013:
+                    self.stats["clob_1013_count"] = int(self.stats.get("clob_1013_count", 0)) + 1
+                if not self._stop.is_set() and (int(self._clock()) // 300) * 300 == subscribed_window:
+                    self.stats["clob_reconnects"] = int(self.stats.get("clob_reconnects", 0)) + 1
+                    await asyncio.sleep(1.0)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001 - reconnect on any transport error
-                self.stats["clob_ws"] = False
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
+                self.stats["clob_ws"] = bool(self._active_clob_ws)
+                if "1013" in str(exc):
+                    self.stats["clob_1013_count"] = int(self.stats.get("clob_1013_count", 0)) + 1
                 self.stats["clob_reconnects"] = int(self.stats.get("clob_reconnects", 0)) + 1
-                self.stats["clob_error"] = f"{type(exc).__name__}: {exc}"
+                self.stats["clob_error"] = f"{sym}: {type(exc).__name__}: {exc}"
                 await asyncio.sleep(1.5)
 
     def _check_clob_ev_fresh(self, ev_type: str, ev: dict[str, Any], stale_since: float) -> tuple[bool, float]:
@@ -597,39 +675,6 @@ class SniperMarketHub:
         if ev_ts > 0.0 and (now - ev_ts) > 2.5:
             return False, stale_since or now
         return True, 0.0
-
-    async def _clob_ws_pump(self, ws: Any, tokens: dict[str, tuple[str, str]], subscribed_window: int) -> None:
-        last_msg = self._clock()
-        stale_since = 0.0
-        while not self._stop.is_set() and (int(self._clock()) // 300) * 300 == subscribed_window:
-            if self._clock() - last_msg >= 12.0 or len(self._token_map()) != len(tokens):
-                return
-            try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue
-            last_msg = self._clock()
-            if not raw or raw in ("PING", "PONG"):
-                continue
-            try:
-                payload = json.loads(raw)
-            except ValueError:
-                continue
-            for ev in payload if isinstance(payload, list) else [payload]:
-                if not isinstance(ev, dict):
-                    continue
-                ev_type = str(ev.get("event_type") or "")
-                fresh, stale_since = self._check_clob_ev_fresh(ev_type, ev, stale_since)
-                if not fresh:
-                    if (self._clock() - stale_since) >= 1.5:
-                        return
-                    continue
-                if ev_type == "book":
-                    mapped = tokens.get(str(ev.get("asset_id")))
-                    if mapped:
-                        self.apply_book(mapped[0], mapped[1], ev, via_ws=True)
-                elif ev_type == "price_change":
-                    self.apply_price_change(ev, tokens, via_ws=True)
 
     async def _fetch_book(self, sym: str, side: str, token: str) -> None:
         try:

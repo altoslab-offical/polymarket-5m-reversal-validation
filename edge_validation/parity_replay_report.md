@@ -1,29 +1,29 @@
 # Path A (Recorder) vs Path B (Runner) Full Per-Second & ENTER Parity Report
 
-- Database rows replayed: `201732` across `67244` 1Hz ticks
-- Per-second full-decision parity (`action`, `reason`, `|dz|<=0.02`, `|dask|<=0.001`): `201527` / `201732` (**`99.8984%`** | gate `>= 99.5%`: **PASS**)
-- Per-second `ENTER` union: `155` / `155` (**`100.00%`**)
-- Coin-window signal union (`ENTER`): `38` / `38` (**`100.00%`** | sample gate `>= 100`: **PENDING (38/100)**)
-- Single-slot window union (`ENTER`): `32` / `32` (**`100.00%`**)
-- Parity gate (`per_sec >= 99.5%` & `ENTER >= 99.0%`): **PASS** (Overall ENTER sample gate: **PENDING (38/100)**)
+- Database rows replayed: `260433` across `86811` 1Hz ticks
+- Per-second full-decision parity (`action`, `reason`, `|dz|<=0.02`, `|dask|<=0.001`): `260225` / `260433` (**`99.9201%`** | gate `>= 99.5%`: **PASS**)
+- Per-second `ENTER` union: `158` / `158` (**`100.00%`**)
+- Coin-window signal union (`ENTER`): `41` / `41` (**`100.00%`** | sample gate `>= 100`: **PENDING (41/100)**)
+- Single-slot window union (`ENTER`): `35` / `35` (**`100.00%`**)
+- Parity gate (`per_sec >= 99.5%` & `ENTER >= 99.0%`): **PASS** (Overall ENTER sample gate: **PENDING (41/100)**)
 
 ## Per-Decision Group Agreement (`Path A Recorder` Baseline)
 
 | Decision Group (`Action:Reason`) | Rows | Matched | Agreement |
 |---|---:|---:|---:|
-| `SKIP:OUTSIDE_ENTRY_WINDOW` | 88484 | 88352 | 99.8508% |
-| `SKIP:WARMUP` | 59259 | 59259 | 100.0000% |
-| `SKIP:Z_LOW` | 23312 | 23312 | 100.0000% |
-| `SKIP:FLOW_BLOCKED` | 10715 | 10685 | 99.7200% |
-| `SKIP:ASK_OUT_OF_BAND` | 8102 | 8102 | 100.0000% |
-| `SKIP:NO_BOOK` | 6772 | 6731 | 99.3946% |
+| `SKIP:OUTSIDE_ENTRY_WINDOW` | 118431 | 118296 | 99.8860% |
+| `SKIP:WARMUP` | 67338 | 67338 | 100.0000% |
+| `SKIP:Z_LOW` | 31056 | 31056 | 100.0000% |
+| `SKIP:FLOW_BLOCKED` | 14568 | 14538 | 99.7941% |
+| `SKIP:ASK_OUT_OF_BAND` | 10667 | 10667 | 100.0000% |
+| `SKIP:NO_BOOK` | 8991 | 8950 | 99.5440% |
+| `SKIP:NO_STRIKE` | 4133 | 4131 | 99.9516% |
 | `SKIP:STALE_BN` | 1931 | 1931 | 100.0000% |
-| `SKIP:NO_STRIKE` | 1564 | 1562 | 99.8721% |
-| `SKIP:STALE_CL_TWAP` | 1135 | 1135 | 100.0000% |
-| `SKIP:STALE_BOOK` | 221 | 221 | 100.0000% |
-| `ENTER:OK` | 155 | 155 | 100.0000% |
+| `SKIP:STALE_CL_TWAP` | 1637 | 1637 | 100.0000% |
+| `SKIP:STALE_BOOK` | 1431 | 1431 | 100.0000% |
+| `ENTER:OK` | 158 | 158 | 100.0000% |
 | `SKIP:DIVERGENCE_HIGH` | 48 | 48 | 100.0000% |
-| `SKIP:STALE_CL_SPOT` | 32 | 32 | 100.0000% |
+| `SKIP:STALE_CL_SPOT` | 42 | 42 | 100.0000% |
 | `SKIP:SPREAD_WIDE` | 2 | 2 | 100.0000% |
 
 ## Discrepancies

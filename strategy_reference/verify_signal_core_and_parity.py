@@ -18,6 +18,7 @@ import pandas as pd
 from edge_validation.binance_1s_audit import audit_recorder_vs_binance_1s, normalize_open_ts_sec, parse_binance_1s_csv_bytes
 from edge_validation.live_recorder_42 import LiveRecorder42, _aggregate_shadow_parity, _sim_one_cfg, analyze_recording, init_db
 from edge_validation.parity_replay import _make_replay_runner, run_parity_replay
+from edge_validation.sqlite_writer import AsyncSQLiteWriter, query_pending_windows
 from engine.chainlink_oracle import ChainlinkRTDSFeed
 from engine.oracle_sniper import TWAP_V2_FILTERED_CONFIG, OrderBookTop, estimate_twap_fair_value, taker_fee_per_share
 from engine.oracle_sniper_feeds import SniperMarketHub
@@ -334,11 +335,25 @@ def check_9_live_shadow_parity_and_reports(tmp: Path) -> int:
     z_sh = float(decs_sh["BTCUSDT"].z or 0.0)
     assert sh_p.exists() and '"type": "ENTER"' in sh_p.read_text(encoding="utf-8")
 
-    # Verify aggregate parity matcher on matching vs mismatched shadow days
-    good = _aggregate_shadow_parity([(w, "BTCUSDT")], {(w, "BTCUSDT"): ("UP", int(wall_r[0]), 2.0, 0.74)}, {(w, "BTCUSDT"): ("UP", int(wall_r[0]) + 1, 2.01, 0.74)})
-    bad = _aggregate_shadow_parity([(w, "BTCUSDT")], {(w, "BTCUSDT"): ("UP", int(wall_r[0]), 2.0, 0.74)}, {(w, "BTCUSDT"): ("DOWN", int(wall_r[0]), 2.0, 0.74)})
-    assert good["parity_rate"] == 1.0 and good["gate_pass"] is True
-    assert bad["parity_rate"] == 0.0 and bad["gate_pass"] is False
+    # Verify Q2 two-metric parity matcher (±2s, >=95%, |Δask|/|Δz| P50/P90, mismatch causes, n>=20 readiness)
+    good = _aggregate_shadow_parity(
+        [(w, "BTCUSDT")],
+        {(w, "BTCUSDT"): ("UP", int(wall_r[0]), 2.0, 0.74)},
+        {(w, "BTCUSDT"): ("UP", int(wall_r[0]) + 2, 2.08, 0.76)},
+    )
+    bad = _aggregate_shadow_parity(
+        [(w, "BTCUSDT"), (w + 300, "ETHUSDT")],
+        {(w, "BTCUSDT"): ("UP", int(wall_r[0]), 2.0, 0.74)},
+        {(w, "BTCUSDT"): ("DOWN", int(wall_r[0]), 2.0, 0.74), (w + 300, "ETHUSDT"): ("UP", int(wall_r[0]) + 300, 1.5, 0.80)},
+        {(w + 300, "ETHUSDT"): {"rec_book_lag_ms": 2200.0, "rec_book_age_sec": 0.1, "skip_reason": "ASK_OUT_OF_BAND"}},
+    )
+    assert good["parity_rate"] == 1.0 and good["gate_pass"] is True and good["gate_ready"] is False and good["gate_status"] == "PENDING (<20)"
+    assert abs((good["delta_ask_p50"] or 0.0) - 0.02) < 1e-6 and abs((good["delta_z_p90"] or 0.0) - 0.08) < 1e-6
+    assert bad["parity_rate"] == 0.0 and bad["gate_pass"] is False and bad["mismatch_counts"]["CLOB_STALL"] == 1
+    ov20 = [(w + 300 * i, "BTCUSDT") for i in range(20)]
+    m20 = {(w + 300 * i, "BTCUSDT"): ("UP", int(wall_r[0]) + 300 * i, 1.8, 0.75) for i in range(20)}
+    ready20 = _aggregate_shadow_parity(ov20, m20, m20)
+    assert ready20["gate_ready"] is True and ready20["gate_status"] == "PASS"
 
     # End-to-end analyze_recording check on synthetic DB + frozen.json + shadow JSONL
     db_p = tmp / "shadow42.db"
@@ -360,8 +375,10 @@ def check_9_live_shadow_parity_and_reports(tmp: Path) -> int:
     assert rep["live_shadow_parity"]["matched"] == 1 and rep["live_shadow_parity"]["parity_rate"] == 1.0
     assert len(rep["r1_diagnostics"]["mismatches"]) == 1
     assert abs(rep["freshness_ms"]["age_ms"]["cl_spot"]["p50"] - 400.0) < 1e-3
+    assert "q3_diagnostics" in rep and set(rep["q3_diagnostics"]["all"]["by_coin"]) == {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
     md = (tmp / "phase42_daily_report.md").read_text(encoding="utf-8")
     assert "P99 (ms)" in md and "Live Shadow Parity" in md and "R1 TWAP Parity Mismatches" in md
+    assert "Q3 Read-Only Diagnostic Breakdowns" in md and "Pre-Entry 3s Binance Direction" in md and "EV / Stake %" in md
     return 1
 
 
@@ -513,8 +530,18 @@ def check_15_clob_sustained_stale_forces_resub_and_roll_sync(tmp: Path) -> int:
         assert rec._clob_resub.is_set()
         rec._record_second(w0 + 300)
         assert st.window_ts == w0 + 300 and st.up_asks == [] and st.up_recv_mono_ms == 0.0 and "UP-OLD" not in rec.token_to_meta
+        assert rec._clob_resub_by_sym["BTCUSDT"].is_set()
     finally:
         rec.con.close()
+
+    w_db = tmp / "async_writer.db"
+    init_db(w_db).close()
+    writer = AsyncSQLiteWriter(w_db)
+    writer.start()
+    writer.execute("INSERT INTO windows_42 (window_ts, symbol, slug) VALUES (?,?,?)", (1795050000, "BTCUSDT", "btc-updown-5m-1795050000"))
+    writer.commit()
+    writer.close()
+    assert writer.writes_failed == 0 and query_pending_windows(w_db, 1795050300) == [(1795050000, "BTCUSDT")]
     return 1
 
 

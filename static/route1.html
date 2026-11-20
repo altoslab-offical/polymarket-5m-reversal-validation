@@ -1,0 +1,978 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Route 1 // 氣象雙引擎 × 隱形專家模擬監控</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg-canvas: oklch(0.16 0.012 248);
+      --bg-surface: oklch(0.20 0.014 248);
+      --bg-elevated: oklch(0.24 0.016 248);
+      --bg-glass: oklch(0.18 0.014 248 / 0.84);
+      --hairline: rgba(255, 255, 255, 0.09);
+      --hairline-strong: rgba(255, 255, 255, 0.16);
+      --text-primary: oklch(0.96 0.008 245);
+      --text-secondary: oklch(0.88 0.012 245);
+      --text-muted: oklch(0.79 0.014 245);
+      --accent-emerald: oklch(0.82 0.14 158);
+      --accent-emerald-bg: oklch(0.32 0.06 158);
+      --accent-amber: oklch(0.84 0.12 78);
+      --accent-amber-bg: oklch(0.33 0.06 78);
+      --accent-coral: oklch(0.76 0.14 22);
+      --accent-coral-bg: oklch(0.31 0.07 22);
+      --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Noto Sans TC", sans-serif;
+      --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      --space-1: 4px;
+      --space-2: 8px;
+      --space-3: 12px;
+      --space-4: 16px;
+      --space-5: 20px;
+      --radius-md: 10px;
+      --radius-sm: 6px;
+      --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: var(--bg-canvas);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      font-size: 14px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 40;
+      background: var(--bg-glass);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      border-bottom: 1px solid var(--hairline);
+    }
+
+    .topbar-inner {
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 12px 20px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .brand-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+      flex-wrap: wrap;
+    }
+
+    .brand-title {
+      margin: 0;
+      font-size: clamp(15px, 1.4vw, 17px);
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      color: var(--text-primary);
+    }
+
+    .badge-paper {
+      display: inline-flex;
+      align-items: center;
+      padding: 3px 9px;
+      border-radius: 999px;
+      background: var(--accent-emerald-bg);
+      border: 1px solid var(--accent-emerald);
+      color: var(--accent-emerald);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
+    .nav-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .tab-group {
+      display: inline-flex;
+      background: var(--bg-surface);
+      border: 1px solid var(--hairline);
+      border-radius: var(--radius-sm);
+      padding: 2px;
+      gap: 2px;
+    }
+
+    button {
+      font-family: inherit;
+      cursor: pointer;
+      border: 1px solid transparent;
+      border-radius: var(--radius-sm);
+      min-height: 36px;
+      padding: 6px 12px;
+      font-size: 13px;
+      font-weight: 500;
+      background: transparent;
+      color: var(--text-secondary);
+      transition: background-color 140ms var(--ease-out), color 140ms var(--ease-out), transform 120ms var(--ease-out);
+    }
+
+    button:hover { background: var(--bg-elevated); color: var(--text-primary); }
+    button:active { transform: scale(0.97); }
+    button:focus-visible { outline: 2px solid var(--accent-emerald); outline-offset: 2px; }
+
+    .tab-btn[aria-selected="true"] {
+      background: var(--bg-elevated);
+      color: var(--text-primary);
+      border-color: var(--hairline-strong);
+    }
+
+    .action-btn {
+      background: var(--bg-surface);
+      border-color: var(--hairline-strong);
+      color: var(--text-primary);
+    }
+
+    .action-btn-primary {
+      background: var(--accent-emerald-bg);
+      border-color: var(--accent-emerald);
+      color: var(--accent-emerald);
+    }
+
+    .action-btn-danger {
+      background: var(--accent-coral-bg);
+      border-color: var(--accent-coral);
+      color: var(--accent-coral);
+    }
+
+    main {
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    .telemetry-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .kpi-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--hairline);
+      border-radius: var(--radius-md);
+      padding: 14px 16px;
+      min-width: 0;
+    }
+
+    .kpi-label {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+
+    .kpi-value {
+      font-family: var(--font-mono);
+      font-size: clamp(20px, 2vw, 24px);
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+      color: var(--text-primary);
+      line-height: 1.2;
+    }
+
+    .kpi-sub {
+      margin-top: 6px;
+      font-size: 12px;
+      color: var(--text-secondary);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .panel {
+      background: var(--bg-surface);
+      border: 1px solid var(--hairline);
+      border-radius: var(--radius-md);
+      padding: 16px;
+      min-width: 0;
+    }
+
+    .panel-head {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .panel-title {
+      margin: 0;
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+    }
+
+    .filter-pill {
+      min-height: 32px;
+      padding: 4px 11px;
+      font-size: 12px;
+      border: 1px solid var(--hairline);
+      background: var(--bg-canvas);
+      color: var(--text-secondary);
+    }
+
+    .filter-pill[aria-pressed="true"] {
+      background: var(--bg-elevated);
+      border-color: var(--accent-emerald);
+      color: var(--accent-emerald);
+    }
+
+    .status-banner {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px 12px;
+      padding: 10px 14px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--hairline);
+      background: var(--bg-elevated);
+      color: var(--text-secondary);
+      font-size: 13px;
+    }
+
+    #status-time {
+      flex-shrink: 0;
+      white-space: nowrap;
+      color: var(--text-muted);
+    }
+
+    .status-banner[data-tone="error"] {
+      border-color: var(--accent-coral);
+      background: var(--accent-coral-bg);
+      color: var(--accent-coral);
+    }
+
+    .table-wrap {
+      width: 100%;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 13px;
+    }
+
+    th {
+      padding: 10px 12px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--hairline-strong);
+      white-space: nowrap;
+    }
+
+    td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--hairline);
+      color: var(--text-secondary);
+      font-variant-numeric: tabular-nums;
+      vertical-align: middle;
+    }
+
+    tbody tr:hover { background: oklch(0.22 0.015 248); }
+
+    .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+    .pos { color: var(--accent-emerald); font-weight: 600; }
+    .warn { color: var(--accent-amber); font-weight: 600; }
+    .neg { color: var(--accent-coral); font-weight: 600; }
+
+    .tag {
+      display: inline-block;
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-family: var(--font-mono);
+      border: 1px solid var(--hairline-strong);
+      color: var(--text-secondary);
+      background: var(--bg-canvas);
+      white-space: nowrap;
+    }
+
+    .tag-emerald { border-color: var(--accent-emerald); color: var(--accent-emerald); background: var(--accent-emerald-bg); }
+    .tag-amber { border-color: var(--accent-amber); color: var(--accent-amber); background: var(--accent-amber-bg); }
+    .tag-coral { border-color: var(--accent-coral); color: var(--accent-coral); background: var(--accent-coral-bg); }
+
+    .split-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .empty-box {
+      padding: 28px 16px;
+      text-align: center;
+      color: var(--text-muted);
+      border: 1px dashed var(--hairline-strong);
+      border-radius: var(--radius-sm);
+      font-size: 13px;
+    }
+
+    .attr-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .attr-box {
+      background: var(--bg-canvas);
+      border: 1px solid var(--hairline);
+      border-radius: var(--radius-sm);
+      padding: 10px 12px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      border: 0;
+    }
+
+    .hidden { display: none !important; }
+
+    @media (max-width: 960px) {
+      .telemetry-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .split-grid { grid-template-columns: minmax(0, 1fr); }
+      .attr-grid { grid-template-columns: minmax(0, 1fr); }
+    }
+
+    @media (max-width: 600px) {
+      .topbar-inner { padding: 10px 12px; }
+      main { padding: 12px; }
+      .telemetry-grid { grid-template-columns: minmax(0, 1fr); }
+      .kpi-value { font-size: 20px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        transition-duration: 0.01ms !important;
+        animation-duration: 0.01ms !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand-row">
+        <h1 class="brand-title">Route 1 // 氣象雙引擎 × 隱形專家模擬監控</h1>
+        <span class="badge-paper" id="badge-mode">PAPER $40U</span>
+        <span class="tag" id="badge-sync">待機中</span>
+      </div>
+      <nav class="nav-actions" aria-label="主導覽與操作">
+        <div class="tab-group" role="tablist" aria-label="視圖切換">
+          <button type="button" role="tab" class="tab-btn" id="tab-weather" data-switch-state="weather" aria-selected="true">氣象掃描 (1)</button>
+          <button type="button" role="tab" class="tab-btn" id="tab-ledger" data-switch-state="ledger" aria-selected="false">模擬帳本 (2)</button>
+          <button type="button" role="tab" class="tab-btn" id="tab-experts" data-switch-state="experts" aria-selected="false">八領域專家 (3)</button>
+        </div>
+        <button type="button" class="action-btn action-btn-primary" id="btn-scan-weather">立即掃描氣象</button>
+        <button type="button" class="action-btn" id="btn-scan-experts">掃描八領域專家</button>
+      </nav>
+    </div>
+  </header>
+
+  <main id="app-main" data-state="ready" data-view="weather">
+    <div class="status-banner" id="status-banner" data-tone="neutral">
+      <span id="status-text">已啟用純模擬監控隔離模式（PAPER_ONLY），絕不觸發實盤下單。</span>
+      <span class="num" id="status-time">--</span>
+    </div>
+
+    <section class="telemetry-grid" aria-label="核心模擬資金遙測">
+      <article class="kpi-card">
+        <div class="kpi-label">模擬總權益 (初始 $40.00U)</div>
+        <div class="kpi-value" id="kpi-equity">$40.00</div>
+        <div class="kpi-sub" id="kpi-cash">可用現金 $40.00 · 已部署 $0.00</div>
+      </article>
+      <article class="kpi-card">
+        <div class="kpi-label">累計損益與勝率</div>
+        <div class="kpi-value" id="kpi-pnl">+$0.00</div>
+        <div class="kpi-sub" id="kpi-wr">0W - 0L (待結算)</div>
+      </article>
+      <article class="kpi-card">
+        <div class="kpi-label">進行中事件倉位 (上限 6 城)</div>
+        <div class="kpi-value" id="kpi-open">0 / 6</div>
+        <div class="kpi-sub" id="kpi-cities">今日掃描城市：0 城</div>
+      </article>
+      <article class="kpi-card">
+        <div class="kpi-label">模型 vs 市場校準度 (Brier ↓越準)</div>
+        <div class="kpi-value" id="kpi-brier">--</div>
+        <div class="kpi-sub" id="kpi-experts-cnt">隱形專家 0 · 擁擠網紅 0</div>
+      </article>
+    </section>
+
+    <section class="panel" id="view-weather" aria-labelledby="heading-weather">
+      <div class="panel-head">
+        <h2 class="panel-title" id="heading-weather">每日氣溫雙引擎即時評估（Open-Meteo 集合 × METAR/HKO 實測）</h2>
+        <div class="pill-row" role="group" aria-label="機會篩選">
+          <button type="button" class="filter-pill" data-filter="all" aria-pressed="true">全部城市</button>
+          <button type="button" class="filter-pill" data-filter="edge" aria-pressed="false">具正 EV 訊號</button>
+          <button type="button" class="filter-pill" data-filter="nowcast" aria-pressed="false">實測鎖定 Nowcast</button>
+          <button type="button" class="filter-pill" data-filter="expert" aria-pressed="false">隱形專家共振</button>
+        </div>
+      </div>
+
+      <h3 class="panel-title" style="margin: 2px 0 10px;">正期望值錯價訊號</h3>
+      <div class="table-wrap" id="opp-table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>城市 / 觀測日</th>
+              <th>區間 / 方向</th>
+              <th>模型勝率</th>
+              <th>實盤買價 + 費率</th>
+              <th>淨 EV</th>
+              <th>模擬下單</th>
+              <th>專家對齊</th>
+              <th>實測最高溫</th>
+              <th>歸因標籤</th>
+            </tr>
+          </thead>
+          <tbody id="opp-tbody"></tbody>
+        </table>
+      </div>
+      <div class="empty-box hidden" id="opp-empty">目前掃描條件下尚無達標（EV >= 4.0¢~6.0¢）的氣象錯價候選，請查看下方全城市模型監控摘要或稍後自動重掃。</div>
+
+      <div class="panel-head" style="margin-top: 20px;">
+        <h3 class="panel-title">全城市氣象模型監控覆蓋（Ensemble + METAR）</h3>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>城市</th>
+              <th>觀測日</th>
+              <th>測站 / 時區</th>
+              <th>流動性</th>
+              <th>當日實測最高</th>
+              <th>模型主預測區間</th>
+              <th>主預測機率</th>
+              <th>狀態</th>
+            </tr>
+          </thead>
+          <tbody id="cities-tbody"></tbody>
+        </table>
+      </div>
+      <div class="empty-box hidden" id="cities-empty">尚未執行過城市掃描，點擊上方「立即掃描氣象」取得即時全球測站與盤口比對。</div>
+    </section>
+
+    <section class="panel hidden" id="view-ledger" aria-labelledby="heading-ledger">
+      <div class="panel-head">
+        <h2 class="panel-title" id="heading-ledger">$40U 模擬帳本明細與策略歸因</h2>
+        <div class="pill-row">
+          <button type="button" class="action-btn action-btn-danger" id="btn-reset-paper">重置模擬金為 $40U</button>
+          <button type="button" class="action-btn action-btn-danger hidden" id="btn-reset-confirm">確認清空重來</button>
+          <button type="button" class="action-btn hidden" id="btn-reset-cancel">取消</button>
+        </div>
+      </div>
+
+      <div class="attr-grid" id="attr-grid"></div>
+
+      <h3 class="panel-title" style="margin-bottom: 10px;">進行中模擬持倉</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>城市 / 日期</th>
+              <th>區間 / 方向</th>
+              <th>進場價</th>
+              <th>模型勝率</th>
+              <th>淨 EV</th>
+              <th>股數 / 成本</th>
+              <th>歸因</th>
+            </tr>
+          </thead>
+          <tbody id="open-tbody"></tbody>
+        </table>
+      </div>
+      <div class="empty-box hidden" id="open-empty">目前無未結算的模擬持倉。</div>
+
+      <h3 class="panel-title" style="margin: 18px 0 10px;">歷史結算紀錄</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>城市 / 日期</th>
+              <th>區間 / 方向</th>
+              <th>進場價</th>
+              <th>模型勝率</th>
+              <th>結算結果</th>
+              <th>淨損益</th>
+              <th>官方結算備註</th>
+            </tr>
+          </thead>
+          <tbody id="closed-tbody"></tbody>
+        </table>
+      </div>
+      <div class="empty-box hidden" id="closed-empty">尚無已結算的氣象模擬交易（每日氣象市場於當地隔日結算後自動入帳）。</div>
+    </section>
+
+    <section class="panel hidden" id="view-experts" aria-labelledby="heading-experts">
+      <div class="panel-head">
+        <h2 class="panel-title" id="heading-experts">八領域隱形專家白名單 vs 擁擠瀑布名單</h2>
+        <div class="pill-row" role="group" aria-label="領域切換" id="domain-pills">
+          <button type="button" class="filter-pill" data-domain="ALL" aria-pressed="true">ALL</button>
+          <button type="button" class="filter-pill" data-domain="WEATHER" aria-pressed="false">WEATHER</button>
+          <button type="button" class="filter-pill" data-domain="ECONOMICS" aria-pressed="false">ECONOMICS</button>
+          <button type="button" class="filter-pill" data-domain="CULTURE" aria-pressed="false">CULTURE</button>
+          <button type="button" class="filter-pill" data-domain="SPORTS" aria-pressed="false">SPORTS</button>
+          <button type="button" class="filter-pill" data-domain="CRYPTO" aria-pressed="false">CRYPTO</button>
+          <button type="button" class="filter-pill" data-domain="FINANCE" aria-pressed="false">FINANCE</button>
+          <button type="button" class="filter-pill" data-domain="TECH" aria-pressed="false">TECH</button>
+          <button type="button" class="filter-pill" data-domain="POLITICS" aria-pressed="false">POLITICS</button>
+        </div>
+      </div>
+
+      <div class="split-grid">
+        <div>
+          <h3 class="panel-title" style="margin-bottom: 10px;">隱形專家白名單（低擁擠度 &lt;= 1.8¢ · 正 Taker Alpha）</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>領域</th>
+                  <th>名稱 / 來源</th>
+                  <th>CopyScore</th>
+                  <th>純交易%</th>
+                  <th>30s 衝擊</th>
+                  <th>延遲 60s ROI</th>
+                  <th>t-stat</th>
+                </tr>
+              </thead>
+              <tbody id="stealth-tbody"></tbody>
+            </table>
+          </div>
+          <div class="empty-box hidden" id="stealth-empty">該領域尚未篩出通過 8 道法醫驗證的隱形專家，請點擊「掃描八領域專家」更新樣本。</div>
+        </div>
+
+        <div>
+          <h3 class="panel-title" style="margin-bottom: 10px;">擁擠網紅觀察池（30s 衝擊 &gt;= 3.0¢ · 嚴禁追高／反割候選）</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>領域</th>
+                  <th>名稱</th>
+                  <th>已實現 PnL</th>
+                  <th>30s 衝擊</th>
+                  <th>延遲 60s ROI</th>
+                  <th>風險標籤</th>
+                </tr>
+              </thead>
+              <tbody id="crowded-tbody"></tbody>
+            </table>
+          </div>
+          <div class="empty-box hidden" id="crowded-empty">目前無高擁擠度網紅帳號命中紀錄。</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    (() => {
+      "use strict";
+      const IS_HTTP = window.location.protocol === "http:" || window.location.protocol === "https:";
+      const store = {
+        view: "weather",
+        filter: "all",
+        domain: "ALL",
+        status: null,
+        opps: [],
+        cities: [],
+        openPositions: [],
+        closedTrades: [],
+        experts: { stealth_experts: [], crowded_whales: [], updated_at_iso: "" },
+      };
+
+      const el = (id) => document.getElementById(id);
+
+      function clearNode(node) {
+        while (node.firstChild) node.removeChild(node.firstChild);
+      }
+
+      function makeCell(text, clsName) {
+        const td = document.createElement("td");
+        if (clsName) td.className = clsName;
+        td.textContent = text;
+        return td;
+      }
+
+      function makeTagCell(label, toneClass) {
+        const td = document.createElement("td");
+        const span = document.createElement("span");
+        span.className = "tag " + (toneClass || "");
+        span.textContent = label;
+        td.appendChild(span);
+        return td;
+      }
+
+      function setBanner(text, tone) {
+        const banner = el("status-banner");
+        banner.setAttribute("data-tone", tone || "neutral");
+        el("status-text").textContent = text;
+      }
+
+      function renderSummary() {
+        const s = (store.status && store.status.summary) || {};
+        const eq = Number(s.equity_u ?? 40);
+        const cash = Number(s.cash_u ?? 40);
+        const dep = Number(s.deployed_u ?? 0);
+        const net = Number(s.net_pnl_usd ?? 0);
+        const pct = Number(s.net_pnl_pct ?? 0);
+        const wins = Number(s.wins ?? 0);
+        const losses = Number(s.losses ?? 0);
+
+        el("kpi-equity").textContent = "$" + eq.toFixed(2);
+        el("kpi-cash").textContent = "可用現金 $" + cash.toFixed(2) + " · 已部署 $" + dep.toFixed(2);
+
+        const pnlNode = el("kpi-pnl");
+        pnlNode.textContent = (net >= 0 ? "+$" : "-$") + Math.abs(net).toFixed(2);
+        pnlNode.className = "kpi-value " + (net > 0 ? "pos" : (net < 0 ? "neg" : ""));
+        el("kpi-wr").textContent = (wins + losses > 0) ? `${wins}W - ${losses}L (${Number(s.win_rate_pct || 0).toFixed(1)}%)` : "0W - 0L (待結算)";
+
+        el("kpi-open").textContent = `${Number(s.open_count ?? 0)} / ${Number(s.max_open_events ?? 6)}`;
+        el("kpi-cities").textContent = `今日掃描城市：${store.cities.length} 城`;
+
+        const mb = s.model_brier;
+        const mktb = s.market_brier;
+        el("kpi-brier").textContent = (mb !== null && mb !== undefined) ? `${Number(mb).toFixed(4)} vs ${Number(mktb).toFixed(4)}` : "待結算累積";
+        const stCnt = (store.experts.stealth_experts || []).length;
+        const crCnt = (store.experts.crowded_whales || []).length;
+        el("kpi-experts-cnt").textContent = `隱形專家 ${stCnt} · 擁擠網紅 ${crCnt}`;
+        el("status-time").textContent = s.last_scan_iso || (IS_HTTP ? "等待首次掃描" : "靜態離線預覽");
+      }
+
+      function renderOpportunities() {
+        const tbody = el("opp-tbody");
+        clearNode(tbody);
+        const rows = store.opps.filter((o) => {
+          if (store.filter === "edge") return Number(o.net_ev || 0) >= 0.04;
+          if (store.filter === "nowcast") return Boolean(o.nowcast_locked);
+          if (store.filter === "expert") return o.expert_alignment === "AGREE";
+          return true;
+        });
+
+        el("opp-empty").classList.toggle("hidden", rows.length > 0);
+        for (const o of rows) {
+          const tr = document.createElement("tr");
+          tr.appendChild(makeCell(`${o.city} (${o.obs_date})`));
+          tr.appendChild(makeCell(`${o.bracket_label} · ${o.side}`, "num"));
+          tr.appendChild(makeCell(`${(Number(o.model_prob) * 100).toFixed(1)}%`, "num"));
+          tr.appendChild(makeCell(`${(Number(o.exec_ask) * 100).toFixed(1)}¢ (+${(Number(o.fee_per_share) * 100).toFixed(2)}¢)`, "num"));
+          tr.appendChild(makeCell(`+${(Number(o.net_ev) * 100).toFixed(1)}¢`, "num pos"));
+          tr.appendChild(makeCell(`${Number(o.shares).toFixed(1)} sh ($${Number(o.cost_usd).toFixed(2)})`, "num"));
+          const alignTone = o.expert_alignment === "AGREE" ? "tag-emerald" : (o.expert_alignment === "OPPOSE" ? "tag-coral" : "");
+          tr.appendChild(makeTagCell(`${o.expert_alignment} (${o.agree_count}/${o.oppose_count})`, alignTone));
+          tr.appendChild(makeCell(o.obs_max_display !== null && o.obs_max_display !== undefined ? `${Number(o.obs_max_display).toFixed(1)}°C` : "--", "num"));
+          const attrTone = o.attribution === "NOWCAST_LOCK" ? "tag-amber" : (o.attribution === "EXPERT_CONFLUENCE" ? "tag-emerald" : "");
+          tr.appendChild(makeTagCell(o.attribution || "ENSEMBLE_SOLO", attrTone));
+          tbody.appendChild(tr);
+        }
+      }
+
+      function renderCities() {
+        const tbody = el("cities-tbody");
+        clearNode(tbody);
+        const rows = store.cities.filter((c) => {
+          if (store.filter === "edge") return Boolean(c.has_edge);
+          if (store.filter === "nowcast") return Boolean(c.nowcast_locked);
+          return true;
+        });
+        el("cities-empty").classList.toggle("hidden", rows.length > 0);
+        for (const c of rows) {
+          const tr = document.createElement("tr");
+          tr.appendChild(makeCell(c.city || "--"));
+          tr.appendChild(makeCell(c.date || "--", "num"));
+          tr.appendChild(makeCell(`${c.station || "--"} · ${c.tz || "UTC"}`));
+          tr.appendChild(makeCell(`$${Number(c.liquidity_usd || 0).toLocaleString()}`, "num"));
+          tr.appendChild(makeCell(c.obs_max_c !== null && c.obs_max_c !== undefined ? `${Number(c.obs_max_c).toFixed(1)}°C` : "預報中", "num"));
+          tr.appendChild(makeCell(c.top_bracket || "--", "num"));
+          tr.appendChild(makeCell(c.top_prob !== undefined ? `${(Number(c.top_prob) * 100).toFixed(1)}%` : "--", "num"));
+          const stLabel = c.has_edge ? "ACTIONABLE" : (c.nowcast_locked ? "NOWCAST" : (c.status || "MONITOR"));
+          const stTone = c.has_edge ? "tag-emerald" : (c.nowcast_locked ? "tag-amber" : "");
+          tr.appendChild(makeTagCell(stLabel, stTone));
+          tbody.appendChild(tr);
+        }
+      }
+
+      function renderLedger() {
+        const attrGrid = el("attr-grid");
+        clearNode(attrGrid);
+        const attr = (store.status && store.status.summary && store.status.summary.attribution) || {};
+        for (const key of ["ENSEMBLE_SOLO", "EXPERT_CONFLUENCE", "NOWCAST_LOCK"]) {
+          const item = attr[key] || { opened: 0, trades: 0, wins: 0, pnl_usd: 0 };
+          const box = document.createElement("div");
+          box.className = "attr-box";
+          const title = document.createElement("div");
+          title.className = "kpi-label";
+          title.textContent = key;
+          const val = document.createElement("div");
+          val.className = "num";
+          val.textContent = `開倉 ${item.opened || 0} · 結算 ${item.trades || 0} (${item.wins || 0}W) · PnL $${Number(item.pnl_usd || 0).toFixed(2)}`;
+          box.appendChild(title);
+          box.appendChild(val);
+          attrGrid.appendChild(box);
+        }
+
+        const openBody = el("open-tbody");
+        clearNode(openBody);
+        el("open-empty").classList.toggle("hidden", store.openPositions.length > 0);
+        for (const p of store.openPositions) {
+          const tr = document.createElement("tr");
+          tr.appendChild(makeCell(`${p.city} (${p.obs_date})`));
+          tr.appendChild(makeCell(`${p.bracket_label} · ${p.side}`, "num"));
+          tr.appendChild(makeCell(`${(Number(p.exec_ask) * 100).toFixed(1)}¢`, "num"));
+          tr.appendChild(makeCell(`${(Number(p.model_prob) * 100).toFixed(1)}%`, "num"));
+          tr.appendChild(makeCell(`+${(Number(p.net_ev) * 100).toFixed(1)}¢`, "num pos"));
+          tr.appendChild(makeCell(`${Number(p.shares).toFixed(1)} sh ($${Number(p.cost_usd).toFixed(2)})`, "num"));
+          tr.appendChild(makeTagCell(p.attribution || "ENSEMBLE_SOLO", ""));
+          openBody.appendChild(tr);
+        }
+
+        const closedBody = el("closed-tbody");
+        clearNode(closedBody);
+        el("closed-empty").classList.toggle("hidden", store.closedTrades.length > 0);
+        for (const t of store.closedTrades) {
+          const tr = document.createElement("tr");
+          tr.appendChild(makeCell(`${t.city} (${t.obs_date})`));
+          tr.appendChild(makeCell(`${t.bracket_label} · ${t.side}`, "num"));
+          tr.appendChild(makeCell(`${(Number(t.exec_ask) * 100).toFixed(1)}¢`, "num"));
+          tr.appendChild(makeCell(`${(Number(t.model_prob) * 100).toFixed(1)}%`, "num"));
+          tr.appendChild(makeTagCell(t.won ? "WON" : "LOST", t.won ? "tag-emerald" : "tag-coral"));
+          const pnl = Number(t.pnl_usd || 0);
+          tr.appendChild(makeCell((pnl >= 0 ? "+$" : "-$") + Math.abs(pnl).toFixed(2), "num " + (pnl >= 0 ? "pos" : "neg")));
+          tr.appendChild(makeCell(t.official_note || "--"));
+          closedBody.appendChild(tr);
+        }
+      }
+
+      function renderExperts() {
+        const stealthBody = el("stealth-tbody");
+        const crowdedBody = el("crowded-tbody");
+        clearNode(stealthBody);
+        clearNode(crowdedBody);
+
+        const matchDom = (row) => store.domain === "ALL" || String(row.category || "").toUpperCase() === store.domain;
+        const stealth = (store.experts.stealth_experts || []).filter(matchDom);
+        const crowded = (store.experts.crowded_whales || []).filter(matchDom);
+
+        el("stealth-empty").classList.toggle("hidden", stealth.length > 0);
+        el("crowded-empty").classList.toggle("hidden", crowded.length > 0);
+
+        for (const e of stealth) {
+          const tr = document.createElement("tr");
+          tr.appendChild(makeTagCell(e.category, "tag-emerald"));
+          tr.appendChild(makeCell(`${e.name} (${e.source})`));
+          tr.appendChild(makeCell(String(e.copy_score), "num pos"));
+          tr.appendChild(makeCell(`${e.pure_trade_pct}%`, "num"));
+          tr.appendChild(makeCell(`${e.impact_30s_cents}¢`, "num"));
+          tr.appendChild(makeCell(`${Number(e.lagged_60s_roi_pct).toFixed(1)}%`, "num pos"));
+          tr.appendChild(makeCell(String(e.t_stat), "num"));
+          stealthBody.appendChild(tr);
+        }
+
+        for (const c of crowded) {
+          const tr = document.createElement("tr");
+          tr.appendChild(makeTagCell(c.category, "tag-amber"));
+          tr.appendChild(makeCell(c.name));
+          tr.appendChild(makeCell(`$${Number(c.realized_pnl || 0).toLocaleString()}`, "num"));
+          tr.appendChild(makeCell(`${c.impact_30s_cents}¢`, "num warn"));
+          tr.appendChild(makeCell(`${Number(c.lagged_60s_roi_pct).toFixed(1)}%`, "num"));
+          tr.appendChild(makeTagCell("CASCADE FADE", "tag-coral"));
+          crowdedBody.appendChild(tr);
+        }
+      }
+
+      function switchView(viewName) {
+        store.view = viewName;
+        const main = el("app-main");
+        main.setAttribute("data-view", viewName);
+        main.setAttribute("data-state", "ready-" + viewName);
+        for (const key of ["weather", "ledger", "experts"]) {
+          el("view-" + key).classList.toggle("hidden", key !== viewName);
+          el("tab-" + key).setAttribute("aria-selected", String(key === viewName));
+        }
+      }
+
+      function applyFilter(filterKey) {
+        store.filter = filterKey;
+        el("app-main").setAttribute("data-state", "filtered-" + filterKey);
+        document.querySelectorAll("[data-filter]").forEach((btn) => {
+          btn.setAttribute("aria-pressed", String(btn.getAttribute("data-filter") === filterKey));
+        });
+        renderOpportunities();
+        renderCities();
+      }
+
+      function applyDomain(domain) {
+        store.domain = domain;
+        el("app-main").setAttribute("data-state", "domain-" + domain);
+        document.querySelectorAll("[data-domain]").forEach((btn) => {
+          btn.setAttribute("aria-pressed", String(btn.getAttribute("data-domain") === domain));
+        });
+        renderExperts();
+      }
+
+      async function fetchJson(url, options) {
+        const resp = await fetch(url, options);
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        return resp.json();
+      }
+
+      async function refreshAll() {
+        if (!IS_HTTP) {
+          renderSummary();
+          renderOpportunities();
+          renderCities();
+          renderLedger();
+          renderExperts();
+          return;
+        }
+        el("app-main").setAttribute("data-state", "loading");
+        el("badge-sync").textContent = "同步中";
+        try {
+          const [st, oppRes, trRes, expRes] = await Promise.all([
+            fetchJson("/api/route1/status"),
+            fetchJson("/api/route1/weather/opportunities"),
+            fetchJson("/api/route1/weather/trades?limit=100"),
+            fetchJson("/api/route1/experts/status"),
+          ]);
+          store.status = st;
+          store.opps = oppRes.opportunities || [];
+          store.cities = oppRes.cities_summary || [];
+          store.openPositions = trRes.open_positions || [];
+          store.closedTrades = trRes.closed_trades || [];
+          store.experts = expRes || { stealth_experts: [], crowded_whales: [] };
+          el("badge-sync").textContent = "已同步";
+          el("app-main").setAttribute("data-state", "ready-" + store.view);
+          setBanner("已啟用純模擬監控隔離模式（PAPER_ONLY），絕不觸發實盤下單。", "neutral");
+          renderSummary();
+          renderOpportunities();
+          renderCities();
+          renderLedger();
+          renderExperts();
+        } catch (err) {
+          el("app-main").setAttribute("data-state", "error");
+          el("badge-sync").textContent = "離線";
+          setBanner("無法連線至後端 API：" + err.message, "error");
+        }
+      }
+
+      async function triggerScan(endpoint, label) {
+        if (!IS_HTTP) {
+          setBanner("目前為本機檔案預覽模式，請透過 http://127.0.0.1:8088/route1 執行即時掃描。", "neutral");
+          return;
+        }
+        el("app-main").setAttribute("data-state", "refreshing");
+        el("badge-sync").textContent = label;
+        setBanner("正在執行 " + label + "，請稍候...", "neutral");
+        try {
+          await fetchJson(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+          await refreshAll();
+        } catch (err) {
+          el("app-main").setAttribute("data-state", "error");
+          setBanner(label + " 失敗：" + err.message, "error");
+        }
+      }
+
+      function bindEvents() {
+        document.querySelectorAll("[data-switch-state]").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            const target = btn.getAttribute("data-switch-state");
+            if (target === "weather" || target === "ledger" || target === "experts") {
+              switchView(target);
+            }
+          });
+        });
+
+        document.querySelectorAll("[data-filter]").forEach((btn) => {
+          btn.addEventListener("click", () => applyFilter(btn.getAttribute("data-filter") || "all"));
+        });
+
+        document.querySelectorAll("[data-domain]").forEach((btn) => {
+          btn.addEventListener("click", () => applyDomain(btn.getAttribute("data-domain") || "ALL"));
+        });
+
+        el("btn-scan-weather").addEventListener("click", () => triggerScan("/api/route1/weather/scan", "氣象掃描中"));
+        el("btn-scan-experts").addEventListener("click", () => triggerScan("/api/route1/experts/scan", "八領域專家掃描中"));
+
+        const btnReset = el("btn-reset-paper");
+        const btnConfirm = el("btn-reset-confirm");
+        const btnCancel = el("btn-reset-cancel");
+        btnReset.addEventListener("click", () => {
+          btnReset.classList.add("hidden");
+          btnConfirm.classList.remove("hidden");
+          btnCancel.classList.remove("hidden");
+        });
+        btnCancel.addEventListener("click", () => {
+          btnConfirm.classList.add("hidden");
+          btnCancel.classList.add("hidden");
+          btnReset.classList.remove("hidden");
+        });
+        btnConfirm.addEventListener("click", async () => {
+          btnConfirm.classList.add("hidden");
+          btnCancel.classList.add("hidden");
+          btnReset.classList.remove("hidden");
+          await triggerScan("/api/route1/paper/reset", "重置模擬帳本");
+        });
+
+        window.addEventListener("keydown", (e) => {
+          if (e.isComposing || e.keyCode === 229) return;
+          if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
+          if (e.key === "1") switchView("weather");
+          else if (e.key === "2") switchView("ledger");
+          else if (e.key === "3") switchView("experts");
+        });
+      }
+
+      bindEvents();
+      refreshAll();
+      if (IS_HTTP) {
+        window.setInterval(refreshAll, 30000);
+      }
+    })();
+  </script>
+</body>
+</html>

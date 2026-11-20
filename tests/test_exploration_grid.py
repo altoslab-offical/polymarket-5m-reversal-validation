@@ -31,7 +31,7 @@ from edge_validation.exploration_grid import (
     verify_base_recorder_parity,
 )
 from edge_validation.live_recorder_42 import NOV21_UTC_TS
-from edge_validation.run_daily_bundle import evaluate_day10_early_stop
+from edge_validation.run_daily_bundle import _prepend_redline_block, build_standing_redline_block, evaluate_day10_early_stop
 from engine.oracle_sniper import TWAP_V2_FILTERED_CONFIG, taker_fee_per_share
 from engine.signal_core import MarketInputs, evaluate as evaluate_signal
 
@@ -281,3 +281,37 @@ def test_day10_early_stop_fail_only_rule() -> None:
     missing = {"post_nov21": {"v2_pure": low_cis["post_nov21"]["v2_pure"], "v2_filtered": {}, "v1": low_cis["post_nov21"]["v1"]}}
     cont_missing = evaluate_day10_early_stop(missing, now_ts=NOV21_UTC_TS + 11.0 * 86400)
     assert cont_missing["status"] == "CONTINUE_TO_300"
+
+
+def test_standing_redline_block_prepends_cleanly_and_flags_alerts(tmp_path: pathlib.Path) -> None:
+    """Verify Phase 4.2 permanent red-lines sit at report top and flag stale / BTC >10%."""
+    q1_ok = {
+        "runner_enters": {"total": 5, "stale_count": 0},
+        "recorder_enters": {"raw_total": 6, "raw_stale_count": 0, "first_entry_total": 4, "first_entry_stale_count": 0},
+        "frozen_check": {"matched": 12, "total": 12, "ok": True},
+        "reconnect_and_1013": {"runner_1013_total": 0, "recorder_1013_total": 1, "runner_reconnects_total": 20},
+        "per_coin_lag": {"symbols": {
+            "BTCUSDT": {"gt_2000ms_pct": 4.2, "entry_age_gt1500_pct": 2.1},
+            "ETHUSDT": {"gt_2000ms_pct": 0.4},
+            "SOLUSDT": {"gt_2000ms_pct": 0.1},
+        }},
+    }
+    block_ok = build_standing_redline_block(q1_ok)
+    assert "PASS (0)" in block_ok and "`12/12`" in block_ok and "ALERT > 10%" not in block_ok
+
+    rpt = tmp_path / "daily.md"
+    rpt.write_text("# Daily Body\n\nContent\n", encoding="utf-8")
+    _prepend_redline_block(rpt, block_ok)
+    txt1 = rpt.read_text(encoding="utf-8")
+    assert txt1.startswith("<!-- PHASE42_REDLINE_START -->") and "# Daily Body" in txt1
+
+    q1_bad = {
+        **q1_ok,
+        "runner_enters": {"total": 5, "stale_count": 1},
+        "per_coin_lag": {"symbols": {**q1_ok["per_coin_lag"]["symbols"], "BTCUSDT": {"gt_2000ms_pct": 6.0, "entry_age_gt1500_pct": 12.5}}},
+    }
+    block_bad = build_standing_redline_block(q1_bad)
+    assert "INVALID" in block_bad and "ALERT > 10%" in block_bad
+    _prepend_redline_block(rpt, block_bad)
+    txt2 = rpt.read_text(encoding="utf-8")
+    assert txt2.count("PHASE42_REDLINE_START") == 1 and "INVALID" in txt2 and "# Daily Body" in txt2
